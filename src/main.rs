@@ -8,7 +8,7 @@
 // Upstreams may be "ip" (=> :4001) or "ip:port" (for local mock peers / custom ports).
 // Subcommand `mock <bind:port> <dir> <start> <end>` replays captured blocks[start..end] for testing.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use rustc_hash::FxHashSet;
 use std::env;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -105,7 +105,8 @@ fn block_round(payload: &[u8]) -> Option<u32> {
 }
 
 struct RoundDedup {
-    seen: parking_lot::Mutex<(FxHashSet<u32>, VecDeque<u32>)>,
+    // (membership set, insertion-order ring buffer, ring write cursor)
+    seen: parking_lot::Mutex<(FxHashSet<u32>, Vec<u32>, usize)>,
     cap: usize,
     uniq: AtomicU64,
     dups: AtomicU64,
@@ -113,7 +114,7 @@ struct RoundDedup {
 impl RoundDedup {
     fn new(cap: usize) -> Self {
         let set = FxHashSet::with_capacity_and_hasher(cap, Default::default());
-        Self { seen: parking_lot::Mutex::new((set, VecDeque::with_capacity(cap))), cap, uniq: AtomicU64::new(0), dups: AtomicU64::new(0) }
+        Self { seen: parking_lot::Mutex::new((set, Vec::with_capacity(cap), 0usize)), cap, uniq: AtomicU64::new(0), dups: AtomicU64::new(0) }
     }
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     fn is_new(&self, r: u32) -> bool {
@@ -122,11 +123,14 @@ impl RoundDedup {
             self.dups.fetch_add(1, Ordering::Relaxed);
             return false;
         }
-        g.1.push_back(r);
-        if g.1.len() > self.cap {
-            if let Some(o) = g.1.pop_front() {
-                g.0.remove(&o);
-            }
+        if g.1.len() < self.cap {
+            g.1.push(r);
+        } else {
+            let c = g.2;
+            let old = g.1[c];
+            g.0.remove(&old);
+            g.1[c] = r;
+            g.2 = (c + 1) % self.cap;
         }
         self.uniq.fetch_add(1, Ordering::Relaxed);
         true
