@@ -118,11 +118,10 @@ impl RoundDedup {
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     fn is_new(&self, r: u32) -> bool {
         let mut g = self.seen.lock().unwrap();
-        if g.0.contains(&r) {
+        if !g.0.insert(r) {
             self.dups.fetch_add(1, Ordering::Relaxed);
             return false;
         }
-        g.0.insert(r);
         g.1.push_back(r);
         if g.1.len() > self.cap {
             if let Some(o) = g.1.pop_front() {
