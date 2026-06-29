@@ -12,6 +12,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macro
 lz4_flex = "0.11"
 hotpath = "0.19"
 rustc-hash = "2"
+parking_lot = "0.12"
 
 [features]
 hotpath = ["hotpath/hotpath"]

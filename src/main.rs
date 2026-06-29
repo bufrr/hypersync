@@ -105,7 +105,7 @@ fn block_round(payload: &[u8]) -> Option<u32> {
 }
 
 struct RoundDedup {
-    seen: Mutex<(FxHashSet<u32>, VecDeque<u32>)>,
+    seen: parking_lot::Mutex<(FxHashSet<u32>, VecDeque<u32>)>,
     cap: usize,
     uniq: AtomicU64,
     dups: AtomicU64,
@@ -113,11 +113,11 @@ struct RoundDedup {
 impl RoundDedup {
     fn new(cap: usize) -> Self {
         let set = FxHashSet::with_capacity_and_hasher(cap, Default::default());
-        Self { seen: Mutex::new((set, VecDeque::with_capacity(cap))), cap, uniq: AtomicU64::new(0), dups: AtomicU64::new(0) }
+        Self { seen: parking_lot::Mutex::new((set, VecDeque::with_capacity(cap))), cap, uniq: AtomicU64::new(0), dups: AtomicU64::new(0) }
     }
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     fn is_new(&self, r: u32) -> bool {
-        let mut g = self.seen.lock().unwrap();
+        let mut g = self.seen.lock();
         if !g.0.insert(r) {
             self.dups.fetch_add(1, Ordering::Relaxed);
             return false;
