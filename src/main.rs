@@ -199,7 +199,7 @@ async fn serve(mut down: TcpStream, upstreams: Vec<String>) -> std::io::Result<(
     timeout(Duration::from_secs(20), down.read_exact(&mut g)).await??;
     eprintln!("[gw] node greeting {:02x?}", g);
 
-    let dedup = Arc::new(RoundDedup::new(2_000_000));
+    let dedup = Arc::new(RoundDedup::new(131_072));
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(4096);
 
     for ip in &upstreams {
@@ -678,7 +678,7 @@ fn run_bench(dir: &str, iters: usize) {
     }
     eprintln!("[bench] verify: {} blocks, {} mismatch vs full-decompress oracle", payloads.len(), mism);
 
-    let dedup = RoundDedup::new(2_000_000);
+    let dedup = RoundDedup::new(131_072);
     let mut forwarded = 0u64;
     let mut bytes = 0u64;
     let t0 = std::time::Instant::now();
