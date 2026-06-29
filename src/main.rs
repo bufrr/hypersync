@@ -11,7 +11,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use rustc_hash::FxHashSet;
 use std::env;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -155,6 +155,14 @@ async fn main() {
         let port: u16 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(4001);
         let upstream = args.get(3).cloned().unwrap_or_else(|| "172.18.0.2:4001".into());
         run_relay(port, upstream).await;
+        return;
+    }
+    if args.get(1).map(|s| s.as_str()) == Some("proxy") {
+        let upstreams: Vec<String> = args
+            .get(2)
+            .map(|s| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect())
+            .unwrap_or_default();
+        run_proxy(upstreams).await;
         return;
     }
     if args.get(1).map(|s| s.as_str()) == Some("cache") {
@@ -454,6 +462,143 @@ async fn feed_live(
                 let _ = btx.send(frame);
             }
         }
+    }
+}
+
+// Pick the next non-bad upstream after `cur` (skips peers in cooldown). None => no healthy alternative.
+fn pick_next(cur: usize, bad_until: &[AtomicU64], now_ms: u64, n: usize) -> Option<usize> {
+    for off in 1..n {
+        let j = (cur + off) % n;
+        if bad_until[j].load(Ordering::Relaxed) <= now_ms {
+            return Some(j);
+        }
+    }
+    None
+}
+
+// Failover transparent proxy (current design): the local node dials the gateway (4000-4010, outbound)
+// and the gateway transparently proxies to the ACTIVE upstream peer. A health monitor detects the
+// active peer stalling (no data) or dying (dial fails) and rotates to the next peer; node connections
+// are dropped on rotation so the node reconnects and is re-proxied to a healthy peer ("选择其他peer替代").
+// Inbound push is deliberately not implemented (verified: HL nodes only ingest from peers they dial).
+async fn run_proxy(upstreams: Vec<String>) {
+    let hosts: Vec<String> = upstreams
+        .iter()
+        .map(|u| match u.rsplit_once(':') { Some((h, _)) => h.to_string(), None => u.clone() })
+        .collect();
+    if hosts.is_empty() {
+        eprintln!("[proxy] no upstreams given");
+        return;
+    }
+    let hosts = Arc::new(hosts);
+    let n = hosts.len();
+    let active = Arc::new(AtomicUsize::new(0));
+    let generation = Arc::new(AtomicU64::new(0));
+    let base = std::time::Instant::now();
+    let last_data_ms = Arc::new(AtomicU64::new(0));
+    let bad_until: Arc<Vec<AtomicU64>> = Arc::new((0..n).map(|_| AtomicU64::new(0)).collect());
+    eprintln!("[proxy] upstreams={:?}, active={}", hosts, hosts[0]);
+
+    {
+        let hosts = hosts.clone();
+        let active = active.clone();
+        let generation = generation.clone();
+        let last_data_ms = last_data_ms.clone();
+        let bad_until = bad_until.clone();
+        tokio::spawn(async move {
+            const STALL_MS: u64 = 20000;
+            const COOLDOWN_MS: u64 = 30000;
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let now = base.elapsed().as_millis() as u64;
+                let ld = last_data_ms.load(Ordering::Relaxed);
+                if ld != 0 && now.saturating_sub(ld) > STALL_MS {
+                    let old = active.load(Ordering::Relaxed);
+                    bad_until[old].store(now + COOLDOWN_MS, Ordering::Relaxed);
+                    if let Some(j) = pick_next(old, &bad_until, now, n) {
+                        active.store(j, Ordering::Relaxed);
+                        generation.fetch_add(1, Ordering::Relaxed);
+                        last_data_ms.store(now, Ordering::Relaxed);
+                        eprintln!("[proxy] STALL {}ms on {} -> failover -> {}", now - ld, hosts[old], hosts[j]);
+                    } else {
+                        last_data_ms.store(now, Ordering::Relaxed); // no healthy alternative; keep current
+                    }
+                }
+            }
+        });
+    }
+
+    let mut handles = Vec::new();
+    for p in 4000u16..=4010 {
+        let hosts = hosts.clone();
+        let active = active.clone();
+        let generation = generation.clone();
+        let last_data_ms = last_data_ms.clone();
+        let bad_until = bad_until.clone();
+        handles.push(tokio::spawn(async move {
+            let l = match TcpListener::bind(("0.0.0.0", p)).await {
+                Ok(l) => l,
+                Err(e) => { eprintln!("[proxy] bind :{p}: {e}"); return; }
+            };
+            loop {
+                let (mut down, _addr) = match l.accept().await { Ok(x) => x, Err(_) => continue };
+                let hosts = hosts.clone();
+                let active = active.clone();
+                let generation = generation.clone();
+                let last_data_ms = last_data_ms.clone();
+                let bad_until = bad_until.clone();
+                tokio::spawn(async move {
+                    let cur_gen = generation.load(Ordering::Relaxed);
+                    let idx = active.load(Ordering::Relaxed);
+                    let up = format!("{}:{}", hosts[idx], p);
+                    let mut upc = match timeout(Duration::from_secs(4), TcpStream::connect(&up)).await {
+                        Ok(Ok(s)) => s,
+                        _ => {
+                            let now = base.elapsed().as_millis() as u64;
+                            bad_until[idx].store(now + 30000, Ordering::Relaxed);
+                            if let Some(j) = pick_next(idx, &bad_until, now, hosts.len()) {
+                                active.store(j, Ordering::Relaxed);
+                                generation.fetch_add(1, Ordering::Relaxed);
+                                eprintln!("[proxy] dial {} failed -> failover -> {}", hosts[idx], hosts[j]);
+                            } else {
+                                eprintln!("[proxy] dial {} failed, no healthy alternative", hosts[idx]);
+                            }
+                            return;
+                        }
+                    };
+                    down.set_nodelay(true).ok();
+                    upc.set_nodelay(true).ok();
+                    let (mut dr, mut dw) = down.into_split();
+                    let (mut ur, mut uw) = upc.into_split();
+                    let ld = last_data_ms.clone();
+                    let up2 = tokio::spawn(async move {
+                        let mut buf = vec![0u8; 262144];
+                        loop {
+                            match ur.read(&mut buf).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(nb) => {
+                                    ld.store(base.elapsed().as_millis() as u64, Ordering::Relaxed);
+                                    if dw.write_all(&buf[..nb]).await.is_err() { break; }
+                                }
+                            }
+                        }
+                    });
+                    let n2u = tokio::spawn(async move {
+                        let _ = tokio::io::copy(&mut dr, &mut uw).await;
+                    });
+                    loop {
+                        if generation.load(Ordering::Relaxed) != cur_gen { break; }
+                        if up2.is_finished() || n2u.is_finished() { break; }
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                    }
+                    up2.abort();
+                    n2u.abort();
+                });
+            }
+        }));
+    }
+    for h in handles {
+        let _ = h.await;
     }
 }
 
