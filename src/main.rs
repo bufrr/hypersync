@@ -20,13 +20,86 @@ use tokio::time::timeout;
 
 const GREET_FALSE: [u8; 8] = [0, 0, 0, 3, 0, 0, 0, 0]; // send_abci:false (live blocks; no rate-limited state)
 
-#[cfg_attr(feature = "hotpath", hotpath::measure)]
-fn block_round(payload: &[u8]) -> Option<u32> {
+// Reference / correctness oracle + fallback: full lz4 decompress, read round @0x5e.
+fn block_round_full(payload: &[u8]) -> Option<u32> {
     let dec = lz4_flex::block::decompress_size_prepended(payload).ok()?;
     if dec.len() >= 0x63 && dec[0x5e] == 0xfc {
         Some(u32::from_le_bytes([dec[0x5f], dec[0x60], dec[0x61], dec[0x62]]))
     } else {
         None
+    }
+}
+
+// Bounded LZ4 block decode: produce only the first `out.len()` bytes (round lives at 0x5e, so we
+// never decompress the full ~200KB block). Standard LZ4 block format; returns bytes produced, or
+// None if it can't safely reach the requested length (caller falls back to full decompress).
+fn lz4_first_n(input: &[u8], out: &mut [u8]) -> Option<usize> {
+    let n = out.len();
+    let ilen = input.len();
+    let mut ip = 0usize;
+    let mut op = 0usize;
+    while ip < ilen {
+        let token = input[ip];
+        ip += 1;
+        let mut lit = (token >> 4) as usize;
+        if lit == 15 {
+            loop {
+                if ip >= ilen { return None; }
+                let b = input[ip];
+                ip += 1;
+                lit += b as usize;
+                if b != 255 { break; }
+            }
+        }
+        if lit > 0 {
+            if ip + lit > ilen { return None; }
+            let take = lit.min(n - op);
+            out[op..op + take].copy_from_slice(&input[ip..ip + take]);
+            op += take;
+            ip += lit;
+            if op >= n { return Some(op); }
+        }
+        if ip >= ilen { return Some(op); } // last sequence is literals-only
+        if ip + 2 > ilen { return None; }
+        let offset = (input[ip] as usize) | ((input[ip + 1] as usize) << 8);
+        ip += 2;
+        if offset == 0 || offset > op { return None; }
+        let mut mlen = (token & 0x0f) as usize;
+        if mlen == 15 {
+            loop {
+                if ip >= ilen { return None; }
+                let b = input[ip];
+                ip += 1;
+                mlen += b as usize;
+                if b != 255 { break; }
+            }
+        }
+        mlen += 4;
+        let take = mlen.min(n - op);
+        for _ in 0..take {
+            out[op] = out[op - offset];
+            op += 1;
+        }
+        if op >= n { return Some(op); }
+    }
+    Some(op)
+}
+
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+fn block_round(payload: &[u8]) -> Option<u32> {
+    if payload.len() < 4 {
+        return block_round_full(payload);
+    }
+    let mut buf = [0u8; 0x63];
+    match lz4_first_n(&payload[4..], &mut buf) {
+        Some(p) if p >= 0x63 => {
+            if buf[0x5e] == 0xfc {
+                Some(u32::from_le_bytes([buf[0x5f], buf[0x60], buf[0x61], buf[0x62]]))
+            } else {
+                None
+            }
+        }
+        _ => block_round_full(payload),
     }
 }
 
@@ -447,6 +520,16 @@ fn run_bench(dir: &str, iters: usize) {
             lz4_flex::block::compress_prepend_size(&data)
         })
         .collect();
+    // correctness: bounded block_round must equal the full-decompress oracle for every block
+    let mut mism = 0;
+    for (i, p) in payloads.iter().enumerate() {
+        if block_round(p) != block_round_full(p) {
+            eprintln!("[bench] VERIFY FAIL block{i}: fast={:?} full={:?}", block_round(p), block_round_full(p));
+            mism += 1;
+        }
+    }
+    eprintln!("[bench] verify: {} blocks, {} mismatch vs full-decompress oracle", payloads.len(), mism);
+
     let dedup = RoundDedup::new(2_000_000);
     let mut forwarded = 0u64;
     let mut bytes = 0u64;
