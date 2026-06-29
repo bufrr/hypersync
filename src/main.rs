@@ -8,7 +8,8 @@
 // Upstreams may be "ip" (=> :4001) or "ip:port" (for local mock peers / custom ports).
 // Subcommand `mock <bind:port> <dir> <start> <end>` replays captured blocks[start..end] for testing.
 
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
+use rustc_hash::FxHashSet;
 use std::env;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -104,15 +105,16 @@ fn block_round(payload: &[u8]) -> Option<u32> {
 }
 
 struct RoundDedup {
-    seen: Mutex<(HashSet<u32>, VecDeque<u32>)>,
+    seen: Mutex<(FxHashSet<u32>, VecDeque<u32>)>,
     cap: usize,
     uniq: AtomicU64,
     dups: AtomicU64,
 }
 impl RoundDedup {
     fn new(cap: usize) -> Self {
-        Self { seen: Mutex::new((HashSet::new(), VecDeque::new())), cap, uniq: AtomicU64::new(0), dups: AtomicU64::new(0) }
+        Self { seen: Mutex::new((FxHashSet::default(), VecDeque::new())), cap, uniq: AtomicU64::new(0), dups: AtomicU64::new(0) }
     }
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     fn is_new(&self, r: u32) -> bool {
         let mut g = self.seen.lock().unwrap();
         if g.0.contains(&r) {
