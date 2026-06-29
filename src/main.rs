@@ -112,7 +112,8 @@ struct RoundDedup {
 }
 impl RoundDedup {
     fn new(cap: usize) -> Self {
-        Self { seen: Mutex::new((FxHashSet::default(), VecDeque::new())), cap, uniq: AtomicU64::new(0), dups: AtomicU64::new(0) }
+        let set = FxHashSet::with_capacity_and_hasher(cap, Default::default());
+        Self { seen: Mutex::new((set, VecDeque::with_capacity(cap))), cap, uniq: AtomicU64::new(0), dups: AtomicU64::new(0) }
     }
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     fn is_new(&self, r: u32) -> bool {
