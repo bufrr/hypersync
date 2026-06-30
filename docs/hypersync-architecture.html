@@ -1,0 +1,491 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>hypersync · 架构与节点同步流程</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --ink:#0c121b;
+    --ink-2:#101a26;
+    --raised:#142031;
+    --raised-2:#17263a;
+    --line:#26384e;
+    --line-soft:#1c2c40;
+    --paper:#e9eff7;
+    --muted:#8fa6c0;
+    --faint:#5d7591;
+    --control:#e9a23c;   /* type 0 — control / 琥珀 */
+    --data:#43cabd;      /* type 1 — data / 青 */
+    --alert:#e8705c;     /* rate-limit / 错误 */
+    --violet:#9b8cf0;
+    --mono:'IBM Plex Mono',ui-monospace,SFMono-Regular,Menlo,monospace;
+    --sans:'Inter',system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    margin:0;background:var(--ink);color:var(--paper);
+    font-family:var(--sans);font-size:16px;line-height:1.7;
+    -webkit-font-smoothing:antialiased;
+    background-image:
+      radial-gradient(900px 500px at 85% -8%, rgba(67,202,189,.07), transparent 60%),
+      radial-gradient(700px 500px at -5% 8%, rgba(233,162,60,.06), transparent 55%);
+    background-attachment:fixed;
+  }
+  ::selection{background:rgba(67,202,189,.28);color:#fff}
+
+  /* ---- layout ---- */
+  .wrap{max-width:1180px;margin:0 auto;padding:0 28px}
+  .grid{display:grid;grid-template-columns:230px 1fr;gap:54px;align-items:start}
+  @media(max-width:900px){.grid{grid-template-columns:1fr;gap:0}}
+
+  /* ---- side nav ---- */
+  nav.toc{position:sticky;top:32px;font-family:var(--mono);font-size:12.5px;padding-top:8px}
+  @media(max-width:900px){nav.toc{display:none}}
+  nav.toc .lbl{color:var(--faint);letter-spacing:.18em;text-transform:uppercase;font-size:10.5px;margin-bottom:14px}
+  nav.toc a{display:block;color:var(--muted);text-decoration:none;padding:7px 0 7px 16px;
+    border-left:2px solid var(--line-soft);transition:.18s;position:relative}
+  nav.toc a .n{color:var(--faint);margin-right:9px}
+  nav.toc a:hover{color:var(--paper);border-left-color:var(--data)}
+  nav.toc a.active{color:var(--paper);border-left-color:var(--control)}
+  nav.toc a.active .n{color:var(--control)}
+
+  /* ---- hero ---- */
+  header.hero{padding:74px 0 36px}
+  .eyebrow{font-family:var(--mono);font-size:12px;letter-spacing:.16em;color:var(--data);
+    text-transform:uppercase;display:flex;align-items:center;gap:12px;margin-bottom:22px}
+  .eyebrow .dot{width:7px;height:7px;border-radius:50%;background:var(--data);
+    box-shadow:0 0 0 4px rgba(67,202,189,.16);animation:pulse 2.6s ease-in-out infinite}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+  h1{font-family:var(--mono);font-weight:600;font-size:clamp(34px,6vw,62px);line-height:1.02;
+    letter-spacing:-.02em;margin:0 0 20px}
+  h1 .sync{color:var(--data)}
+  .lede{font-size:18px;color:var(--muted);max-width:62ch;margin:0 0 14px}
+  .lede b{color:var(--paper);font-weight:600}
+  .src{font-family:var(--mono);font-size:12.5px;color:var(--faint);margin-top:22px}
+  .src code{color:var(--muted)}
+
+  /* ---- signature: frame strip ---- */
+  .framewrap{margin:40px 0 8px;padding:26px 24px 16px;border:1px solid var(--line);
+    border-radius:12px;background:linear-gradient(180deg,var(--raised),var(--ink-2));
+    overflow-x:auto}
+  .frame{display:flex;align-items:stretch;min-width:560px;font-family:var(--mono);font-size:12px}
+  .seg{padding:13px 14px;border:1px solid var(--line);border-right:none;
+    display:flex;flex-direction:column;gap:5px;position:relative}
+  .seg:last-child{border-right:1px solid var(--line)}
+  .seg .h{font-size:10px;letter-spacing:.08em;color:var(--faint);text-transform:uppercase}
+  .seg .v{font-weight:600}
+  .seg.len{background:rgba(143,166,192,.06);border-radius:7px 0 0 7px;flex:0 0 auto}
+  .seg.typ{background:rgba(233,162,60,.13);border-color:rgba(233,162,60,.4)}
+  .seg.typ .v{color:var(--control)}
+  .seg.pay{background:rgba(67,202,189,.1);border-color:rgba(67,202,189,.34);flex:1;border-radius:0 7px 7px 0}
+  .seg.pay .v{color:var(--data)}
+  .tick{margin-top:11px;min-width:560px;position:relative;height:30px;font-family:var(--mono);font-size:11px}
+  .tick .mark{position:absolute;left:62%;top:0;color:var(--violet);white-space:nowrap}
+  .tick .mark::before{content:"";position:absolute;left:0;top:-13px;width:1px;height:11px;background:var(--violet)}
+  .legend{display:flex;gap:20px;flex-wrap:wrap;font-family:var(--mono);font-size:11.5px;color:var(--muted);margin-top:16px}
+  .legend span{display:inline-flex;align-items:center;gap:7px}
+  .legend i{width:11px;height:11px;border-radius:3px;display:inline-block}
+
+  /* ---- stat row ---- */
+  .stats{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin:34px 0 6px}
+  @media(max-width:640px){.stats{grid-template-columns:repeat(2,1fr)}}
+  .stat{border:1px solid var(--line-soft);border-radius:10px;padding:16px 16px 14px;background:var(--ink-2)}
+  .stat .big{font-family:var(--mono);font-size:24px;font-weight:600;color:var(--paper);line-height:1}
+  .stat .big.c{color:var(--data)}
+  .stat .sm{font-size:12px;color:var(--muted);margin-top:8px;line-height:1.4}
+
+  /* ---- sections ---- */
+  section{padding:46px 0;border-top:1px solid var(--line-soft)}
+  .sec-head{display:flex;align-items:baseline;gap:16px;margin-bottom:8px}
+  .sec-num{font-family:var(--mono);font-size:13px;color:var(--control);font-weight:600;
+    border:1px solid rgba(233,162,60,.35);border-radius:6px;padding:3px 9px;flex:0 0 auto}
+  h2{font-family:var(--mono);font-weight:600;font-size:clamp(21px,3vw,27px);letter-spacing:-.01em;margin:0}
+  .sec-sub{color:var(--muted);max-width:70ch;margin:14px 0 0}
+  .sec-sub code,p code,li code,td code{font-family:var(--mono);font-size:.88em;
+    background:rgba(67,202,189,.1);color:var(--data);padding:1px 6px;border-radius:5px}
+
+  p{margin:18px 0;color:#cdd9e8}
+  p b,li b{color:#fff;font-weight:600}
+  .reveal{opacity:0;transform:translateY(14px);transition:opacity .6s ease,transform .6s ease}
+  .reveal.in{opacity:1;transform:none}
+  @media(prefers-reduced-motion:reduce){.reveal{opacity:1;transform:none;transition:none}
+    .eyebrow .dot{animation:none}html{scroll-behavior:auto}}
+
+  /* ---- diagram card ---- */
+  .scope{margin:26px 0;border:1px solid var(--line);border-radius:13px;overflow:hidden;
+    background:var(--raised)}
+  .scope-bar{display:flex;align-items:center;gap:9px;padding:11px 16px;
+    background:var(--ink-2);border-bottom:1px solid var(--line);font-family:var(--mono);font-size:12px}
+  .scope-bar .dots{display:flex;gap:6px}
+  .scope-bar .dots i{width:10px;height:10px;border-radius:50%}
+  .scope-bar .dots i:nth-child(1){background:#37485e}
+  .scope-bar .dots i:nth-child(2){background:#37485e}
+  .scope-bar .dots i:nth-child(3){background:#37485e}
+  .scope-bar .ttl{color:var(--muted)}
+  .scope-bar .ttl b{color:var(--paper)}
+  .scope-body{padding:22px;overflow-x:auto;text-align:center}
+  pre.mermaid{margin:0;min-height:40px}
+  pre.mermaid:not([data-processed]){font-family:var(--mono);font-size:12px;color:var(--faint);text-align:left}
+
+  /* ---- callout ---- */
+  .note{border-left:3px solid var(--data);background:rgba(67,202,189,.06);
+    padding:15px 18px;border-radius:0 9px 9px 0;margin:22px 0;font-size:15px}
+  .note.warn{border-left-color:var(--control);background:rgba(233,162,60,.07)}
+  .note.warn .tag{color:var(--control)}
+  .note .tag{font-family:var(--mono);font-size:11px;letter-spacing:.1em;text-transform:uppercase;
+    color:var(--data);display:block;margin-bottom:6px}
+
+  .detail{border:1px solid var(--line-soft);border-radius:11px;padding:20px 22px;margin:18px 0;background:var(--ink-2)}
+  .detail h3{font-family:var(--mono);font-size:15px;margin:0 0 8px;color:var(--paper);font-weight:600}
+  .detail h3 .pin{color:var(--control)}
+
+  /* ---- table ---- */
+  table{width:100%;border-collapse:collapse;margin:22px 0;font-size:14px}
+  th,td{text-align:left;padding:12px 14px;border-bottom:1px solid var(--line-soft);vertical-align:top}
+  th{font-family:var(--mono);font-size:11px;letter-spacing:.08em;text-transform:uppercase;
+    color:var(--faint);font-weight:600}
+  td:first-child{font-family:var(--mono);color:var(--data);white-space:nowrap;font-size:12.5px}
+  tr:hover td{background:rgba(255,255,255,.015)}
+
+  footer{padding:48px 0 70px;border-top:1px solid var(--line-soft);color:var(--faint);
+    font-family:var(--mono);font-size:12px}
+  footer a{color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="grid">
+
+    <!-- TOC -->
+    <nav class="toc" id="toc">
+      <div class="lbl">Sections</div>
+      <a href="#arch"><span class="n">01</span>整体架构</a>
+      <a href="#dispatch"><span class="n">02</span>连接分发</a>
+      <a href="#lifecycle"><span class="n">03</span>启动→同步完成</a>
+      <a href="#push"><span class="n">04</span>缓存冷启动</a>
+      <a href="#failover"><span class="n">05</span>故障转移</a>
+      <a href="#details"><span class="n">06</span>实现细节</a>
+      <a href="#cmds"><span class="n">07</span>子命令</a>
+    </nav>
+
+    <main>
+      <!-- HERO -->
+      <header class="hero">
+        <div class="eyebrow"><span class="dot"></span>Hyperliquid · P2P sync gateway</div>
+        <h1>hypersync<br>架构与节点<span class="sync">同步流程</span>梳理</h1>
+        <p class="lede">挡在 Hyperliquid 非验证节点前面的<b>多 peer、带健康检查的故障转移透明代理 / P2P 网关</b>。节点把 <code style="font-family:var(--mono);font-size:.9em">root_node_ips</code> 指向它；它对上游 peer 池做透传、缓存、多路合并与自动 failover，把单个 peer 的抖动从节点解耦。</p>
+
+        <!-- signature: the wire frame -->
+        <div class="framewrap reveal">
+          <div class="frame">
+            <div class="seg len"><span class="h">u32 big-endian</span><span class="v">length (仅 payload)</span></div>
+            <div class="seg typ"><span class="h">1 byte</span><span class="v">type · 0=control 1=data</span></div>
+            <div class="seg pay"><span class="h">L bytes · lz4_flex(prepend_size)</span><span class="v">payload</span></div>
+          </div>
+          <div class="tick"><span class="mark">↑ 解压后 0x5e = round (0xfc + u32 LE)</span></div>
+          <div class="legend">
+            <span><i style="background:var(--control)"></i>type 0 — control / greeting / RPC 请求</span>
+            <span><i style="background:var(--data)"></i>type 1 — data / abci_state / blocks</span>
+            <span><i style="background:var(--violet)"></i>共识 round 偏移</span>
+          </div>
+        </div>
+
+        <div class="stats">
+          <div class="stat"><div class="big">4001<span style="color:var(--faint);font-size:14px"> / 4002</span></div><div class="sm">重通道 state·block / gossip RPC</div></div>
+          <div class="stat"><div class="big c">~4.5GB</div><div class="sm">bootstrap：abci_state + EVM KVs</div></div>
+          <div class="stat"><div class="big">~950MB</div><div class="sm">abci_state，per-IP 限速</div></div>
+          <div class="stat"><div class="big c">795×</div><div class="sm">热路径 vs 全解压（bench）</div></div>
+        </div>
+
+        <p class="src">源：GitHub <code>bufrr/hypersync</code> — README.md + docs/hl-p2p-protocol.md + src/main.rs (1421 行) + peerd.sh</p>
+      </header>
+
+      <!-- 01 ARCH -->
+      <section id="arch">
+        <div class="sec-head"><span class="sec-num">01</span><h2>整体架构</h2></div>
+        <p class="sec-sub">四个角色：本地 HL 节点、hypersync 网关进程、伴生的 <code>peerd.sh</code> 探活守护、以及 Hyperliquid 主网的上游 peer 池。</p>
+        <div class="scope reveal">
+          <div class="scope-bar"><span class="dots"><i></i><i></i><i></i></span><span class="ttl"><b>diagram</b> · system-architecture</span></div>
+          <div class="scope-body">
+<pre class="mermaid">
+flowchart TB
+  subgraph HL["Hyperliquid 主网"]
+    API["api.hyperliquid.xyz/info<br/>(gossipRootIps)"]
+    PEERS["上游真实 Peer 池<br/>非验证节点 · 端口 4000-4010<br/>4001=重通道 4002=gossip RPC"]
+  end
+  subgraph PEERD["peerd.sh 伴生守护进程"]
+    DISC["发现: gossipRootIps API<br/>+ 抓 node 日志 Ip(x.x.x.x)"]
+    PROBE["探活: send_abci:false<br/>只探 live-block(不限速)<br/>故意不探 abci_state(限速)"]
+    RANK["按 live-block 数排名<br/>写 peers.json"]
+  end
+  subgraph GW["hypersync gateway"]
+    L["监听 0.0.0.0:4000-4010"]
+    POOL["pool: 读 peers.json<br/>每 30s 刷新"]
+    ACTIVE["active peer<br/>本 node 会话锚定·所有连接复用"]
+    BOOT["boot_blob: RAM 缓存整份 bootstrap<br/>~4.5GB (仅 --push)"]
+    BUF["live 环形缓冲: round 去重"]
+    RPC["client-block RPC 代答(4002)"]
+  end
+  subgraph NODE["本地 HL Node (hl-visor/hl-node)"]
+    CFG["override_gossip_config.json<br/>root_node_ips=[gateway]<br/>try_new_peers:false"]
+  end
+  API --> DISC
+  PEERS -. 日志 .-> DISC
+  DISC --> PROBE --> RANK --> POOL
+  PROBE -. send_abci:false .-> PEERS
+  CFG -->|"出站 dial 4000-4010"| L
+  L --> BOOT & ACTIVE & BUF & RPC
+  POOL --> ACTIVE
+  ACTIVE -->|"relay / 代取"| PEERS
+  BOOT -. 抓一次·定期刷新 .-> PEERS
+  BUF -. 多路 .-> PEERS
+  RPC -. RANGE 查询 .-> PEERS
+</pre>
+          </div>
+        </div>
+        <div class="note warn">
+          <span class="tag">关键约束 · 协议 §4 §12</span>
+          节点<b>只从「自己主动 dial 的出站 peer」吃块</b>，入站推送无效。所以 hypersync 必须作为节点的出站 peer（写进 <code>root_node_ips</code>）——这是整个设计成立的前提。
+        </div>
+      </section>
+
+      <!-- 02 DISPATCH -->
+      <section id="dispatch">
+        <div class="sec-head"><span class="sec-num">02</span><h2>网关连接分发逻辑</h2></div>
+        <p class="sec-sub">节点对网关 4000–4010 全开连接。网关按端口与 greeting 区别对待（<code>run_gateway</code>）。</p>
+        <div class="scope reveal">
+          <div class="scope-bar"><span class="dots"><i></i><i></i><i></i></span><span class="ttl"><b>diagram</b> · connection-dispatch</span></div>
+          <div class="scope-body">
+<pre class="mermaid">
+flowchart TD
+  A["accept 连接 @ port"] --> B{"port?"}
+  B -->|4001| C["读 8 字节 greeting"]
+  C --> D{"greet[5]==1?<br/>(send_abci)"}
+  D -->|"=1 BOOTSTRAP"| E{"--push 且<br/>boot_blob 已缓存?"}
+  E -->|是| F["回放缓存 ~4.5GB → node<br/>再选 pool peer 转 live·设 active"]
+  E -->|否| G["round-robin 试 peer<br/>转发 greeting·偷看首帧"]
+  G --> H{"首帧 len > 4MB?"}
+  H -->|"否·被限速"| G
+  H -->|"是·正在服务 state"| I["设 active=该peer<br/>首帧写回 → splice 双向透传"]
+  D -->|"=0 live/resume"| J["选 reachable peer·设 active"]
+  J --> K{"--push?"}
+  K -->|否| L1["splice 透传"]
+  K -->|是| L2["serve_push: active 透传<br/>+ n_live-1 个 peer 合并 fastest-first"]
+  B -->|"4002 且 --push"| M["serve_client_blocks<br/>代 node 取 RANGE·verbatim 回传"]
+  B -->|"4000/4003-4010<br/>或 4002 无 --push"| N["dial_active: 复用 active → splice"]
+</pre>
+          </div>
+        </div>
+        <div class="note">
+          <span class="tag">为什么所有连接钉同一个 active</span>
+          4002 的 client-block RPC 若落到一个「从没给本节点服务过」的 peer，会被拒 <code>Peer-only request</code>。所以 <code>active</code> 一旦由 4001 块流连接设定，其余通道（<code>dial_active</code>）都复用它；且<b>瞬时失败不清空 active</b>——清了会抖动，导致 RPC 又落错 peer。
+        </div>
+      </section>
+
+      <!-- 03 LIFECYCLE -->
+      <section id="lifecycle">
+        <div class="sec-head"><span class="sec-num">03</span><h2>节点启动 → 同步完成</h2></div>
+        <p class="sec-sub">默认透明 failover 模式，对应协议 §9 的生命周期主线：配置 → bootstrap → catch-up → 稳态。</p>
+        <div class="scope reveal">
+          <div class="scope-bar"><span class="dots"><i></i><i></i><i></i></span><span class="ttl"><b>sequence</b> · startup-to-synced</span></div>
+          <div class="scope-body">
+<pre class="mermaid">
+sequenceDiagram
+  autonumber
+  participant N as HL Node
+  participant G as hypersync GW
+  participant P1 as Peer A (限速/拒绝)
+  participant P2 as Peer B (服务 state)
+  participant PX as Peer (4002 追块)
+  Note over N: ① 读 override_gossip_config.json<br/>root_node_ips=[GW], try_new_peers:false
+  N->>G: dial 4001 + greeting(send_abci:true)
+  Note over G: greet[5]==1 → BOOTSTRAP<br/>round-robin 逐个试探
+  G->>P1: 转发 greeting(send_abci:true)
+  P1-->>G: 首帧 len≤4MB (tiny status·被限速)
+  Note over G: ≤4MB → 跳过, 试下一个
+  G->>P2: 转发 greeting(send_abci:true)
+  P2-->>G: 首帧 len>4MB (abci_state 开始)
+  Note over G: ② active=P2·首帧写回<br/>之后 splice 纯透传<br/>(网关不解析内部 framing)
+  P2-->>N: abci_state(~950MB) → EVM KVs(~3.5GB) → live
+  Note over N: ③ 认证+提交快照<br/>写 visor_abci_state.json = 完成信号
+  Note over N,PX: ④ Catch-up 追块
+  loop 连续 ~100-round 窗口
+    N->>G: 4002 client-block RANGE [start,end]
+    G->>PX: dial_active 复用 active=P2
+    PX-->>G: ClientBlocks 批次 (N 个 element)
+    G-->>N: verbatim 转发 → node 逐个验签 apply
+  end
+  Note over N: 请求超过已提交 tip<br/>→ "client block round too large" → 等
+  Note over N,P2: ⑤ 稳态 steady state
+  P2-->>G: live block 流 (type=1, 4001)
+  G-->>N: 透传 → apply<br/>"app hashes reached quorum" 确认
+</pre>
+          </div>
+        </div>
+        <p>要点：bootstrap 阶段网关<b>完全不解析</b> abci_state→EVM-KVs→live 的内部边界（§7 明确这边界在线缆上不可见），只做字节级透传，让节点自己找边界、自己端到端验签。</p>
+      </section>
+
+      <!-- 04 PUSH -->
+      <section id="push">
+        <div class="sec-head"><span class="sec-num">04</span><h2><code>--push</code> 缓存冷启动</h2></div>
+        <p class="sec-sub">默认模式仍要节点从真 peer 流式拉整份 state；<code>--push</code> 把 bootstrap 缓存进网关 RAM，节点冷启动直接从缓存回放，绕开 per-IP 限速。节点可完全只连网关。</p>
+        <div class="scope reveal">
+          <div class="scope-bar"><span class="dots"><i></i><i></i><i></i></span><span class="ttl"><b>sequence</b> · cache-cold-start</span></div>
+          <div class="scope-body">
+<pre class="mermaid">
+sequenceDiagram
+  autonumber
+  participant G as GW(--push 后台)
+  participant SP as 快速 state-server
+  participant N as HL Node
+  participant LP as live peers (n_live)
+  participant CB as client-block peer
+  Note over G,SP: 启动即跑·每 900s 刷新
+  G->>SP: fetch_bootstrap, send_abci:true
+  SP-->>G: abci_state + EVM KVs 逐帧
+  Note over G: 速率门限 >10MB/s<br/>速率跌到 live 涓流持续~12s = bulk 结束<br/>整份 verbatim 存入 boot_blob
+  N->>G: dial 4001 + greeting(send_abci:true)
+  Note over G: 命中 boot_blob → 直接回放<br/>无 peer state fetch · 无限速
+  G-->>N: 回放 ~4.5GB 缓存
+  par 多路 live 合并
+    LP-->>G: live blocks (各 peer)
+  end
+  Note over G: round 去重 · fastest-first
+  G-->>N: 每个 round 取最快副本 (gap-free)
+  N->>G: 4002 client-block RANGE
+  Note over G: serve_client_blocks 代取
+  G->>CB: 转发同样的 RANGE 请求
+  CB-->>G: ClientBlocks 批次
+  G-->>N: verbatim 转发 (node 验签)
+  Note over N: 追到 tip → 写 visor_abci_state.json → 稳态
+</pre>
+          </div>
+        </div>
+      </section>
+
+      <!-- 05 FAILOVER -->
+      <section id="failover">
+        <div class="sec-head"><span class="sec-num">05</span><h2>故障转移状态机</h2></div>
+        <p class="sec-sub"><code>proxy</code> 模式（固定 peer 列表，非 peerd 池）的显式健康监控线程。</p>
+        <div class="scope reveal">
+          <div class="scope-bar"><span class="dots"><i></i><i></i><i></i></span><span class="ttl"><b>state</b> · proxy-failover</span></div>
+          <div class="scope-body">
+<pre class="mermaid">
+stateDiagram-v2
+  [*] --> Active: 选定 active peer
+  Active --> Active: 有数据流入(刷新 last_data_ms)
+  Active --> Failover: 静默 > STALL_MS(20s)<br/>或 dial 失败
+  Failover --> Active: pick_next() 找到健康 peer<br/>旧 peer 进 cooldown(30s)
+  Failover --> Active: 无健康替代<br/>→ 保持当前(避免震荡)
+</pre>
+          </div>
+        </div>
+        <p>切换靠一个 <code>generation</code> 计数器：每次 failover <code>generation+1</code>，正在跑的透传协程检测到代次变化就主动断开重连到新 active。</p>
+      </section>
+
+      <!-- 06 DETAILS -->
+      <section id="details">
+        <div class="sec-head"><span class="sec-num">06</span><h2>最关键的实现细节</h2></div>
+        <p class="sec-sub">三个容易踩坑的点。</p>
+
+        <div class="detail reveal">
+          <h3><span class="pin">▸</span> 两种块序列化不可互换 <span style="color:var(--faint);font-weight:400;font-size:13px">（§6，全代码最重要约束）</span></h3>
+          <p style="margin:8px 0 0">4001 上的 live/共识块（含 <code>abci_block</code> ~200KB，round 在解压后 <code>0x5e</code>）和 4002 RANGE 响应里的 <code>ClientBlock</code> element（含 <code>commit_proof</code> 的 child/grandchild QC，round 在 element 起点 <code>+0x5d</code>）是两种不同的 bincode 布局。<code>ClientBlock</code> 需要后续 round 才产生的 commit-proof，没法从单个 live 块合成——所以 catch-up <b>只能走真实 RPC 代取</b>，不能用缓冲的 live 块拼。</p>
+        </div>
+
+        <div class="detail reveal">
+          <h3><span class="pin">▸</span> 热路径优化 → 795×</h3>
+          <p style="margin:8px 0 0">去重只需读 round，所以 <code>lz4_first_n</code> 只做<b>有界 LZ4 解码</b>、解出前 ~99 字节（<code>0x63</code>）就停，不解整块 ~200KB；<code>RoundDedup</code> 用 FxHashSet + 定长 ring-buffer 做 cache 驻留窗口的去重淘汰。README 称比朴素全解压快约 795×（见 <code>bench</code>）。</p>
+        </div>
+
+        <div class="detail reveal">
+          <h3><span class="pin">▸</span> dedup 局限</h3>
+          <p style="margin:8px 0 0">去重 key 是 <code>u32</code> round，窗口 131072（gateway）/ 50000（cache）。round 当前约 1.35e9，u32 够用但理论上有回绕风险；窗口外的老 round 会被当新块——对实时 live 流没问题，若上游回灌很旧的块需留意。</p>
+        </div>
+      </section>
+
+      <!-- 07 CMDS -->
+      <section id="cmds">
+        <div class="sec-head"><span class="sec-num">07</span><h2>六种子命令速查</h2></div>
+        <table>
+          <thead><tr><th>子命令</th><th>作用</th></tr></thead>
+          <tbody>
+            <tr><td>gateway &lt;peers-file&gt; [--push] [--live N] [--retain N]</td><td>完整 P2P 网关（推荐）。peerd 池 + 透传/缓存 + 多路 live 合并 + 4002 代答</td></tr>
+            <tr><td>proxy &lt;peer1,peer2,…&gt; [--push]</td><td>固定 peer 列表的故障转移透明代理（4000-4010）</td></tr>
+            <tr><td>relay &lt;host&gt;</td><td>单上游纯透明多端口中继</td></tr>
+            <tr><td>serve &lt;port&gt; &lt;peers&gt;</td><td>多上游 live-block round 去重合并</td></tr>
+            <tr><td>cache &lt;port&gt; &lt;upstream&gt;</td><td>抓一次 abci_state 缓存，本地速度服务连入节点</td></tr>
+            <tr><td>mock / bench</td><td>回放抓取的块做测试 / 热路径基准</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <footer>
+        逆向自闭源 hl-visor / hl-node · 明文 TCP，无需 MITM · 块由节点端到端验签，网关只做字节级转发<br>
+        生成自 <a href="https://github.com/bufrr/hypersync">github.com/bufrr/hypersync</a>
+      </footer>
+    </main>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script>
+  const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  mermaid.initialize({
+    startOnLoad:true,
+    securityLevel:'loose',
+    theme:'base',
+    fontFamily:"'IBM Plex Mono', monospace",
+    themeVariables:{
+      background:'#142031',
+      primaryColor:'#17263a',
+      primaryTextColor:'#e9eff7',
+      primaryBorderColor:'#43cabd',
+      secondaryColor:'#1c2c40',
+      tertiaryColor:'#101a26',
+      lineColor:'#5d7591',
+      textColor:'#cdd9e8',
+      fontSize:'14px',
+      /* sequence */
+      actorBkg:'#17263a', actorBorder:'#43cabd', actorTextColor:'#e9eff7',
+      actorLineColor:'#37485e',
+      signalColor:'#8fa6c0', signalTextColor:'#cdd9e8',
+      noteBkgColor:'rgba(233,162,60,.14)', noteTextColor:'#e9eff7', noteBorderColor:'rgba(233,162,60,.5)',
+      loopTextColor:'#e9a23c',
+      labelBoxBkgColor:'#142031', labelBoxBorderColor:'#26384e', labelTextColor:'#cdd9e8',
+      /* state */
+      transitionColor:'#5d7591', transitionLabelColor:'#cdd9e8'
+    }
+  });
+
+  // scroll reveal
+  if(!reduce && 'IntersectionObserver' in window){
+    const io = new IntersectionObserver((es)=>{
+      es.forEach(e=>{ if(e.isIntersecting){ e.target.classList.add('in'); io.unobserve(e.target);} });
+    },{threshold:.12});
+    document.querySelectorAll('.reveal').forEach(el=>io.observe(el));
+  } else {
+    document.querySelectorAll('.reveal').forEach(el=>el.classList.add('in'));
+  }
+
+  // active TOC highlight
+  const links = [...document.querySelectorAll('#toc a')];
+  const secs = links.map(a=>document.querySelector(a.getAttribute('href')));
+  const so = new IntersectionObserver((es)=>{
+    es.forEach(e=>{
+      if(e.isIntersecting){
+        const i = secs.indexOf(e.target);
+        links.forEach(l=>l.classList.remove('active'));
+        if(i>=0) links[i].classList.add('active');
+      }
+    });
+  },{rootMargin:'-30% 0px -60% 0px'});
+  secs.forEach(s=>s && so.observe(s));
+</script>
+</body>
+</html>

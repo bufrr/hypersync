@@ -9,9 +9,8 @@
 // Subcommand `mock <bind:port> <dir> <start> <end>` replays captured blocks[start..end] for testing.
 
 use std::collections::BTreeMap;
-use rustc_hash::FxHashSet;
 use std::env;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -88,12 +87,44 @@ fn lz4_first_n(input: &[u8], out: &mut [u8]) -> Option<usize> {
 
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn block_round(payload: &[u8]) -> Option<u32> {
-    if payload.len() < 4 {
+    if payload.len() < 5 {
         return block_round_full(payload);
     }
+    let lz = &payload[4..]; // skip the u32-LE uncompressed-size prefix
+    // fast path: the first 0x63 decompressed bytes of an lz4 block are always raw literals (nothing
+    // to back-reference at the start). If the first token's literal run covers them, read the round
+    // straight from the literal bytes — no decode buffer, no copy.
+    let token = lz[0];
+    let mut lit = (token >> 4) as usize;
+    let mut p = 1usize;
+    if lit == 15 {
+        while p < lz.len() {
+            let b = lz[p];
+            p += 1;
+            lit += b as usize;
+            if b != 255 {
+                break;
+            }
+        }
+    }
+    if lit >= 0x63 && p + 0x63 <= lz.len() {
+        // SAFETY: p + 0x63 <= lz.len() is checked on the line above.
+        unsafe {
+            return if *lz.get_unchecked(p + 0x5e) == 0xfc {
+                Some(u32::from_le_bytes([
+                    *lz.get_unchecked(p + 0x5f),
+                    *lz.get_unchecked(p + 0x60),
+                    *lz.get_unchecked(p + 0x61),
+                    *lz.get_unchecked(p + 0x62),
+                ]))
+            } else {
+                None
+            };
+        }
+    }
     let mut buf = [0u8; 0x63];
-    match lz4_first_n(&payload[4..], &mut buf) {
-        Some(p) if p >= 0x63 => {
+    match lz4_first_n(lz, &mut buf) {
+        Some(n) if n >= 0x63 => {
             if buf[0x5e] == 0xfc {
                 Some(u32::from_le_bytes([buf[0x5f], buf[0x60], buf[0x61], buf[0x62]]))
             } else {
@@ -105,35 +136,24 @@ fn block_round(payload: &[u8]) -> Option<u32> {
 }
 
 struct RoundDedup {
-    // (membership set, insertion-order ring buffer, ring write cursor)
-    seen: parking_lot::Mutex<(FxHashSet<u32>, Vec<u32>, usize)>,
-    cap: usize,
-    uniq: AtomicU64,
-    dups: AtomicU64,
+    // slot[r % cap] = most recent round that mapped to that slot. Lock-free: an atomic swap is O(1)
+    // with no mutex. Consensus rounds are ~sequential, so this is a hash-free sliding window of the
+    // last ~cap rounds. A rare race (two threads swap the same r) only re-forwards one block, which
+    // the node de-dups anyway ("received old client block"), so it's harmless.
+    slots: Vec<AtomicU32>,
+    mask: usize,
 }
 impl RoundDedup {
     fn new(cap: usize) -> Self {
-        let set = FxHashSet::with_capacity_and_hasher(cap, Default::default());
-        Self { seen: parking_lot::Mutex::new((set, Vec::with_capacity(cap), 0usize)), cap, uniq: AtomicU64::new(0), dups: AtomicU64::new(0) }
+        let cap = cap.next_power_of_two(); // power-of-two so `% cap` becomes a single-cycle `& mask`
+        Self {
+            slots: (0..cap).map(|_| AtomicU32::new(0)).collect(),
+            mask: cap - 1,
+        }
     }
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     fn is_new(&self, r: u32) -> bool {
-        let mut g = self.seen.lock();
-        if !g.0.insert(r) {
-            self.dups.fetch_add(1, Ordering::Relaxed);
-            return false;
-        }
-        if g.1.len() < self.cap {
-            g.1.push(r);
-        } else {
-            let c = g.2;
-            let old = g.1[c];
-            g.0.remove(&old);
-            g.1[c] = r;
-            g.2 = (c + 1) % self.cap;
-        }
-        self.uniq.fetch_add(1, Ordering::Relaxed);
-        true
+        self.slots[(r as usize) & self.mask].swap(r, Ordering::Relaxed) != r
     }
 }
 
@@ -227,7 +247,7 @@ async fn serve(mut down: TcpStream, upstreams: Vec<String>) -> std::io::Result<(
     timeout(Duration::from_secs(20), down.read_exact(&mut g)).await??;
     eprintln!("[gw] node greeting {:02x?}", g);
 
-    let dedup = Arc::new(RoundDedup::new(131_072));
+    let dedup = Arc::new(RoundDedup::new(16_384));
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(4096);
 
     for ip in &upstreams {
@@ -252,16 +272,10 @@ async fn serve(mut down: TcpStream, upstreams: Vec<String>) -> std::io::Result<(
             break;
         }
         if nframes % 5 == 0 {
-            eprintln!(
-                "[gw] unique_rounds(forwarded)={} deduped={} frames={}",
-                dedup.uniq.load(Ordering::Relaxed), dedup.dups.load(Ordering::Relaxed), nframes
-            );
+            eprintln!("[gw] frames forwarded={}", nframes);
         }
     }
-    eprintln!(
-        "[gw] end: unique_rounds={} deduped={} frames={} bytes={}",
-        dedup.uniq.load(Ordering::Relaxed), dedup.dups.load(Ordering::Relaxed), nframes, bytes
-    );
+    eprintln!("[gw] end: frames={} bytes={}", nframes, bytes);
     Ok(())
 }
 
@@ -1204,7 +1218,7 @@ async fn run_proxy(upstreams: Vec<String>, push: bool) {
 // active peer AND every other peer are merged by consensus round (dedup) and forwarded to the node
 // fastest-first => the node receives each block at the earliest arrival across all peers (lower latency).
 async fn serve_push(node: TcpStream, active_conn: TcpStream, hosts: Arc<Vec<String>>, active_idx: usize, port: u16) {
-    let dedup = Arc::new(RoundDedup::new(131_072));
+    let dedup = Arc::new(RoundDedup::new(16_384));
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(8192);
     let (node_r, mut node_w) = node.into_split();
     let (act_r, mut act_w) = active_conn.into_split();
@@ -1360,7 +1374,7 @@ fn run_bench(dir: &str, iters: usize) {
     }
     eprintln!("[bench] verify: {} blocks, {} mismatch vs full-decompress oracle", payloads.len(), mism);
 
-    let dedup = RoundDedup::new(131_072);
+    let dedup = RoundDedup::new(16_384);
     let mut forwarded = 0u64;
     let mut bytes = 0u64;
     let t0 = std::time::Instant::now();
