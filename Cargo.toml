@@ -1,10 +1,10 @@
 [package]
-name = "hl-push-gateway"
+name = "hypersync"
 version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "hl-push-gateway"
+name = "hypersync"
 path = "src/main.rs"
 
 [dependencies]
