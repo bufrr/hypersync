@@ -43,4 +43,4 @@ Point the node's `override_gossip_config.json` at hypersync and restart it so th
 
 ## Performance
 
-The hot path (decode + dedup) is heavily optimized vs a naive full-decompress implementation: bounded lz4 decode (only the first ~99 bytes are needed to read the round), FxHash dedup over a cache-resident window, flat ring-buffer eviction. ~**795x** throughput in the included `bench`.
+The hot path (lz4 round-decode + dedup) is heavily optimized. Reading a block's consensus round needs only the first decompressed bytes, and the lz4 literal run at the block head normally covers them — so the round is read straight from the compressed literals with **no decode buffer at all** (it falls back to a bounded decode otherwise). Dedup is a lock-free, hash-free sliding window: a power-of-two `AtomicU32` array indexed by `round & mask` and updated with a single atomic swap — no mutex, no hashing, no ring-buffer eviction. ~**135M frames/s** in the included `bench` — about **4.3x** the previous already-optimized baseline (and far higher vs a naive full-decompress).
