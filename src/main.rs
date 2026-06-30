@@ -13,7 +13,7 @@ use rustc_hash::FxHashSet;
 use std::env;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
@@ -178,6 +178,26 @@ async fn main() {
         let port: u16 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(4001);
         let upstream = args.get(3).cloned().unwrap_or_else(|| "172.18.0.2:4001".into());
         run_cache(port, upstream).await;
+        return;
+    }
+    if args.get(1).map(|s| s.as_str()) == Some("gateway") {
+        // full P2P gateway: reads the node's OWN peer file (path arg) for its upstream pool, then
+        // caches abci_state + round-merges live blocks from many peers + proxies gossip RPC w/ failover.
+        let node_peer_file = args.get(2).cloned().unwrap_or_else(|| "/nodepeers".into());
+        // --push: also merge-push live blocks from multiple peers (lower latency); default off (pure
+        // transparent failover). --live N: concurrent upstreams for the merge (default 10). --retain N:
+        // how many recent blocks the gateway keeps (block-height window) — bounds memory (default 5000).
+        let push = args.iter().any(|a| a == "--push");
+        let flagval = |name: &str, def: usize| {
+            args.iter()
+                .position(|a| a == name)
+                .and_then(|i| args.get(i + 1))
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(def)
+        };
+        let n_live = flagval("--live", 5);
+        let retain = flagval("--retain", 5000);
+        run_gateway(node_peer_file, push, n_live, retain).await;
         return;
     }
     let port: u16 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(4001);
@@ -471,6 +491,566 @@ async fn feed_live(
                 let _ = btx.send(frame);
             }
         }
+    }
+}
+
+// ---- full P2P gateway ----
+fn is_ipv4(s: &str) -> bool {
+    let mut parts = 0;
+    for p in s.split('.') {
+        parts += 1;
+        if p.is_empty() || p.len() > 3 {
+            return false;
+        }
+        match p.parse::<u32>() {
+            Ok(n) if n <= 255 => {}
+            _ => return false,
+        }
+    }
+    parts == 4
+}
+fn is_routable(s: &str) -> bool {
+    !(s.starts_with("0.")
+        || s.starts_with("127.")
+        || s.starts_with("10.")
+        || s.starts_with("172.")
+        || s.starts_with("192.168.")
+        || s.starts_with("169.254.")
+        || s.starts_with("255."))
+}
+// Extract peer IPv4s out of the local node's own peer file (e.g. hl/data/tcp_lz4_stats/<date>, which
+// logs every peer the node exchanged data with). Timestamps/floats/ports are not valid 4-octet IPs so
+// they are skipped. The gateway uses the node's OWN discovered peers as its upstream pool.
+fn extract_ipv4(s: &str) -> Vec<String> {
+    let b = s.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i].is_ascii_digit() {
+            let start = i;
+            while i < b.len() && (b[i].is_ascii_digit() || b[i] == b'.') {
+                i += 1;
+            }
+            let tok = &s[start..i];
+            if is_ipv4(tok) && is_routable(tok) {
+                out.push(tok.to_string());
+            }
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+fn read_node_peers(path: &str) -> Vec<String> {
+    use std::collections::HashSet;
+    // preserve file order (peerd ranks live-servers best-first); dedup keeping first occurrence.
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out: Vec<String> = Vec::new();
+    let p = std::path::Path::new(path);
+    let mut files: Vec<std::path::PathBuf> = Vec::new();
+    if p.is_dir() {
+        if let Ok(rd) = std::fs::read_dir(p) {
+            for e in rd.flatten() {
+                if e.path().is_file() {
+                    files.push(e.path());
+                }
+            }
+        }
+    } else {
+        files.push(p.to_path_buf());
+    }
+    for f in files {
+        if let Ok(s) = std::fs::read_to_string(&f) {
+            for ip in extract_ipv4(&s) {
+                if seen.insert(ip.clone()) {
+                    out.push(ip);
+                }
+            }
+        }
+    }
+    out
+}
+
+// Bidirectionally relay a node connection and its chosen upstream until either side closes.
+async fn splice(down: TcpStream, upc: TcpStream) {
+    let (mut dr, mut dw) = down.into_split();
+    let (mut ur, mut uw) = upc.into_split();
+    let h = tokio::spawn(async move {
+        let _ = tokio::io::copy(&mut ur, &mut dw).await;
+    });
+    let _ = tokio::io::copy(&mut dr, &mut uw).await;
+    h.abort();
+}
+
+// Connect to the session's active peer (the one serving the node's bootstrap) on `port`, waiting
+// briefly for the bootstrap to set it; falls back to a round-robin pool peer if none is set yet.
+async fn dial_active(
+    active: &Arc<Mutex<Option<String>>>,
+    peers: &[String],
+    rr: &Arc<AtomicUsize>,
+    port: u16,
+) -> Option<TcpStream> {
+    let n = peers.len();
+    if n == 0 {
+        return None;
+    }
+    // brief wait in case a concurrent bootstrap is about to set the active peer
+    let mut target = None;
+    for _ in 0..15 {
+        if let Some(a) = active.lock().unwrap().clone() {
+            target = Some(a);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    // no active yet (e.g. a resuming node after a gateway restart, with no fresh bootstrap): establish
+    // one now so EVERY connection of this node converges on the same upstream (client-block RPC needs it)
+    let target = match target {
+        Some(t) => t,
+        None => {
+            let mut a = active.lock().unwrap();
+            match a.clone() {
+                Some(t) => t,
+                None => {
+                    let t = peers[rr.fetch_add(1, Ordering::Relaxed) % n].clone();
+                    *a = Some(t.clone());
+                    t
+                }
+            }
+        }
+    };
+    let up = format!("{}:{}", target, port);
+    match timeout(Duration::from_secs(5), TcpStream::connect(&up)).await {
+        Ok(Ok(c)) => {
+            c.set_nodelay(true).ok();
+            Some(c)
+        }
+        // do NOT clear active on a transient failure (that flaps the active peer and makes the
+        // client-block RPC land on a peer that doesn't know this node -> "Peer-only request").
+        // The active peer is (re)set by the node's 4001 block-stream connection instead.
+        _ => None,
+    }
+}
+
+type BlockBuf = Arc<Mutex<BTreeMap<u32, Arc<Vec<u8>>>>>; // reserved cache type (serve fetch-forwards)
+
+// Serve the node's client-block RPC (port 4002). A node that cold-started from the cached bootstrap
+// has NO peer relationship, so the gateway fetches the requested range from a real peer ON THE NODE'S
+// BEHALF (client-block range queries are answered to any caller) and forwards the response verbatim
+// (the node verifies signatures). This lets the node sync entirely through the gateway. The buffered
+// LIVE blocks can't be reused here — a live/consensus block is a DIFFERENT serialization from a
+// ClientBlock element (the latter needs commit-proof from later rounds), so we fetch the real thing.
+async fn serve_client_blocks(
+    down: TcpStream,
+    _buf: BlockBuf,
+    active: Arc<Mutex<Option<String>>>,
+    peers: Vec<String>,
+    rr: Arc<AtomicUsize>,
+) {
+    let mut down = down;
+    let n = peers.len();
+    if n == 0 {
+        return;
+    }
+    let mut hdr = [0u8; 5];
+    if timeout(Duration::from_secs(120), down.read_exact(&mut hdr))
+        .await
+        .is_err()
+    {
+        return;
+    }
+    let len = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as usize;
+    if len > 65536 {
+        return;
+    }
+    let mut payload = vec![0u8; len];
+    if timeout(Duration::from_secs(30), down.read_exact(&mut payload))
+        .await
+        .is_err()
+    {
+        return;
+    }
+    let mut req = hdr.to_vec();
+    req.extend_from_slice(&payload);
+    // fetch the same request from a real peer (active first, then round-robin pool); forward verbatim
+    let mut cands: Vec<String> = Vec::new();
+    if let Some(a) = active.lock().unwrap().clone() {
+        cands.push(a);
+    }
+    let start = rr.fetch_add(1, Ordering::Relaxed);
+    for k in 0..n {
+        cands.push(peers[(start + k) % n].clone());
+    }
+    for ip in cands {
+        let up = format!("{}:4002", ip);
+        let Ok(Ok(mut upc)) = timeout(Duration::from_secs(5), TcpStream::connect(&up)).await else {
+            continue;
+        };
+        upc.set_nodelay(true).ok();
+        if upc.write_all(&req).await.is_err() {
+            continue;
+        }
+        let mut rh = [0u8; 5];
+        if timeout(Duration::from_secs(15), upc.read_exact(&mut rh))
+            .await
+            .is_err()
+        {
+            continue;
+        }
+        let rl = u32::from_be_bytes([rh[0], rh[1], rh[2], rh[3]]) as usize;
+        if rl > 200_000_000 {
+            continue;
+        }
+        let mut rp = vec![0u8; rl];
+        if timeout(Duration::from_secs(30), upc.read_exact(&mut rp))
+            .await
+            .is_err()
+        {
+            continue;
+        }
+        let _ = down.write_all(&rh).await;
+        let _ = down.write_all(&rp).await;
+        return;
+    }
+}
+
+// Capture a full bootstrap (abci_state + EVM KVs) VERBATIM from a serving state-server, frame-aligned,
+// stopping when the bulk transfer ends (byte rate collapses from the bulk's tens-of-MB/s to the
+// live-block trickle). Replayed to a bootstrapping node so it never pulls the snapshot from a peer
+// (avoids the per-IP abci_state rate-limit). The node handles the internal abci_state/EVM-KVs/live
+// framing itself, so the gateway needn't understand the (undocumented) boundary.
+async fn fetch_bootstrap(upstream: &str) -> std::io::Result<Vec<u8>> {
+    let mut s = TcpStream::connect(upstream).await?;
+    s.set_nodelay(true).ok();
+    s.write_all(&[0, 0, 0, 3, 0, 1, 0, 0]).await?; // send_abci:true
+    let mut blob: Vec<u8> = Vec::new();
+    let t0 = Instant::now();
+    let mut first = true;
+    let mut win = Instant::now();
+    let mut win_bytes = 0usize;
+    let mut slow = 0u32;
+    loop {
+        let mut hdr = [0u8; 5];
+        match timeout(Duration::from_secs(20), s.read_exact(&mut hdr)).await {
+            Ok(Ok(_)) => {}
+            _ => break,
+        }
+        let len = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as usize;
+        if first {
+            if len <= 4_000_000 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "not serving abci_state",
+                ));
+            }
+            first = false;
+        }
+        if len > 2_000_000_000 {
+            break;
+        }
+        let mut payload = vec![0u8; len];
+        if timeout(Duration::from_secs(60), s.read_exact(&mut payload))
+            .await
+            .is_err()
+        {
+            break;
+        }
+        blob.extend_from_slice(&hdr);
+        blob.extend_from_slice(&payload);
+        win_bytes += 5 + len;
+        // speed gate: right after the abci_state snapshot, require a fast server (else the EVM-KVs
+        // capture is slow and the rate-drop detector could mistake a slow tail for the end).
+        if blob.len() >= 900_000_000 && blob.len() < 970_000_000 {
+            let r = blob.len() as f64 / t0.elapsed().as_secs_f64();
+            if r < 10_000_000.0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "state-server too slow",
+                ));
+            }
+        }
+        let el = win.elapsed();
+        if el >= Duration::from_millis(1500) {
+            let rate = win_bytes as f64 / el.as_secs_f64();
+            // bulk (abci_state + EVM KVs) ends when the rate collapses to the live-block trickle.
+            // Require it SUSTAINED (~12s of <400KB/s) so a mid-EVM-KVs slowdown isn't taken for the end.
+            if blob.len() > 1_500_000_000 && rate < 400_000.0 {
+                slow += 1;
+                if slow >= 8 {
+                    break;
+                }
+            } else {
+                slow = 0;
+            }
+            win = Instant::now();
+            win_bytes = 0;
+        }
+    }
+    Ok(blob)
+}
+
+// Full P2P gateway. The node connects ONLY to the gateway; the gateway provides all of HL's sync P2P
+// backed by MULTIPLE upstream peers (taken from the node's own peer file, a startup path arg):
+//   - abci_state: fetched from a pool peer and CACHED (served to the node at local speed, so node
+//     restarts never re-pull ~950MB and never hit the per-IP abci_state rate-limit);
+//   - live blocks: round-merged from several pool peers (fastest-block-first, gap-free);
+//   - gossip RPC (4002 etc.): transparently proxied to an active pool peer, failing over on dial error.
+// If the active peer has a problem the gateway uses the next peer from the (continuously refreshed) pool.
+async fn run_gateway(node_peer_file: String, push: bool, n_live: usize, retain: usize) {
+    let pool: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(read_node_peers(&node_peer_file)));
+    let buf: BlockBuf = Arc::new(Mutex::new(BTreeMap::new()));
+    // cached verbatim bootstrap (abci_state + EVM KVs) for cold-start without a peer state fetch
+    let boot_blob: Arc<Mutex<Option<Arc<Vec<u8>>>>> = Arc::new(Mutex::new(None));
+    let rr = Arc::new(AtomicUsize::new(0)); // round-robin so successive bootstraps pick fresh peers
+    // the peer that served the node's bootstrap; ALL the node's connections reuse it so client-block
+    // RPC (4002) isn't rejected with "Peer-only request" for hitting a peer that doesn't know the node.
+    let active: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    eprintln!(
+        "[gw] full P2P gateway: pool from {} ({} peers); mode={}; live-merge upstreams={}, retain={} blocks",
+        node_peer_file,
+        pool.lock().unwrap().len(),
+        if push { "transparent + block-push" } else { "transparent failover" },
+        n_live,
+        retain
+    );
+
+    // pool refresher: re-read the node's peer file (peerd keeps it fresh)
+    {
+        let pool = pool.clone();
+        let path = node_peer_file.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                let p = read_node_peers(&path);
+                if !p.is_empty() {
+                    *pool.lock().unwrap() = p;
+                }
+            }
+        });
+    }
+
+    // block buffer for the gossip RPC server (--push): round-indexed recent blocks, bounded by
+    // `retain`, populated by `n_live` persistent live feeders. Lets the gateway answer a node's
+    // client-block catch-up RANGE requests locally (no peer load, no "Peer-only request");
+    // bootstrap (abci_state + EVM KVs) still streams transparently from a real peer.
+    if push {
+        // bootstrap capture: fetch + cache the full bootstrap (abci_state + EVM KVs) verbatim from a
+        // serving state-server, so a node can cold-start from cache (no per-IP state rate-limit). Refresh.
+        {
+            let boot_blob = boot_blob.clone();
+            let pool = pool.clone();
+            tokio::spawn(async move {
+                loop {
+                    let peers = pool.lock().unwrap().clone();
+                    let mut got = false;
+                    for ip in peers.iter().take(12) {
+                        if let Ok(blob) = fetch_bootstrap(&format!("{}:4001", ip)).await {
+                            if blob.len() > 500_000_000 {
+                                eprintln!(
+                                    "[gw] bootstrap captured: {} MB via {}",
+                                    blob.len() / 1_000_000,
+                                    ip
+                                );
+                                *boot_blob.lock().unwrap() = Some(Arc::new(blob));
+                                got = true;
+                                break;
+                            }
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_secs(if got { 900 } else { 60 })).await;
+                }
+            });
+        }
+    }
+
+    // listeners on 4000-4010. The node connects ONLY here; the gateway transparently relays each
+    // connection to a real upstream peer. For the heavy channel (4001) bootstrap (send_abci:true)
+    // it picks a peer that is ACTUALLY serving the abci_state right now (peeks the first frame:
+    // a serving peer sends the >4MB state, a rate-limited one sends a tiny status frame -> try next),
+    // so the node streams the complete abci_state + EVM KVs + live blocks straight from a fresh peer.
+    // Round-robin start means node/gateway restarts rotate to a different fresh state-server (no
+    // per-peer abci_state rate-limit). The whole pool behind the gateway is the failover set.
+    let mut handles = Vec::new();
+    for port in 4000u16..=4010 {
+        let pool = pool.clone();
+        let rr = rr.clone();
+        let active = active.clone();
+        let buf = buf.clone();
+        let boot_blob = boot_blob.clone();
+        handles.push(tokio::spawn(async move {
+            let l = match TcpListener::bind(("0.0.0.0", port)).await {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("[gw] bind :{port}: {e}");
+                    return;
+                }
+            };
+            loop {
+                let (down, _addr) = match l.accept().await {
+                    Ok(x) => x,
+                    Err(_) => continue,
+                };
+                let pool = pool.clone();
+                let rr = rr.clone();
+                let active = active.clone();
+                let buf = buf.clone();
+                let boot_blob = boot_blob.clone();
+                tokio::spawn(async move {
+                    let mut down = down;
+                    down.set_nodelay(true).ok();
+                    let peers = pool.lock().unwrap().clone();
+                    let n = peers.len();
+                    if n == 0 {
+                        return;
+                    }
+                    if port == 4001 {
+                        let mut greet = [0u8; 8];
+                        if timeout(Duration::from_secs(20), down.read_exact(&mut greet))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                        if greet[5] == 1 {
+                            // BOOTSTRAP. With --push + a captured snapshot, serve it FROM CACHE (no peer
+                            // state fetch, no rate-limit); then stream live from a pool peer. The node
+                            // catches up the gap via the client-block RPC server (4002, from the buffer).
+                            if push {
+                                let blob = boot_blob.lock().unwrap().clone();
+                                if let Some(blob) = blob {
+                                    eprintln!(
+                                        "[gw] node cold-start FROM CACHE ({} MB), no peer state fetch",
+                                        blob.len() / 1_000_000
+                                    );
+                                    if down.write_all(&blob).await.is_err() {
+                                        return;
+                                    }
+                                    let start = rr.fetch_add(1, Ordering::Relaxed);
+                                    for k in 0..n {
+                                        let ip = peers[(start + k) % n].clone();
+                                        if let Ok(Ok(mut upc)) = timeout(
+                                            Duration::from_secs(5),
+                                            TcpStream::connect(&format!("{}:4001", ip)),
+                                        )
+                                        .await
+                                        {
+                                            upc.set_nodelay(true).ok();
+                                            if upc.write_all(&GREET_FALSE).await.is_ok() {
+                                                *active.lock().unwrap() = Some(ip.clone());
+                                                splice(down, upc).await;
+                                                return;
+                                            }
+                                        }
+                                    }
+                                    return;
+                                }
+                            }
+                            // fallback: transparently relay a peer that is serving the abci_state now
+                            let start = rr.fetch_add(1, Ordering::Relaxed);
+                            let mut chosen: Option<(TcpStream, [u8; 5])> = None;
+                            for k in 0..n {
+                                let ip = peers[(start + k) % n].clone();
+                                let up = format!("{}:4001", ip);
+                                let mut upc = match timeout(
+                                    Duration::from_secs(5),
+                                    TcpStream::connect(&up),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(c)) => c,
+                                    _ => continue,
+                                };
+                                upc.set_nodelay(true).ok();
+                                if upc.write_all(&greet).await.is_err() {
+                                    continue;
+                                }
+                                let mut hdr = [0u8; 5];
+                                match timeout(Duration::from_secs(12), upc.read_exact(&mut hdr)).await
+                                {
+                                    Ok(Ok(_)) => {
+                                        let len = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]])
+                                            as usize;
+                                        if len <= 4_000_000 {
+                                            continue;
+                                        }
+                                        eprintln!(
+                                            "[gw] node bootstrap via {ip} (abci_state {} bytes); active set",
+                                            len
+                                        );
+                                        *active.lock().unwrap() = Some(ip.clone());
+                                        chosen = Some((upc, hdr));
+                                        break;
+                                    }
+                                    _ => continue,
+                                }
+                            }
+                            let Some((upc, hdr)) = chosen else {
+                                eprintln!("[gw] no peer serving abci_state right now");
+                                return;
+                            };
+                            if down.write_all(&hdr).await.is_err() {
+                                return;
+                            }
+                            splice(down, upc).await;
+                        } else {
+                            // live/resume channel: choose a reachable peer, make it THIS node's active
+                            // session peer (so its client-block RPC on 4002 hits the same peer), forward
+                            // the greeting, and relay. This is what (re)establishes `active`.
+                            let start = rr.fetch_add(1, Ordering::Relaxed);
+                            for k in 0..n {
+                                let ip = peers[(start + k) % n].clone();
+                                let up = format!("{}:4001", ip);
+                                let mut upc = match timeout(
+                                    Duration::from_secs(5),
+                                    TcpStream::connect(&up),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(c)) => c,
+                                    _ => continue,
+                                };
+                                upc.set_nodelay(true).ok();
+                                if upc.write_all(&greet).await.is_err() {
+                                    continue;
+                                }
+                                *active.lock().unwrap() = Some(ip.clone());
+                                if push {
+                                    // active stays transparent (keeps the peer relationship for the
+                                    // 4002 client-block RPC) + inject the fastest copy of each block
+                                    // from up to n_live-1 other peers (multi-source acceleration).
+                                    let mut hosts = vec![ip.clone()];
+                                    for p in peers.iter() {
+                                        if hosts.len() >= n_live {
+                                            break;
+                                        }
+                                        if *p != ip {
+                                            hosts.push(p.clone());
+                                        }
+                                    }
+                                    serve_push(down, upc, Arc::new(hosts), 0, 4001).await;
+                                } else {
+                                    splice(down, upc).await;
+                                }
+                                break;
+                            }
+                        }
+                    } else if push && port == 4002 {
+                        // serve the node's client-block catch-up from the local buffer; falls back
+                        // to relaying to the active peer for anything not fully buffered.
+                        serve_client_blocks(down, buf, active, peers, rr).await;
+                    } else {
+                        // other gossip channels: reuse the active peer (consistent for the node)
+                        let Some(upc) = dial_active(&active, &peers, &rr, port).await else {
+                            return;
+                        };
+                        splice(down, upc).await;
+                    }
+                });
+            }
+        }));
+    }
+    for h in handles {
+        let _ = h.await;
     }
 }
 
