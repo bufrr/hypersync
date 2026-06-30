@@ -1221,13 +1221,37 @@ async fn serve_push(node: TcpStream, active_conn: TcpStream, hosts: Arc<Vec<Stri
     let dedup = Arc::new(RoundDedup::new(16_384));
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(8192);
     let (node_r, mut node_w) = node.into_split();
-    let (act_r, mut act_w) = active_conn.into_split();
-    // node -> active peer (transparent: greeting + RPC requests + acks)
+    let (mut act_r, mut act_w) = active_conn.into_split();
+    // The node's first read on 4001 is the peer's greeting ("abci_stream recv greeting", max 1000
+    // bytes). Forward the active peer's greeting frame to the node BEFORE starting the shadow
+    // injectors: they all share node_w, so a shadow peer's first live block can otherwise reach the
+    // node ahead of the greeting, and the node reads the block's length as the greeting length and
+    // bails ("tcp read bytes over limit").
+    {
+        let mut hdr = [0u8; 5];
+        if act_r.read_exact(&mut hdr).await.is_err() {
+            return;
+        }
+        let len = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as usize;
+        if len > 1000 {
+            return; // first frame from a live (send_abci:false) peer must be the small greeting
+        }
+        let mut g = vec![0u8; len];
+        if act_r.read_exact(&mut g).await.is_err() {
+            return;
+        }
+        let mut greet = hdr.to_vec();
+        greet.extend_from_slice(&g);
+        if node_w.write_all(&greet).await.is_err() {
+            return;
+        }
+    }
+    // node -> active peer (transparent: RPC requests + acks)
     {
         let mut node_r = node_r;
         tokio::spawn(async move { let _ = tokio::io::copy(&mut node_r, &mut act_w).await; });
     }
-    // active peer -> node: control / abci_state forwarded as-is, block frames deduped by round
+    // active peer -> node: block frames deduped by round (greeting already forwarded above)
     {
         let tx = tx.clone();
         let dedup = dedup.clone();
