@@ -1038,6 +1038,7 @@ async fn run_gateway(node_peer_file: String, push: bool, n_live: usize) {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs() as usize)
                     .unwrap_or(0);
+                let mut fails = 0u32;
                 loop {
                     // Until we have ANY cached blob the node can't cold-start, so the initial
                     // capture is urgent: search a wide window and retry fast. Once cached, the old
@@ -1071,11 +1072,16 @@ async fn run_gateway(node_peer_file: String, push: bool, n_live: usize) {
                         false
                     };
                     let delay = if got {
+                        fails = 0;
                         900
                     } else if have_cache {
                         60
                     } else {
-                        8
+                        // initial capture failing: back off 8->16->32->60s so a degraded /
+                        // rate-limited pool isn't hammered every 8s forever (still fast for the
+                        // first few tries when the pool is healthy).
+                        fails = (fails + 1).min(4);
+                        (8u64 << (fails - 1)).min(60)
                     };
                     tokio::time::sleep(Duration::from_secs(delay)).await;
                 }
