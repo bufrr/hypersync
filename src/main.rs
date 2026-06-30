@@ -24,7 +24,9 @@ const GREET_FALSE: [u8; 8] = [0, 0, 0, 3, 0, 0, 0, 0]; // send_abci:false (live 
 fn block_round_full(payload: &[u8]) -> Option<u32> {
     let dec = lz4_flex::block::decompress_size_prepended(payload).ok()?;
     if dec.len() >= 0x63 && dec[0x5e] == 0xfc {
-        Some(u32::from_le_bytes([dec[0x5f], dec[0x60], dec[0x61], dec[0x62]]))
+        Some(u32::from_le_bytes([
+            dec[0x5f], dec[0x60], dec[0x61], dec[0x62],
+        ]))
     } else {
         None
     }
@@ -44,34 +46,52 @@ fn lz4_first_n(input: &[u8], out: &mut [u8]) -> Option<usize> {
         let mut lit = (token >> 4) as usize;
         if lit == 15 {
             loop {
-                if ip >= ilen { return None; }
+                if ip >= ilen {
+                    return None;
+                }
                 let b = input[ip];
                 ip += 1;
                 lit += b as usize;
-                if b != 255 { break; }
+                if b != 255 {
+                    break;
+                }
             }
         }
         if lit > 0 {
-            if ip + lit > ilen { return None; }
+            if ip + lit > ilen {
+                return None;
+            }
             let take = lit.min(n - op);
             out[op..op + take].copy_from_slice(&input[ip..ip + take]);
             op += take;
             ip += lit;
-            if op >= n { return Some(op); }
+            if op >= n {
+                return Some(op);
+            }
         }
-        if ip >= ilen { return Some(op); } // last sequence is literals-only
-        if ip + 2 > ilen { return None; }
+        if ip >= ilen {
+            return Some(op);
+        } // last sequence is literals-only
+        if ip + 2 > ilen {
+            return None;
+        }
         let offset = (input[ip] as usize) | ((input[ip + 1] as usize) << 8);
         ip += 2;
-        if offset == 0 || offset > op { return None; }
+        if offset == 0 || offset > op {
+            return None;
+        }
         let mut mlen = (token & 0x0f) as usize;
         if mlen == 15 {
             loop {
-                if ip >= ilen { return None; }
+                if ip >= ilen {
+                    return None;
+                }
                 let b = input[ip];
                 ip += 1;
                 mlen += b as usize;
-                if b != 255 { break; }
+                if b != 255 {
+                    break;
+                }
             }
         }
         mlen += 4;
@@ -80,7 +100,9 @@ fn lz4_first_n(input: &[u8], out: &mut [u8]) -> Option<usize> {
             out[op] = out[op - offset];
             op += 1;
         }
-        if op >= n { return Some(op); }
+        if op >= n {
+            return Some(op);
+        }
     }
     Some(op)
 }
@@ -91,9 +113,9 @@ fn block_round(payload: &[u8]) -> Option<u32> {
         return block_round_full(payload);
     }
     let lz = &payload[4..]; // skip the u32-LE uncompressed-size prefix
-    // fast path: the first 0x63 decompressed bytes of an lz4 block are always raw literals (nothing
-    // to back-reference at the start). If the first token's literal run covers them, read the round
-    // straight from the literal bytes — no decode buffer, no copy.
+                            // fast path: the first 0x63 decompressed bytes of an lz4 block are always raw literals (nothing
+                            // to back-reference at the start). If the first token's literal run covers them, read the round
+                            // straight from the literal bytes — no decode buffer, no copy.
     let token = lz[0];
     let mut lit = (token >> 4) as usize;
     let mut p = 1usize;
@@ -126,7 +148,9 @@ fn block_round(payload: &[u8]) -> Option<u32> {
     match lz4_first_n(lz, &mut buf) {
         Some(n) if n >= 0x63 => {
             if buf[0x5e] == 0xfc {
-                Some(u32::from_le_bytes([buf[0x5f], buf[0x60], buf[0x61], buf[0x62]]))
+                Some(u32::from_le_bytes([
+                    buf[0x5f], buf[0x60], buf[0x61], buf[0x62],
+                ]))
             } else {
                 None
             }
@@ -163,12 +187,18 @@ async fn main() {
     let args: Vec<String> = env::args().collect();
     if args.get(1).map(|s| s.as_str()) == Some("bench") {
         let dir = args.get(2).cloned().unwrap_or_else(|| ".".into());
-        let iters: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(1_000_000);
+        let iters: usize = args
+            .get(3)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1_000_000);
         run_bench(&dir, iters);
         return;
     }
     if args.get(1).map(|s| s.as_str()) == Some("mock") {
-        let bind = args.get(2).cloned().unwrap_or_else(|| "127.0.0.1:6001".into());
+        let bind = args
+            .get(2)
+            .cloned()
+            .unwrap_or_else(|| "127.0.0.1:6001".into());
         let dir = args.get(3).cloned().unwrap_or_else(|| ".".into());
         let start: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(0);
         let end: usize = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(12);
@@ -177,7 +207,10 @@ async fn main() {
     }
     if args.get(1).map(|s| s.as_str()) == Some("relay") {
         let port: u16 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(4001);
-        let upstream = args.get(3).cloned().unwrap_or_else(|| "172.18.0.2:4001".into());
+        let upstream = args
+            .get(3)
+            .cloned()
+            .unwrap_or_else(|| "172.18.0.2:4001".into());
         run_relay(port, upstream).await;
         return;
     }
@@ -189,14 +222,22 @@ async fn main() {
             .iter()
             .skip(2)
             .find(|a| a.as_str() != "--push")
-            .map(|s| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect())
+            .map(|s| {
+                s.split(',')
+                    .map(|x| x.trim().to_string())
+                    .filter(|x| !x.is_empty())
+                    .collect()
+            })
             .unwrap_or_default();
         run_proxy(upstreams, push).await;
         return;
     }
     if args.get(1).map(|s| s.as_str()) == Some("cache") {
         let port: u16 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(4001);
-        let upstream = args.get(3).cloned().unwrap_or_else(|| "172.18.0.2:4001".into());
+        let upstream = args
+            .get(3)
+            .cloned()
+            .unwrap_or_else(|| "172.18.0.2:4001".into());
         run_cache(port, upstream).await;
         return;
     }
@@ -205,24 +246,24 @@ async fn main() {
         // caches abci_state + round-merges live blocks from many peers + proxies gossip RPC w/ failover.
         let node_peer_file = args.get(2).cloned().unwrap_or_else(|| "/nodepeers".into());
         // --push: also merge-push live blocks from multiple peers (lower latency); default off (pure
-        // transparent failover). --live N: concurrent upstreams for the merge (default 10). --retain N:
-        // how many recent blocks the gateway keeps (block-height window) — bounds memory (default 5000).
+        // transparent failover). --live N: concurrent upstreams for the live-block merge (default 5).
         let push = args.iter().any(|a| a == "--push");
-        let flagval = |name: &str, def: usize| {
-            args.iter()
-                .position(|a| a == name)
-                .and_then(|i| args.get(i + 1))
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(def)
-        };
-        let n_live = flagval("--live", 5);
-        let retain = flagval("--retain", 5000);
-        run_gateway(node_peer_file, push, n_live, retain).await;
+        let n_live = args
+            .iter()
+            .position(|a| a == "--live")
+            .and_then(|i| args.get(i + 1))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5);
+        run_gateway(node_peer_file, push, n_live).await;
         return;
     }
     let port: u16 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(4001);
     let upstreams: Vec<String> = match args.get(2) {
-        Some(s) => s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect(),
+        Some(s) => s
+            .split(',')
+            .map(|x| x.trim().to_string())
+            .filter(|x| !x.is_empty())
+            .collect(),
         None => vec!["74.63.207.101".into(), "64.140.170.202".into()],
     };
     let l = TcpListener::bind(("0.0.0.0", port)).await.expect("bind");
@@ -230,12 +271,17 @@ async fn main() {
     loop {
         let (down, addr) = match l.accept().await {
             Ok(x) => x,
-            Err(e) => { eprintln!("[gw] accept {e}"); continue; }
+            Err(e) => {
+                eprintln!("[gw] accept {e}");
+                continue;
+            }
         };
         let ups = upstreams.clone();
         tokio::spawn(async move {
             eprintln!("[gw] downstream {addr}");
-            if let Err(e) = serve(down, ups).await { eprintln!("[gw] {addr}: {e}"); }
+            if let Err(e) = serve(down, ups).await {
+                eprintln!("[gw] {addr}: {e}");
+            }
             eprintln!("[gw] {addr} done");
         });
     }
@@ -256,7 +302,9 @@ async fn serve(mut down: TcpStream, upstreams: Vec<String>) -> std::io::Result<(
         let dedup = dedup.clone();
         tokio::spawn(async move {
             match connect_greet(&ip, GREET_FALSE).await {
-                Ok(s) => { let _ = pump(s, ip, tx, dedup).await; }
+                Ok(s) => {
+                    let _ = pump(s, ip, tx, dedup).await;
+                }
                 Err(e) => eprintln!("[gw] upstream connect: {e}"),
             }
         });
@@ -271,7 +319,7 @@ async fn serve(mut down: TcpStream, upstreams: Vec<String>) -> std::io::Result<(
         if down.write_all(&buf).await.is_err() {
             break;
         }
-        if nframes % 5 == 0 {
+        if nframes.is_multiple_of(5) {
             eprintln!("[gw] frames forwarded={}", nframes);
         }
     }
@@ -280,14 +328,23 @@ async fn serve(mut down: TcpStream, upstreams: Vec<String>) -> std::io::Result<(
 }
 
 async fn connect_greet(addr: &str, g: [u8; 8]) -> std::io::Result<TcpStream> {
-    let target = if addr.contains(':') { addr.to_string() } else { format!("{addr}:4001") };
+    let target = if addr.contains(':') {
+        addr.to_string()
+    } else {
+        format!("{addr}:4001")
+    };
     let mut s = timeout(Duration::from_secs(5), TcpStream::connect(&target)).await??;
     s.set_nodelay(true).ok();
     s.write_all(&g).await?;
     Ok(s)
 }
 
-async fn pump(mut s: TcpStream, ip: String, tx: mpsc::Sender<Vec<u8>>, dedup: Arc<RoundDedup>) -> std::io::Result<()> {
+async fn pump(
+    mut s: TcpStream,
+    ip: String,
+    tx: mpsc::Sender<Vec<u8>>,
+    dedup: Arc<RoundDedup>,
+) -> std::io::Result<()> {
     let mut first = true;
     loop {
         let mut hdr = [0u8; 5];
@@ -299,7 +356,9 @@ async fn pump(mut s: TcpStream, ip: String, tx: mpsc::Sender<Vec<u8>>, dedup: Ar
             let mut buf = vec![0u8; 65536];
             while rem > 0 {
                 let n = s.read(&mut buf[..rem.min(65536)]).await?;
-                if n == 0 { return Ok(()); }
+                if n == 0 {
+                    return Ok(());
+                }
                 rem -= n;
             }
             continue;
@@ -311,17 +370,24 @@ async fn pump(mut s: TcpStream, ip: String, tx: mpsc::Sender<Vec<u8>>, dedup: Ar
         }
         match block_round(&payload) {
             Some(r) => {
-                if first { eprintln!("[gw] upstream {ip}: first round = {r}"); first = false; }
+                if first {
+                    eprintln!("[gw] upstream {ip}: first round = {r}");
+                    first = false;
+                }
                 if dedup.is_new(r) {
                     let mut frame = hdr.to_vec();
                     frame.extend_from_slice(&payload);
-                    if tx.send(frame).await.is_err() { return Ok(()); }
+                    if tx.send(frame).await.is_err() {
+                        return Ok(());
+                    }
                 }
             }
             None => {
                 let mut frame = hdr.to_vec();
                 frame.extend_from_slice(&payload);
-                if tx.send(frame).await.is_err() { return Ok(()); }
+                if tx.send(frame).await.is_err() {
+                    return Ok(());
+                }
             }
         }
     }
@@ -386,8 +452,13 @@ async fn run_cache(port: u16, upstream: String) {
         });
     }
 
-    let l = TcpListener::bind(("0.0.0.0", port)).await.expect("cache bind");
-    eprintln!("[cache] :{} <- upstream {} (state cached once + continuous round-merged live)", port, upstream);
+    let l = TcpListener::bind(("0.0.0.0", port))
+        .await
+        .expect("cache bind");
+    eprintln!(
+        "[cache] :{} <- upstream {} (state cached once + continuous round-merged live)",
+        port, upstream
+    );
     loop {
         let (mut down, addr) = match l.accept().await {
             Ok(x) => x,
@@ -487,7 +558,9 @@ async fn feed_live(
             let mut buf = vec![0u8; 65536];
             while rem > 0 {
                 let n = s.read(&mut buf[..rem.min(65536)]).await?;
-                if n == 0 { return Ok(()); }
+                if n == 0 {
+                    return Ok(());
+                }
                 rem -= n;
             }
             continue;
@@ -524,13 +597,25 @@ fn is_ipv4(s: &str) -> bool {
     parts == 4
 }
 fn is_routable(s: &str) -> bool {
-    !(s.starts_with("0.")
+    if s.starts_with("0.")
         || s.starts_with("127.")
         || s.starts_with("10.")
-        || s.starts_with("172.")
         || s.starts_with("192.168.")
         || s.starts_with("169.254.")
-        || s.starts_with("255."))
+        || s.starts_with("255.")
+    {
+        return false;
+    }
+    // 172 is private ONLY for 172.16.0.0/12 (second octet 16-31). 172.0-15 and 172.32-255 are
+    // public (e.g. Cloudflare 172.64/13), so don't reject the whole /8.
+    if let Some(rest) = s.strip_prefix("172.") {
+        if let Some(oct) = rest.split('.').next().and_then(|o| o.parse::<u8>().ok()) {
+            if (16..=31).contains(&oct) {
+                return false;
+            }
+        }
+    }
+    true
 }
 // Extract peer IPv4s out of the local node's own peer file (e.g. hl/data/tcp_lz4_stats/<date>, which
 // logs every peer the node exchanged data with). Timestamps/floats/ports are not valid 4-octet IPs so
@@ -646,17 +731,14 @@ async fn dial_active(
     }
 }
 
-type BlockBuf = Arc<Mutex<BTreeMap<u32, Arc<Vec<u8>>>>>; // reserved cache type (serve fetch-forwards)
-
 // Serve the node's client-block RPC (port 4002). A node that cold-started from the cached bootstrap
 // has NO peer relationship, so the gateway fetches the requested range from a real peer ON THE NODE'S
 // BEHALF (client-block range queries are answered to any caller) and forwards the response verbatim
-// (the node verifies signatures). This lets the node sync entirely through the gateway. The buffered
-// LIVE blocks can't be reused here — a live/consensus block is a DIFFERENT serialization from a
-// ClientBlock element (the latter needs commit-proof from later rounds), so we fetch the real thing.
+// (the node verifies signatures). This lets the node sync entirely through the gateway. We can't reuse
+// buffered LIVE blocks here — a live/consensus block is a DIFFERENT serialization from a ClientBlock
+// element (the latter needs commit-proof from later rounds), so we fetch the real thing.
 async fn serve_client_blocks(
     down: TcpStream,
-    _buf: BlockBuf,
     active: Arc<Mutex<Option<String>>>,
     peers: Vec<String>,
     rr: Arc<AtomicUsize>,
@@ -667,10 +749,10 @@ async fn serve_client_blocks(
         return;
     }
     let mut hdr = [0u8; 5];
-    if timeout(Duration::from_secs(120), down.read_exact(&mut hdr))
-        .await
-        .is_err()
-    {
+    if !matches!(
+        timeout(Duration::from_secs(120), down.read_exact(&mut hdr)).await,
+        Ok(Ok(_))
+    ) {
         return;
     }
     let len = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as usize;
@@ -678,10 +760,10 @@ async fn serve_client_blocks(
         return;
     }
     let mut payload = vec![0u8; len];
-    if timeout(Duration::from_secs(30), down.read_exact(&mut payload))
-        .await
-        .is_err()
-    {
+    if !matches!(
+        timeout(Duration::from_secs(30), down.read_exact(&mut payload)).await,
+        Ok(Ok(_))
+    ) {
         return;
     }
     let mut req = hdr.to_vec();
@@ -705,21 +787,23 @@ async fn serve_client_blocks(
             continue;
         }
         let mut rh = [0u8; 5];
-        if timeout(Duration::from_secs(15), upc.read_exact(&mut rh))
-            .await
-            .is_err()
-        {
+        if !matches!(
+            timeout(Duration::from_secs(15), upc.read_exact(&mut rh)).await,
+            Ok(Ok(_))
+        ) {
             continue;
         }
         let rl = u32::from_be_bytes([rh[0], rh[1], rh[2], rh[3]]) as usize;
-        if rl > 200_000_000 {
+        // a client-block batch is a handful of blocks (~100 rounds/request); cap well above that
+        // but far below a memory hazard.
+        if rl > 64_000_000 {
             continue;
         }
         let mut rp = vec![0u8; rl];
-        if timeout(Duration::from_secs(30), upc.read_exact(&mut rp))
-            .await
-            .is_err()
-        {
+        if !matches!(
+            timeout(Duration::from_secs(30), upc.read_exact(&mut rp)).await,
+            Ok(Ok(_))
+        ) {
             continue;
         }
         let _ = down.write_all(&rh).await;
@@ -753,14 +837,14 @@ async fn fetch_bootstrap(upstream: &str) -> std::io::Result<Vec<u8>> {
         let len = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as usize;
         if first {
             if len <= 4_000_000 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "not serving abci_state",
-                ));
+                return Err(std::io::Error::other("not serving abci_state"));
             }
             first = false;
         }
-        if len > 2_000_000_000 {
+        // Cap a single frame: the only legitimately-large frame is the ~954MB abci_state snapshot;
+        // 1.5GB leaves headroom for state growth while rejecting a bogus/huge length that would
+        // otherwise force a multi-GB allocation (3 of these race concurrently).
+        if len > 1_500_000_000 {
             break;
         }
         let mut payload = vec![0u8; len];
@@ -786,20 +870,17 @@ async fn fetch_bootstrap(upstream: &str) -> std::io::Result<Vec<u8>> {
                 // rejects, just ~20x sooner); peers at/above it are kept so a capture still
                 // completes whenever any peer serves >=10MB/s.
                 if el > 4.0 && (off as f64 / el) < 10_000_000.0 {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        "state-server too slow (early abort)",
-                    ));
+                    return Err(std::io::Error::other("state-server too slow (early abort)"));
                 }
             }
             if !ok {
                 break;
             }
-        } else if timeout(Duration::from_secs(60), s.read_exact(&mut payload))
-            .await
-            .is_err()
-        {
-            break;
+        } else if !matches!(
+            timeout(Duration::from_secs(60), s.read_exact(&mut payload)).await,
+            Ok(Ok(_))
+        ) {
+            break; // timeout OR mid-frame EOF/error -> incomplete (clean stays false -> Err)
         }
         blob.extend_from_slice(&hdr);
         blob.extend_from_slice(&payload);
@@ -809,10 +890,7 @@ async fn fetch_bootstrap(upstream: &str) -> std::io::Result<Vec<u8>> {
         if blob.len() >= 900_000_000 && blob.len() < 970_000_000 {
             let r = blob.len() as f64 / t0.elapsed().as_secs_f64();
             if r < 10_000_000.0 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "state-server too slow",
-                ));
+                return Err(std::io::Error::other("state-server too slow"));
             }
         }
         let el = win.elapsed();
@@ -839,10 +917,7 @@ async fn fetch_bootstrap(upstream: &str) -> std::io::Result<Vec<u8>> {
     if clean && blob.len() > 500_000_000 {
         Ok(blob)
     } else {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "incomplete capture",
-        ))
+        Err(std::io::Error::other("incomplete capture"))
     }
 }
 
@@ -912,22 +987,24 @@ async fn capture_bootstrap_raced(
 //   - live blocks: round-merged from several pool peers (fastest-block-first, gap-free);
 //   - gossip RPC (4002 etc.): transparently proxied to an active pool peer, failing over on dial error.
 // If the active peer has a problem the gateway uses the next peer from the (continuously refreshed) pool.
-async fn run_gateway(node_peer_file: String, push: bool, n_live: usize, retain: usize) {
+async fn run_gateway(node_peer_file: String, push: bool, n_live: usize) {
     let pool: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(read_node_peers(&node_peer_file)));
-    let buf: BlockBuf = Arc::new(Mutex::new(BTreeMap::new()));
     // cached verbatim bootstrap (abci_state + EVM KVs) for cold-start without a peer state fetch
     let boot_blob: Arc<Mutex<Option<Arc<Vec<u8>>>>> = Arc::new(Mutex::new(None));
     let rr = Arc::new(AtomicUsize::new(0)); // round-robin so successive bootstraps pick fresh peers
-    // the peer that served the node's bootstrap; ALL the node's connections reuse it so client-block
-    // RPC (4002) isn't rejected with "Peer-only request" for hitting a peer that doesn't know the node.
+                                            // the peer that served the node's bootstrap; ALL the node's connections reuse it so client-block
+                                            // RPC (4002) isn't rejected with "Peer-only request" for hitting a peer that doesn't know the node.
     let active: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     eprintln!(
-        "[gw] full P2P gateway: pool from {} ({} peers); mode={}; live-merge upstreams={}, retain={} blocks",
+        "[gw] full P2P gateway: pool from {} ({} peers); mode={}; live-merge upstreams={}",
         node_peer_file,
         pool.lock().unwrap().len(),
-        if push { "transparent + block-push" } else { "transparent failover" },
-        n_live,
-        retain
+        if push {
+            "transparent + block-push"
+        } else {
+            "transparent failover"
+        },
+        n_live
     );
 
     // pool refresher: re-read the node's peer file (peerd keeps it fresh)
@@ -945,10 +1022,6 @@ async fn run_gateway(node_peer_file: String, push: bool, n_live: usize, retain: 
         });
     }
 
-    // block buffer for the gossip RPC server (--push): round-indexed recent blocks, bounded by
-    // `retain`, populated by `n_live` persistent live feeders. Lets the gateway answer a node's
-    // client-block catch-up RANGE requests locally (no peer load, no "Peer-only request");
-    // bootstrap (abci_state + EVM KVs) still streams transparently from a real peer.
     if push {
         // bootstrap capture: fetch + cache the full bootstrap (abci_state + EVM KVs) verbatim from a
         // serving state-server, so a node can cold-start from cache (no per-IP state rate-limit). Refresh.
@@ -1022,7 +1095,6 @@ async fn run_gateway(node_peer_file: String, push: bool, n_live: usize, retain: 
         let pool = pool.clone();
         let rr = rr.clone();
         let active = active.clone();
-        let buf = buf.clone();
         let boot_blob = boot_blob.clone();
         handles.push(tokio::spawn(async move {
             let l = match TcpListener::bind(("0.0.0.0", port)).await {
@@ -1040,7 +1112,6 @@ async fn run_gateway(node_peer_file: String, push: bool, n_live: usize, retain: 
                 let pool = pool.clone();
                 let rr = rr.clone();
                 let active = active.clone();
-                let buf = buf.clone();
                 let boot_blob = boot_blob.clone();
                 tokio::spawn(async move {
                     let mut down = down;
@@ -1052,10 +1123,10 @@ async fn run_gateway(node_peer_file: String, push: bool, n_live: usize, retain: 
                     }
                     if port == 4001 {
                         let mut greet = [0u8; 8];
-                        if timeout(Duration::from_secs(20), down.read_exact(&mut greet))
-                            .await
-                            .is_err()
-                        {
+                        if !matches!(
+                            timeout(Duration::from_secs(20), down.read_exact(&mut greet)).await,
+                            Ok(Ok(_))
+                        ) {
                             return;
                         }
                         if greet[5] == 1 {
@@ -1182,9 +1253,8 @@ async fn run_gateway(node_peer_file: String, push: bool, n_live: usize, retain: 
                             }
                         }
                     } else if push && port == 4002 {
-                        // serve the node's client-block catch-up from the local buffer; falls back
-                        // to relaying to the active peer for anything not fully buffered.
-                        serve_client_blocks(down, buf, active, peers, rr).await;
+                        // fetch the node's client-block catch-up range from a real peer and forward it.
+                        serve_client_blocks(down, active, peers, rr).await;
                     } else {
                         // other gossip channels: reuse the active peer (consistent for the node)
                         let Some(upc) = dial_active(&active, &peers, &rr, port).await else {
@@ -1222,7 +1292,10 @@ fn pick_next(cur: usize, bad_until: &[AtomicU64], now_ms: u64, n: usize) -> Opti
 async fn run_proxy(upstreams: Vec<String>, push: bool) {
     let hosts: Vec<String> = upstreams
         .iter()
-        .map(|u| match u.rsplit_once(':') { Some((h, _)) => h.to_string(), None => u.clone() })
+        .map(|u| match u.rsplit_once(':') {
+            Some((h, _)) => h.to_string(),
+            None => u.clone(),
+        })
         .collect();
     if hosts.is_empty() {
         eprintln!("[proxy] no upstreams given");
@@ -1235,7 +1308,10 @@ async fn run_proxy(upstreams: Vec<String>, push: bool) {
     let base = std::time::Instant::now();
     let last_data_ms = Arc::new(AtomicU64::new(0));
     let bad_until: Arc<Vec<AtomicU64>> = Arc::new((0..n).map(|_| AtomicU64::new(0)).collect());
-    eprintln!("[proxy] upstreams={:?}, active={}, push={}", hosts, hosts[0], push);
+    eprintln!(
+        "[proxy] upstreams={:?}, active={}, push={}",
+        hosts, hosts[0], push
+    );
 
     {
         let hosts = hosts.clone();
@@ -1257,7 +1333,12 @@ async fn run_proxy(upstreams: Vec<String>, push: bool) {
                         active.store(j, Ordering::Relaxed);
                         generation.fetch_add(1, Ordering::Relaxed);
                         last_data_ms.store(now, Ordering::Relaxed);
-                        eprintln!("[proxy] STALL {}ms on {} -> failover -> {}", now - ld, hosts[old], hosts[j]);
+                        eprintln!(
+                            "[proxy] STALL {}ms on {} -> failover -> {}",
+                            now - ld,
+                            hosts[old],
+                            hosts[j]
+                        );
                     } else {
                         last_data_ms.store(now, Ordering::Relaxed); // no healthy alternative; keep current
                     }
@@ -1276,10 +1357,16 @@ async fn run_proxy(upstreams: Vec<String>, push: bool) {
         handles.push(tokio::spawn(async move {
             let l = match TcpListener::bind(("0.0.0.0", p)).await {
                 Ok(l) => l,
-                Err(e) => { eprintln!("[proxy] bind :{p}: {e}"); return; }
+                Err(e) => {
+                    eprintln!("[proxy] bind :{p}: {e}");
+                    return;
+                }
             };
             loop {
-                let (mut down, _addr) = match l.accept().await { Ok(x) => x, Err(_) => continue };
+                let (down, _addr) = match l.accept().await {
+                    Ok(x) => x,
+                    Err(_) => continue,
+                };
                 let hosts = hosts.clone();
                 let active = active.clone();
                 let generation = generation.clone();
@@ -1289,7 +1376,7 @@ async fn run_proxy(upstreams: Vec<String>, push: bool) {
                     let cur_gen = generation.load(Ordering::Relaxed);
                     let idx = active.load(Ordering::Relaxed);
                     let up = format!("{}:{}", hosts[idx], p);
-                    let mut upc = match timeout(Duration::from_secs(4), TcpStream::connect(&up)).await {
+                    let upc = match timeout(Duration::from_secs(4), TcpStream::connect(&up)).await {
                         Ok(Ok(s)) => s,
                         _ => {
                             let now = base.elapsed().as_millis() as u64;
@@ -1297,9 +1384,15 @@ async fn run_proxy(upstreams: Vec<String>, push: bool) {
                             if let Some(j) = pick_next(idx, &bad_until, now, hosts.len()) {
                                 active.store(j, Ordering::Relaxed);
                                 generation.fetch_add(1, Ordering::Relaxed);
-                                eprintln!("[proxy] dial {} failed -> failover -> {}", hosts[idx], hosts[j]);
+                                eprintln!(
+                                    "[proxy] dial {} failed -> failover -> {}",
+                                    hosts[idx], hosts[j]
+                                );
                             } else {
-                                eprintln!("[proxy] dial {} failed, no healthy alternative", hosts[idx]);
+                                eprintln!(
+                                    "[proxy] dial {} failed, no healthy alternative",
+                                    hosts[idx]
+                                );
                             }
                             return;
                         }
@@ -1322,7 +1415,9 @@ async fn run_proxy(upstreams: Vec<String>, push: bool) {
                                 Ok(0) | Err(_) => break,
                                 Ok(nb) => {
                                     ld.store(base.elapsed().as_millis() as u64, Ordering::Relaxed);
-                                    if dw.write_all(&buf[..nb]).await.is_err() { break; }
+                                    if dw.write_all(&buf[..nb]).await.is_err() {
+                                        break;
+                                    }
                                 }
                             }
                         }
@@ -1331,8 +1426,12 @@ async fn run_proxy(upstreams: Vec<String>, push: bool) {
                         let _ = tokio::io::copy(&mut dr, &mut uw).await;
                     });
                     loop {
-                        if generation.load(Ordering::Relaxed) != cur_gen { break; }
-                        if up2.is_finished() || n2u.is_finished() { break; }
+                        if generation.load(Ordering::Relaxed) != cur_gen {
+                            break;
+                        }
+                        if up2.is_finished() || n2u.is_finished() {
+                            break;
+                        }
                         tokio::time::sleep(Duration::from_millis(300)).await;
                     }
                     up2.abort();
@@ -1350,7 +1449,13 @@ async fn run_proxy(upstreams: Vec<String>, push: bool) {
 // node's outbound and the active peer's control / abci_state / RPC frames; block frames from the
 // active peer AND every other peer are merged by consensus round (dedup) and forwarded to the node
 // fastest-first => the node receives each block at the earliest arrival across all peers (lower latency).
-async fn serve_push(node: TcpStream, active_conn: TcpStream, hosts: Arc<Vec<String>>, active_idx: usize, port: u16) {
+async fn serve_push(
+    node: TcpStream,
+    active_conn: TcpStream,
+    hosts: Arc<Vec<String>>,
+    active_idx: usize,
+    port: u16,
+) {
     let dedup = Arc::new(RoundDedup::new(16_384));
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(8192);
     let (node_r, mut node_w) = node.into_split();
@@ -1382,33 +1487,52 @@ async fn serve_push(node: TcpStream, active_conn: TcpStream, hosts: Arc<Vec<Stri
     // node -> active peer (transparent: RPC requests + acks)
     {
         let mut node_r = node_r;
-        tokio::spawn(async move { let _ = tokio::io::copy(&mut node_r, &mut act_w).await; });
+        tokio::spawn(async move {
+            let _ = tokio::io::copy(&mut node_r, &mut act_w).await;
+        });
     }
     // active peer -> node: block frames deduped by round (greeting already forwarded above)
     {
         let tx = tx.clone();
         let dedup = dedup.clone();
-        tokio::spawn(async move { let _ = pump_merge(act_r, tx, dedup, true).await; });
+        tokio::spawn(async move {
+            let _ = pump_merge(act_r, tx, dedup, true).await;
+        });
     }
     // every other peer -> node: live blocks only, deduped (multi-source acceleration)
     for (i, h) in hosts.iter().enumerate() {
-        if i == active_idx { continue; }
+        if i == active_idx {
+            continue;
+        }
         let target = format!("{}:{}", h, port);
         let tx = tx.clone();
         let dedup = dedup.clone();
         tokio::spawn(async move {
-            if let Ok(Ok(mut s)) = timeout(Duration::from_secs(5), TcpStream::connect(&target)).await {
-                s.set_nodelay(true).ok();
-                if s.write_all(&GREET_FALSE).await.is_ok() {
-                    let (r, _w) = s.into_split();
-                    let _ = pump_merge(r, tx, dedup, false).await;
+            // Reconnect with backoff: public peers drop their streams, and a shadow source that
+            // exited permanently would silently degrade the merge from n_live sources to fewer.
+            // Stop only when the node side is gone (the merge channel is closed).
+            while !tx.is_closed() {
+                if let Ok(Ok(mut s)) =
+                    timeout(Duration::from_secs(5), TcpStream::connect(&target)).await
+                {
+                    s.set_nodelay(true).ok();
+                    if s.write_all(&GREET_FALSE).await.is_ok() {
+                        let (r, _w) = s.into_split();
+                        let _ = pump_merge(r, tx.clone(), dedup.clone(), false).await;
+                    }
                 }
+                if tx.is_closed() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
             }
         });
     }
     drop(tx);
     while let Some(buf) = rx.recv().await {
-        if node_w.write_all(&buf).await.is_err() { break; }
+        if node_w.write_all(&buf).await.is_err() {
+            break;
+        }
     }
 }
 
@@ -1431,7 +1555,9 @@ async fn pump_merge(
             let mut buf = vec![0u8; 65536];
             while rem > 0 {
                 let nb = r.read(&mut buf[..rem.min(65536)]).await?;
-                if nb == 0 { return Ok(()); }
+                if nb == 0 {
+                    return Ok(());
+                }
                 rem -= nb;
             }
             continue;
@@ -1474,11 +1600,14 @@ async fn run_relay(_port: u16, upstream: String) {
         handles.push(tokio::spawn(async move {
             let l = match TcpListener::bind(("0.0.0.0", p)).await {
                 Ok(l) => l,
-                Err(e) => { eprintln!("[relay] bind :{p}: {e}"); return; }
+                Err(e) => {
+                    eprintln!("[relay] bind :{p}: {e}");
+                    return;
+                }
             };
             eprintln!("[relay] :{p} -> {host}:{p}");
             loop {
-                let (mut down, addr) = match l.accept().await {
+                let (down, addr) = match l.accept().await {
                     Ok(x) => x,
                     Err(_) => continue,
                 };
@@ -1486,7 +1615,10 @@ async fn run_relay(_port: u16, upstream: String) {
                 tokio::spawn(async move {
                     let upc = match TcpStream::connect(&up).await {
                         Ok(s) => s,
-                        Err(e) => { eprintln!("[relay] :{p} {addr} upstream err {e}"); return; }
+                        Err(e) => {
+                            eprintln!("[relay] :{p} {addr} upstream err {e}");
+                            return;
+                        }
                     };
                     down.set_nodelay(true).ok();
                     upc.set_nodelay(true).ok();
@@ -1496,8 +1628,13 @@ async fn run_relay(_port: u16, upstream: String) {
                         let mut buf = vec![0u8; 262144];
                         let mut total = 0u64;
                         loop {
-                            let n = match ur.read(&mut buf).await { Ok(0) | Err(_) => break, Ok(n) => n };
-                            if dw.write_all(&buf[..n]).await.is_err() { break; }
+                            let n = match ur.read(&mut buf).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => n,
+                            };
+                            if dw.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
                             total += n as u64;
                         }
                         if total > 1_000_000 {
@@ -1510,7 +1647,9 @@ async fn run_relay(_port: u16, upstream: String) {
             }
         }));
     }
-    for h in handles { let _ = h.await; }
+    for h in handles {
+        let _ = h.await;
+    }
 }
 
 // Benchmark the hot path: lz4 decompress + round extract (block_round) + dedup, over captured blocks.
@@ -1525,11 +1664,19 @@ fn run_bench(dir: &str, iters: usize) {
     let mut mism = 0;
     for (i, p) in payloads.iter().enumerate() {
         if block_round(p) != block_round_full(p) {
-            eprintln!("[bench] VERIFY FAIL block{i}: fast={:?} full={:?}", block_round(p), block_round_full(p));
+            eprintln!(
+                "[bench] VERIFY FAIL block{i}: fast={:?} full={:?}",
+                block_round(p),
+                block_round_full(p)
+            );
             mism += 1;
         }
     }
-    eprintln!("[bench] verify: {} blocks, {} mismatch vs full-decompress oracle", payloads.len(), mism);
+    eprintln!(
+        "[bench] verify: {} blocks, {} mismatch vs full-decompress oracle",
+        payloads.len(),
+        mism
+    );
 
     let dedup = RoundDedup::new(16_384);
     let mut forwarded = 0u64;
@@ -1548,7 +1695,11 @@ fn run_bench(dir: &str, iters: usize) {
     let dt = t0.elapsed().as_secs_f64();
     eprintln!(
         "[bench] {} frames in {:.3}s = {:.1} kframes/s, {:.0} MB/s (compressed in), forwarded={}",
-        iters, dt, iters as f64 / dt / 1000.0, bytes as f64 / 1e6 / dt, forwarded
+        iters,
+        dt,
+        iters as f64 / dt / 1000.0,
+        bytes as f64 / 1e6 / dt,
+        forwarded
     );
 }
 
@@ -1565,7 +1716,13 @@ async fn run_mock(bind: String, dir: String, start: usize, end: usize) {
     }
     let frames = Arc::new(frames);
     let l = TcpListener::bind(&bind).await.expect("mock bind");
-    eprintln!("[mock] {} ready, blocks {}..{} ({} frames)", bind, start, end, frames.len());
+    eprintln!(
+        "[mock] {} ready, blocks {}..{} ({} frames)",
+        bind,
+        start,
+        end,
+        frames.len()
+    );
     loop {
         let (mut c, _) = match l.accept().await {
             Ok(x) => x,
@@ -1577,7 +1734,9 @@ async fn run_mock(bind: String, dir: String, start: usize, end: usize) {
             let _ = c.read_exact(&mut g).await;
             for _ in 0..3 {
                 for f in frames.iter() {
-                    if c.write_all(f).await.is_err() { return; }
+                    if c.write_all(f).await.is_err() {
+                        return;
+                    }
                 }
             }
             let mut buf = [0u8; 1024];
@@ -1588,5 +1747,73 @@ async fn run_mock(bind: String, dir: String, start: usize, end: usize) {
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A decompressed block whose first bytes are unique (ramp), so lz4 emits a leading literal run
+    // >= 0x63 and block_round's fast path engages; the consensus round sits at offset 0x5e
+    // (varint 0xfc + u32 LE), matching the real wire format.
+    fn make_block(round: u32) -> Vec<u8> {
+        let mut dec: Vec<u8> = (0..0x100).map(|i| i as u8).collect();
+        dec[0x5e] = 0xfc;
+        dec[0x5f..0x63].copy_from_slice(&round.to_le_bytes());
+        lz4_flex::block::compress_prepend_size(&dec)
+    }
+
+    #[test]
+    fn block_round_matches_full_decompress() {
+        for round in [0u32, 1, 1000, 1_055_000_000, u32::MAX] {
+            let payload = make_block(round);
+            assert_eq!(block_round_full(&payload), Some(round), "full @ {round}");
+            assert_eq!(block_round(&payload), Some(round), "fast @ {round}");
+        }
+    }
+
+    #[test]
+    fn is_routable_excludes_only_real_private_ranges() {
+        for ip in [
+            "8.8.8.8",
+            "1.1.1.1",
+            "172.15.0.1",
+            "172.32.0.1",
+            "172.64.0.1",
+            "173.0.0.1",
+        ] {
+            assert!(is_routable(ip), "{ip} should be routable");
+        }
+        for ip in [
+            "10.0.0.1",
+            "127.0.0.1",
+            "192.168.1.1",
+            "169.254.1.1",
+            "172.16.0.1",
+            "172.31.255.1",
+            "0.0.0.0",
+            "255.255.255.255",
+        ] {
+            assert!(!is_routable(ip), "{ip} should NOT be routable");
+        }
+    }
+
+    #[test]
+    fn extract_ipv4_skips_noise_and_private() {
+        let s =
+            "Ip(172.64.1.2) at 1700000000.5 port 4001, peer 8.8.8.8, bad 999.1.1.1, lan 10.0.0.3";
+        let got = extract_ipv4(s);
+        assert!(got.contains(&"172.64.1.2".to_string()));
+        assert!(got.contains(&"8.8.8.8".to_string()));
+        assert!(
+            !got.contains(&"10.0.0.3".to_string()),
+            "private 10/8 excluded"
+        );
+        assert!(!got.iter().any(|x| x == "999.1.1.1"), "octet >255 excluded");
+        assert!(
+            !got.iter().any(|x| x.starts_with("1700000000")),
+            "float/timestamp excluded"
+        );
     }
 }

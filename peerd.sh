@@ -12,7 +12,7 @@ INTERVAL=${1:-300}
 touch "$CAND"
 while true; do
   ROOTS=$(curl -s -X POST -H 'Content-Type: application/json' --data '{"type":"gossipRootIps"}' https://api.hyperliquid.xyz/info 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+')
-  HARV=$(sudo docker logs --tail 3000 hyperliquid-node-1 2>&1 | grep -aoE 'Ip\(([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)\)' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+')
+  HARV=$(sudo docker logs --tail 3000 "$NODE" 2>&1 | grep -aoE 'Ip\(([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)\)' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+')
   printf '%s\n%s\n%s\n' "$(cat "$CAND")" "$ROOTS" "$HARV" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | grep -vE '^172\.18|^127\.|152\.53\.128\.11' | sort -u > "$CAND.tmp" && mv "$CAND.tmp" "$CAND"
   python3 - "$CAND" "$OUT" <<'PY'
 import socket,struct,sys,threading,json,time
