@@ -10,7 +10,7 @@ Hyperliquid non-validator nodes sync by dialing peers and streaming consensus / 
 
 ## Modes
 
-- `proxy <peer1,peer2,...>` — **failover transparent proxy** (production mode): listens on 4000-4010, relays to the active upstream, health-monitors it, and fails over to the next healthy peer (bad peers are skipped with a cooldown; no oscillation).
+- `proxy <peer1,peer2,...> [--push]` — **failover transparent proxy** (production mode): listens on 4000-4010, relays to the active upstream, health-monitors it, and fails over to the next healthy peer (bad peers skipped with a cooldown; no oscillation). **Default = transparent proxy + failover only (no block push).** Add `--push` to additionally merge-push live blocks from *all* peers on 4001 (round-dedup, fastest-block-first) for lower block-reception latency.
 - `relay <host>` — plain transparent multi-port relay to a single upstream.
 - `serve <port> <peers>` — multi-upstream live-block merge with round-based dedup (freshest block wins, gap-free).
 - `cache <port> <upstream>` — fetches the abci_state snapshot once, caches it, serves connecting nodes at local speed (beats the abci_stream deadline).

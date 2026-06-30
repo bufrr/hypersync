@@ -162,11 +162,16 @@ async fn main() {
         return;
     }
     if args.get(1).map(|s| s.as_str()) == Some("proxy") {
+        // default: transparent proxy + failover (NO block push).
+        // optional `--push`: also actively merge-push live blocks from ALL peers (fastest-block, round-dedup).
+        let push = args.iter().any(|a| a == "--push");
         let upstreams: Vec<String> = args
-            .get(2)
+            .iter()
+            .skip(2)
+            .find(|a| a.as_str() != "--push")
             .map(|s| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect())
             .unwrap_or_default();
-        run_proxy(upstreams).await;
+        run_proxy(upstreams, push).await;
         return;
     }
     if args.get(1).map(|s| s.as_str()) == Some("cache") {
@@ -480,12 +485,14 @@ fn pick_next(cur: usize, bad_until: &[AtomicU64], now_ms: u64, n: usize) -> Opti
     None
 }
 
-// Failover transparent proxy (current design): the local node dials the gateway (4000-4010, outbound)
-// and the gateway transparently proxies to the ACTIVE upstream peer. A health monitor detects the
-// active peer stalling (no data) or dying (dial fails) and rotates to the next peer; node connections
-// are dropped on rotation so the node reconnects and is re-proxied to a healthy peer ("选择其他peer替代").
-// Inbound push is deliberately not implemented (verified: HL nodes only ingest from peers they dial).
-async fn run_proxy(upstreams: Vec<String>) {
+// Failover transparent proxy. Default (push=false): the local node dials the gateway (4000-4010,
+// outbound) and the gateway transparently proxies to the ACTIVE upstream peer; a health monitor
+// rotates to the next healthy peer on stall/dial-failure ("选择其他peer替代").
+// With push=true: on the heavy block channel (4001) the gateway ALSO connects to all other peers and
+// merge-pushes their live blocks (round-dedup, fastest-first) for lower block-reception latency; the
+// active peer connection stays transparent for the node's outbound + control/state/RPC frames.
+// (Inbound push to the node is not implemented — verified: HL nodes only ingest from peers they dial.)
+async fn run_proxy(upstreams: Vec<String>, push: bool) {
     let hosts: Vec<String> = upstreams
         .iter()
         .map(|u| match u.rsplit_once(':') { Some((h, _)) => h.to_string(), None => u.clone() })
@@ -501,7 +508,7 @@ async fn run_proxy(upstreams: Vec<String>) {
     let base = std::time::Instant::now();
     let last_data_ms = Arc::new(AtomicU64::new(0));
     let bad_until: Arc<Vec<AtomicU64>> = Arc::new((0..n).map(|_| AtomicU64::new(0)).collect());
-    eprintln!("[proxy] upstreams={:?}, active={}", hosts, hosts[0]);
+    eprintln!("[proxy] upstreams={:?}, active={}, push={}", hosts, hosts[0], push);
 
     {
         let hosts = hosts.clone();
@@ -572,6 +579,12 @@ async fn run_proxy(upstreams: Vec<String>) {
                     };
                     down.set_nodelay(true).ok();
                     upc.set_nodelay(true).ok();
+                    if push && p == 4001 {
+                        // block-push: merge live blocks from active + all other peers (round-dedup,
+                        // fastest-first); active stays transparent for node->peer + control/state/RPC.
+                        serve_push(down, upc, hosts.clone(), idx, p).await;
+                        return;
+                    }
                     let (mut dr, mut dw) = down.into_split();
                     let (mut ur, mut uw) = upc.into_split();
                     let ld = last_data_ms.clone();
@@ -603,6 +616,92 @@ async fn run_proxy(upstreams: Vec<String>) {
     }
     for h in handles {
         let _ = h.await;
+    }
+}
+
+// Block-push serving (push mode, heavy channel): the active peer connection is transparent for the
+// node's outbound and the active peer's control / abci_state / RPC frames; block frames from the
+// active peer AND every other peer are merged by consensus round (dedup) and forwarded to the node
+// fastest-first => the node receives each block at the earliest arrival across all peers (lower latency).
+async fn serve_push(node: TcpStream, active_conn: TcpStream, hosts: Arc<Vec<String>>, active_idx: usize, port: u16) {
+    let dedup = Arc::new(RoundDedup::new(131_072));
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(8192);
+    let (node_r, mut node_w) = node.into_split();
+    let (act_r, mut act_w) = active_conn.into_split();
+    // node -> active peer (transparent: greeting + RPC requests + acks)
+    {
+        let mut node_r = node_r;
+        tokio::spawn(async move { let _ = tokio::io::copy(&mut node_r, &mut act_w).await; });
+    }
+    // active peer -> node: control / abci_state forwarded as-is, block frames deduped by round
+    {
+        let tx = tx.clone();
+        let dedup = dedup.clone();
+        tokio::spawn(async move { let _ = pump_merge(act_r, tx, dedup, true).await; });
+    }
+    // every other peer -> node: live blocks only, deduped (multi-source acceleration)
+    for (i, h) in hosts.iter().enumerate() {
+        if i == active_idx { continue; }
+        let target = format!("{}:{}", h, port);
+        let tx = tx.clone();
+        let dedup = dedup.clone();
+        tokio::spawn(async move {
+            if let Ok(Ok(mut s)) = timeout(Duration::from_secs(5), TcpStream::connect(&target)).await {
+                s.set_nodelay(true).ok();
+                if s.write_all(&GREET_FALSE).await.is_ok() {
+                    let (r, _w) = s.into_split();
+                    let _ = pump_merge(r, tx, dedup, false).await;
+                }
+            }
+        });
+    }
+    drop(tx);
+    while let Some(buf) = rx.recv().await {
+        if node_w.write_all(&buf).await.is_err() { break; }
+    }
+}
+
+// Frame reader for serve_push: forward block frames (type=1 with a round) deduped; if forward_nonblock
+// (the active peer only) also forward control / abci_state / RPC frames as-is.
+async fn pump_merge(
+    mut r: tokio::net::tcp::OwnedReadHalf,
+    tx: mpsc::Sender<Vec<u8>>,
+    dedup: Arc<RoundDedup>,
+    forward_nonblock: bool,
+) -> std::io::Result<()> {
+    loop {
+        let mut hdr = [0u8; 5];
+        r.read_exact(&mut hdr).await?;
+        let len = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as usize;
+        let typ = hdr[4];
+        if len > 60_000_000 && !forward_nonblock {
+            // a non-active (shadow) peer shouldn't send huge frames; drain to stay frame-aligned
+            let mut rem = len;
+            let mut buf = vec![0u8; 65536];
+            while rem > 0 {
+                let nb = r.read(&mut buf[..rem.min(65536)]).await?;
+                if nb == 0 { return Ok(()); }
+                rem -= nb;
+            }
+            continue;
+        }
+        let mut payload = vec![0u8; len];
+        r.read_exact(&mut payload).await?;
+        let forward = if typ == 1 {
+            match block_round(&payload) {
+                Some(rnd) => dedup.is_new(rnd), // block: forward only the first (fastest) copy
+                None => forward_nonblock,       // abci_state / non-round data: only from active
+            }
+        } else {
+            forward_nonblock // control / RPC: only from active
+        };
+        if forward {
+            let mut frame = hdr.to_vec();
+            frame.extend_from_slice(&payload);
+            if tx.send(frame).await.is_err() {
+                return Ok(());
+            }
+        }
     }
 }
 
