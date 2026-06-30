@@ -199,7 +199,7 @@
           <div class="stat"><div class="big">4001<span style="color:var(--faint);font-size:14px"> / 4002</span></div><div class="sm">state/block 重通道 / gossip RPC</div></div>
           <div class="stat"><div class="big c">~4.5GB</div><div class="sm">完整 bootstrap：abci_state + EVM KVs</div></div>
           <div class="stat"><div class="big">~950MB</div><div class="sm">abci_state，按源 IP 限流</div></div>
-          <div class="stat"><div class="big c">795×</div><div class="sm">round 提取热路径相对全解压的提升</div></div>
+          <div class="stat"><div class="big c">135M/s</div><div class="sm">bench 中 round 提取与去重热路径吞吐</div></div>
         </div>
 
         <p class="src">依据：README.md · docs/hl-p2p-protocol.md · src/main.rs · peerd.sh</p>
@@ -228,7 +228,7 @@ flowchart TB
     POOL["pool: 读 peers.json<br/>每 30s 刷新"]
     ACTIVE["active peer<br/>当前节点会话固定上游<br/>所有连接尽量复用"]
     BOOT["boot_blob: RAM 缓存整份 bootstrap<br/>~4.5GB (仅 --push)"]
-    BUF["live 环形缓冲: round 去重"]
+    BUF["live merge: round 去重<br/>AtomicU32 slot window"]
     RPC["client-block RPC 转发(4002)"]
   end
   subgraph NODE["本地 HL Node (hl-visor/hl-node)"]
@@ -391,7 +391,7 @@ stateDiagram-v2
       <!-- 06 DETAILS -->
       <section id="details">
         <div class="sec-head"><span class="sec-num">06</span><h2>关键实现细节</h2></div>
-        <p class="sec-sub">下面三点决定了 gateway 是否能稳定、低延迟地完成完整同步。</p>
+        <p class="sec-sub">下面这些实现点决定了 gateway 是否能稳定、低延迟地完成完整同步。</p>
 
         <div class="detail reveal">
           <h3><span class="pin">▸</span> 两种块序列化不可互换 <span style="color:var(--faint);font-weight:400;font-size:13px">（协议 §6，全链路最重要约束）</span></h3>
@@ -399,13 +399,18 @@ stateDiagram-v2
         </div>
 
         <div class="detail reveal">
-          <h3><span class="pin">▸</span> 热路径优化 → 795×</h3>
-          <p style="margin:8px 0 0">live merge 去重只需要读取 round，因此 <code>lz4_first_n</code> 做的是<b>有界 LZ4 解码</b>：解出前约 99 字节（<code>0x63</code>）即可停止，不需要解完整个约 200KB 的 block。当前 <code>RoundDedup</code> 使用 <code>round % cap</code> 的 slot window 做常数时间去重；README 中的 <code>bench</code> 显示该热路径相对完整解压有数量级优势。</p>
+          <h3><span class="pin">▸</span> 热路径优化 → 135M frames/s</h3>
+          <p style="margin:8px 0 0">live merge 去重只需要读取 round。最新代码先走最快路径：如果 LZ4 block 起始 literal run 已覆盖前 <code>0x63</code> 个解压字节，就直接从压缩 payload 的 literal bytes 读取 <code>0x5e</code> 处的 round，<b>不分配解码缓冲、不复制字节</b>；只有 literal 覆盖不足时才 fallback 到 <code>lz4_first_n</code> 的有界解码，最后才退回完整解压 oracle。</p>
         </div>
 
         <div class="detail reveal">
-          <h3><span class="pin">▸</span> 去重窗口的边界</h3>
-          <p style="margin:8px 0 0">去重 key 是 <code>u32</code> round，gateway 的 live merge 窗口容量为 131072。该窗口面向近实时顺序增长的 live block 流设计；如果上游异常回放很旧的 round，窗口外数据可能被视为新块，需要依赖节点端签名和状态校验兜底。</p>
+          <h3><span class="pin">▸</span> lock-free round 去重</h3>
+          <p style="margin:8px 0 0"><code>RoundDedup</code> 不再使用 mutex、hash set 或 ring-buffer。它把容量提升到 2 的幂，用 <code>round &amp; mask</code> 定位 <code>AtomicU32</code> slot，并通过一次 <code>swap</code> 判断该 round 是否已见过。<code>serve</code> 和 <code>serve_push</code> 当前使用 16,384 个 slot；极少数竞态最多导致重复转发一帧，节点端仍会按签名和状态去重。</p>
+        </div>
+
+        <div class="detail reveal">
+          <h3><span class="pin">▸</span> 4002 catch-up 的当前实现边界</h3>
+          <p style="margin:8px 0 0">代码里保留了 <code>BlockBuf</code>、<code>retain</code> 以及“本地 buffer 回答 RANGE”的注释，但当前 <code>serve_client_blocks</code> 实际参数名是 <code>_buf</code>，不会从本地 live buffer 构造响应。4002 catch-up 会优先尝试 active peer，再按 pool 轮询真实 peer，并将 <code>ClientBlocks</code> response 原样返回给节点。这与协议约束一致：4001 live block 不能合成 4002 <code>ClientBlock</code> element。</p>
         </div>
       </section>
 
@@ -415,7 +420,7 @@ stateDiagram-v2
         <table>
           <thead><tr><th>子命令</th><th>作用</th></tr></thead>
           <tbody>
-            <tr><td>gateway &lt;peers-file&gt; [--push] [--live N] [--retain N]</td><td>完整 P2P 网关（推荐）。使用 peerd 动态池，提供透明转发、bootstrap 缓存、多路 live 合并和 4002 RPC 转发。</td></tr>
+            <tr><td>gateway &lt;peers-file&gt; [--push] [--live N] [--retain N]</td><td>完整 P2P 网关（推荐）。使用 peerd 动态池，提供透明转发、bootstrap 缓存、多路 live 合并和 4002 RPC 转发。当前代码默认 <code>--live=5</code>、<code>--retain=5000</code>。</td></tr>
             <tr><td>proxy &lt;peer1,peer2,…&gt; [--push]</td><td>固定 peer 列表的透明代理，覆盖 4000-4010，并在上游 stall 或拨号失败时切换 active peer。</td></tr>
             <tr><td>relay &lt;host&gt;</td><td>单上游多端口透明中继，用于最小化转发路径或本地调试。</td></tr>
             <tr><td>serve &lt;port&gt; &lt;peers&gt;</td><td>多上游 live block 合并服务，按 round 去重并转发最先到达的副本。</td></tr>

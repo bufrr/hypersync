@@ -743,6 +743,7 @@ async fn fetch_bootstrap(upstream: &str) -> std::io::Result<Vec<u8>> {
     let mut win = Instant::now();
     let mut win_bytes = 0usize;
     let mut slow = 0u32;
+    let mut clean = false; // set only when the bulk (abci_state + EVM KVs) ends via the rate-drop
     loop {
         let mut hdr = [0u8; 5];
         match timeout(Duration::from_secs(20), s.read_exact(&mut hdr)).await {
@@ -763,7 +764,35 @@ async fn fetch_bootstrap(upstream: &str) -> std::io::Result<Vec<u8>> {
             break;
         }
         let mut payload = vec![0u8; len];
-        if timeout(Duration::from_secs(60), s.read_exact(&mut payload))
+        if len > 50_000_000 {
+            // The big frame is the ~954MB abci_state. Read it in chunks and abort early if the
+            // sustained rate is too low to ever deliver the full bootstrap before the per-frame
+            // deadline. This frees the slot so the race moves to a faster state-server in ~4s
+            // instead of blocking ~60s on one slow peer. (The same peers were rejected before via
+            // the 60s read_exact timeout — this just rejects them ~15x sooner.)
+            let mut off = 0usize;
+            let fstart = Instant::now();
+            let mut ok = true;
+            while off < len {
+                match timeout(Duration::from_secs(15), s.read(&mut payload[off..])).await {
+                    Ok(Ok(n)) if n > 0 => off += n,
+                    _ => {
+                        ok = false;
+                        break;
+                    }
+                }
+                let el = fstart.elapsed().as_secs_f64();
+                if el > 4.0 && (off as f64 / el) < 15_000_000.0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "state-server too slow (early abort)",
+                    ));
+                }
+            }
+            if !ok {
+                break;
+            }
+        } else if timeout(Duration::from_secs(60), s.read_exact(&mut payload))
             .await
             .is_err()
         {
@@ -791,6 +820,7 @@ async fn fetch_bootstrap(upstream: &str) -> std::io::Result<Vec<u8>> {
             if blob.len() > 1_500_000_000 && rate < 400_000.0 {
                 slow += 1;
                 if slow >= 8 {
+                    clean = true;
                     break;
                 }
             } else {
@@ -800,7 +830,70 @@ async fn fetch_bootstrap(upstream: &str) -> std::io::Result<Vec<u8>> {
             win_bytes = 0;
         }
     }
-    Ok(blob)
+    // Only a clean bulk-end is a usable capture; a mid-stream EOF/timeout leaves an incomplete
+    // abci_state/EVM-KVs blob that would wedge a cold-starting node — reject it so the race never
+    // prefers a fast-but-truncated capture over a slower complete one.
+    if clean && blob.len() > 500_000_000 {
+        Ok(blob)
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "incomplete capture",
+        ))
+    }
+}
+
+// Race several state-servers for the bootstrap capture instead of trying them one-by-one. A
+// rate-limited peer fails in <1s and is replaced immediately; a slow-but-serving peer would
+// otherwise block the queue while it downloads ~900MB before the speed gate rejects it, so after
+// `hedge` with no winner we add a concurrent attempt to a fresh peer (up to `max_inflight`). The
+// first CLEAN capture wins and the rest are aborted, freeing bandwidth and the per-IP abci_state
+// quota. `hedge` is set above the typical fast-capture time, so the common case runs solo (no
+// contention) and only the slow tail is hedged.
+async fn capture_bootstrap_raced(
+    peers: Vec<String>,
+    max_inflight: usize,
+    hedge: Duration,
+) -> Option<(Vec<u8>, String)> {
+    if peers.is_empty() {
+        return None;
+    }
+    let mut set: tokio::task::JoinSet<(std::io::Result<Vec<u8>>, String)> =
+        tokio::task::JoinSet::new();
+    let mut idx = 0usize;
+    let mut started = 0usize;
+    macro_rules! spawn_next {
+        () => {{
+            let ip = peers[idx].clone();
+            idx += 1;
+            started += 1;
+            let up = format!("{}:4001", ip);
+            set.spawn(async move { (fetch_bootstrap(&up).await, ip) });
+        }};
+    }
+    spawn_next!();
+    loop {
+        if set.is_empty() && idx >= peers.len() {
+            return None;
+        }
+        tokio::select! {
+            joined = set.join_next(), if !set.is_empty() => {
+                if let Some(Ok((Ok(blob), ip))) = joined {
+                    set.abort_all();
+                    eprintln!("[gw] bootstrap race won by {ip} after {started} attempt(s)");
+                    return Some((blob, ip));
+                }
+                // failed/short attempt: replace immediately with a fresh candidate
+                if idx < peers.len() {
+                    spawn_next!();
+                }
+            }
+            _ = tokio::time::sleep(hedge), if set.len() < max_inflight && idx < peers.len() => {
+                eprintln!("[gw] bootstrap race: no winner in {}s, hedging attempt #{}", hedge.as_secs(), started + 1);
+                spawn_next!();
+            }
+        }
+    }
 }
 
 // Full P2P gateway. The node connects ONLY to the gateway; the gateway provides all of HL's sync P2P
@@ -854,23 +947,41 @@ async fn run_gateway(node_peer_file: String, push: bool, n_live: usize, retain: 
             let boot_blob = boot_blob.clone();
             let pool = pool.clone();
             tokio::spawn(async move {
+                // abci_state is rate-limited per (source-IP, peer) pair, so re-hitting the same
+                // top-ranked peers exhausts them. Take a bounded window of candidates per cycle
+                // (gentle on peers), rotate the window each cycle to cover the pool and let
+                // per-peer limits recover, and seed the start from the clock so a fresh gateway
+                // doesn't always begin at the (often-busy) top of the rank.
+                let mut cycle = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as usize)
+                    .unwrap_or(0);
                 loop {
-                    let peers = pool.lock().unwrap().clone();
-                    let mut got = false;
-                    for ip in peers.iter().take(12) {
-                        if let Ok(blob) = fetch_bootstrap(&format!("{}:4001", ip)).await {
-                            if blob.len() > 500_000_000 {
-                                eprintln!(
-                                    "[gw] bootstrap captured: {} MB via {}",
-                                    blob.len() / 1_000_000,
-                                    ip
-                                );
-                                *boot_blob.lock().unwrap() = Some(Arc::new(blob));
-                                got = true;
-                                break;
-                            }
+                    let peers: Vec<String> = {
+                        let full = pool.lock().unwrap();
+                        let n = full.len();
+                        if n == 0 {
+                            Vec::new()
+                        } else {
+                            let take = 24.min(n);
+                            let off = cycle.wrapping_mul(take) % n;
+                            (0..take).map(|k| full[(off + k) % n].clone()).collect()
                         }
-                    }
+                    };
+                    cycle = cycle.wrapping_add(1);
+                    let got = if let Some((blob, ip)) =
+                        capture_bootstrap_raced(peers, 3, Duration::from_secs(40)).await
+                    {
+                        eprintln!(
+                            "[gw] bootstrap captured: {} MB via {} (raced)",
+                            blob.len() / 1_000_000,
+                            ip
+                        );
+                        *boot_blob.lock().unwrap() = Some(Arc::new(blob));
+                        true
+                    } else {
+                        false
+                    };
                     tokio::time::sleep(Duration::from_secs(if got { 900 } else { 60 })).await;
                 }
             });
