@@ -782,7 +782,10 @@ async fn fetch_bootstrap(upstream: &str) -> std::io::Result<Vec<u8>> {
                     }
                 }
                 let el = fstart.elapsed().as_secs_f64();
-                if el > 4.0 && (off as f64 / el) < 15_000_000.0 {
+                // Abort below the speed gate's 10MB/s floor (same peers the post-snapshot gate
+                // rejects, just ~20x sooner); peers at/above it are kept so a capture still
+                // completes whenever any peer serves >=10MB/s.
+                if el > 4.0 && (off as f64 / el) < 10_000_000.0 {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::Other,
                         "state-server too slow (early abort)",
@@ -874,13 +877,19 @@ async fn capture_bootstrap_raced(
     spawn_next!();
     loop {
         if set.is_empty() && idx >= peers.len() {
+            eprintln!(
+                "[gw] bootstrap race: no usable state-server among {started} peers tried (all too-slow / incomplete / throttled)"
+            );
             return None;
         }
         tokio::select! {
             joined = set.join_next(), if !set.is_empty() => {
                 if let Some(Ok((Ok(blob), ip))) = joined {
+                    eprintln!(
+                        "[gw] bootstrap race won by {ip} ({} MB) after {started} attempt(s)",
+                        blob.len() / 1_000_000
+                    );
                     set.abort_all();
-                    eprintln!("[gw] bootstrap race won by {ip} after {started} attempt(s)");
                     return Some((blob, ip));
                 }
                 // failed/short attempt: replace immediately with a fresh candidate
@@ -957,13 +966,19 @@ async fn run_gateway(node_peer_file: String, push: bool, n_live: usize, retain: 
                     .map(|d| d.as_secs() as usize)
                     .unwrap_or(0);
                 loop {
+                    // Until we have ANY cached blob the node can't cold-start, so the initial
+                    // capture is urgent: search a wide window and retry fast. Once cached, the old
+                    // blob stays valid, so refreshes use a small rotated window on a long interval
+                    // (gentle on peers, lets per-peer abci_state limits recover).
+                    let have_cache = boot_blob.lock().unwrap().is_some();
+                    let window = if have_cache { 24 } else { 64 };
                     let peers: Vec<String> = {
                         let full = pool.lock().unwrap();
                         let n = full.len();
                         if n == 0 {
                             Vec::new()
                         } else {
-                            let take = 24.min(n);
+                            let take = window.min(n);
                             let off = cycle.wrapping_mul(take) % n;
                             (0..take).map(|k| full[(off + k) % n].clone()).collect()
                         }
@@ -982,7 +997,14 @@ async fn run_gateway(node_peer_file: String, push: bool, n_live: usize, retain: 
                     } else {
                         false
                     };
-                    tokio::time::sleep(Duration::from_secs(if got { 900 } else { 60 })).await;
+                    let delay = if got {
+                        900
+                    } else if have_cache {
+                        60
+                    } else {
+                        8
+                    };
+                    tokio::time::sleep(Duration::from_secs(delay)).await;
                 }
             });
         }
