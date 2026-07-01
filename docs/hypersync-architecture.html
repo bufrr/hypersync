@@ -172,6 +172,7 @@
       <a href="#failover"><span class="n">06</span>proxy 故障转移</a>
       <a href="#details"><span class="n">07</span>关键实现</a>
       <a href="#cmds"><span class="n">08</span>运行模式</a>
+      <a href="#ports"><span class="n">09</span>端口接口对比</a>
     </nav>
 
     <main>
@@ -179,7 +180,7 @@
       <header class="hero">
         <div class="eyebrow"><span class="dot"></span>Hyperliquid · P2P sync gateway</div>
         <h1>hypersync<br>架构与节点<span class="sync">同步流程</span></h1>
-        <p class="lede">hypersync 是部署在 Hyperliquid 非验证节点前的<b>多 peer、健康监控、自动故障转移的透明 P2P 网关</b>。节点将 <code style="font-family:var(--mono);font-size:.9em">root_node_ips</code> 指向 gateway；两个可独立开启、可叠加的标志在透明 failover 骨干之上分别加装能力：<code style="font-family:var(--mono);font-size:.9em">--push</code> 叠加多源 live block 加速 + active peer 故障转移，<code style="font-family:var(--mono);font-size:.9em">--cache</code> 叠加 RAM 缓存冷启动。生产推荐同时开启 <b>transparent + push</b>：push 层任何降级都不影响节点继续从透明骨干同步。</p>
+        <p class="lede">hypersync 是部署在 Hyperliquid 非验证节点前的<b>多 peer、健康监控、自动故障转移的透明 P2P 网关</b>。节点将 <code style="font-family:var(--mono);font-size:.9em">root_node_ips</code> 指向 gateway；两个可独立开启、可叠加的标志在 <b>transparent failover backbone</b> 之上分别加装能力：<code style="font-family:var(--mono);font-size:.9em">--push</code> 叠加多源 live block 加速 + active peer 故障转移，<code style="font-family:var(--mono);font-size:.9em">--cache</code> 叠加 RAM 缓存冷启动。生产推荐同时开启 <b>transparent + push</b>：push 层任何降级都不影响节点继续从 transparent backbone 同步。</p>
 
         <!-- signature: the wire frame -->
         <div class="framewrap reveal">
@@ -200,7 +201,7 @@
           <div class="stat"><div class="big">4001<span style="color:var(--faint);font-size:14px"> / 4002</span></div><div class="sm">state/block 重通道 / gossip RPC</div></div>
           <div class="stat"><div class="big c">~4.5GB</div><div class="sm">完整 bootstrap：abci_state + EVM KVs</div></div>
           <div class="stat"><div class="big">~950MB</div><div class="sm">abci_state，按源 IP 限流</div></div>
-          <div class="stat"><div class="big c">~135M/s</div><div class="sm">bench 中 round 提取与去重热路径吞吐(单次运行 ~132-136M 间波动)</div></div>
+          <div class="stat"><div class="big c">~135M/s</div><div class="sm">bench 中 round 提取与去重 hotpath 吞吐(单次运行 ~132-136M 间波动)</div></div>
         </div>
 
         <p class="src">依据：README.md · docs/hl-p2p-protocol.md · src/main.rs · peerd.sh</p>
@@ -291,7 +292,7 @@ flowchart TD
       <!-- 03 LIFECYCLE -->
       <section id="lifecycle">
         <div class="sec-head"><span class="sec-num">03</span><h2>节点启动到同步完成</h2></div>
-        <p class="sec-sub">默认透明 failover 模式下，节点生命周期可以概括为：读取配置 → 获取 bootstrap → client-block catch-up → live steady state。</p>
+        <p class="sec-sub">默认 transparent failover 模式下，节点生命周期可以概括为：读取配置 → 获取 bootstrap → client-block catch-up → live steady state。</p>
         <div class="scope reveal">
           <div class="scope-bar"><span class="dots"><i></i><i></i><i></i></span><span class="ttl"><b>sequence</b> · startup-to-synced</span></div>
           <div class="scope-body">
@@ -377,8 +378,8 @@ sequenceDiagram
 
       <!-- 05 PUSH (combined production mode) -->
       <section id="push">
-        <div class="sec-head"><span class="sec-num">05</span><h2><code>--push</code> 生产组合模式<span style="color:var(--faint);font-weight:400;font-size:14px"> · 透明骨干 + 多源加速 + active 故障转移</span></h2></div>
-        <p class="sec-sub">生产环境的稳健做法是<b>同时启用透明 failover 骨干与 push 加速</b>，而不是二选一。<code>--push</code> 把多源加速叠加在默认的透明 bootstrap 之上：active peer 仍然是保底的透明骨干（转发 greeting、RPC、ack，并携带完整 live block 流），gateway 额外从 <code>--live N</code>（默认 5）个 peer 里挑 <code>N-1</code> 个 shadow peer 注入更快到达的区块副本，按 round 去重、fastest-first。<b>关键设计：push/多源层任何降级都不影响节点继续同步</b>——因为节点始终经由透明骨干拿到完整数据，shadow 只是加速，不是必需路径。</p>
+        <div class="sec-head"><span class="sec-num">05</span><h2><code>--push</code> 生产组合模式<span style="color:var(--faint);font-weight:400;font-size:14px"> · transparent backbone + 多源加速 + active 故障转移</span></h2></div>
+        <p class="sec-sub">生产环境的稳健做法是<b>同时启用 transparent failover backbone 与 push 加速</b>，而不是二选一。<code>--push</code> 把多源加速叠加在默认的 transparent bootstrap 之上：active peer 仍然是保底的 transparent backbone（转发 greeting、RPC、ack，并携带完整 live block 流），gateway 额外从 <code>--live N</code>（默认 5）个 peer 里挑 <code>N-1</code> 个 shadow peer 注入更快到达的区块副本，按 round 去重、fastest-first。<b>关键设计：push/多源层任何降级都不影响节点继续同步</b>——因为节点始终经由 transparent backbone 拿到完整数据，shadow 只是加速，不是必需路径。</p>
         <div class="scope reveal">
           <div class="scope-bar"><span class="dots"><i></i><i></i><i></i></span><span class="ttl"><b>state</b> · active-peer failover (serve_push)</span></div>
           <div class="scope-body">
@@ -396,10 +397,10 @@ stateDiagram-v2
 </pre>
           </div>
         </div>
-        <p>4002 client-block RPC 在组合模式下走 <code>dial_active</code> → <code>splice</code>（不是 fetch-forward），因为节点经透明骨干保有真实 peer 关系。这是组合模式比单独 <code>--cache</code> 更稳健的原因：4002 直连不受某个第三方 peer 限流/慢速影响，只受 active peer 本身的健康状况影响，而 active 本身有故障转移。</p>
+        <p>4002 client-block RPC 在组合模式下走 <code>dial_active</code> → <code>splice</code>（不是 fetch-forward），因为节点经 transparent backbone 保有真实 peer 关系。这是组合模式比单独 <code>--cache</code> 更稳健的原因：4002 直连不受某个第三方 peer 限流/慢速影响，只受 active peer 本身的健康状况影响，而 active 本身有故障转移。</p>
         <div class="note">
           <span class="tag">已验证 · 生产 node1 实测</span>
-          组合模式下持续同步 <b>5h15m</b>（64 个采样，0 stall、0 真实错误、全程仅连网关）；额外做过 <b>1 小时含节点重启</b>的完整周期测试（透明 re-bootstrap → catch-up → 稳态，到 tip 后 0 新增真实错误）；并用主动断开网关到 active 的上行连接<b>确定性验证了故障转移</b>——节点在新连接上重连，网关 pin 到全新 active，同步在数十秒内恢复到实时速率。
+          组合模式下持续同步 <b>5h15m</b>（64 个采样，0 stall、0 真实错误、全程仅连网关）；额外做过 <b>1 小时含节点重启</b>的完整周期测试（transparent re-bootstrap → catch-up → 稳态，到 tip 后 0 新增真实错误）；并用主动断开网关到 active 的上行连接<b>确定性验证了故障转移</b>——节点在新连接上重连，网关 pin 到全新 active，同步在数十秒内恢复到实时速率。
         </div>
         <div class="note warn">
           <span class="tag">已知限制 · pump_merge 无空闲超时</span>
@@ -438,7 +439,7 @@ stateDiagram-v2
         </div>
 
         <div class="detail reveal">
-          <h3><span class="pin">▸</span> 热路径优化 → ~135M frames/s</h3>
+          <h3><span class="pin">▸</span> hotpath 优化 → ~135M frames/s</h3>
           <p style="margin:8px 0 0">live merge 去重只需要读取 round。最新代码先走最快路径：如果 LZ4 block 起始 literal run 已覆盖前 <code>0x63</code> 个解压字节，就直接从压缩 payload 的 literal bytes 读取 <code>0x5e</code> 处的 round，用 <code>get_unchecked</code>（长度已校验）跳过边界检查，<b>不分配解码缓冲、不复制字节</b>；只有 literal 覆盖不足时才 fallback 到 <code>lz4_first_n</code> 的有界解码，最后才退回完整解压 oracle。10 轮 <code>hotpath</code> 埋点优化（Cargo 依赖 + <code>main.rs</code> 内 <code>#[hotpath::measure]</code> 属性宏，非独立文件）后为 31.6M → ~132-136M frames/s（约 4.3x，单次 <code>bench</code> 运行有 ±3% 波动），每轮均对照完整解压 oracle 验证 0 mismatch。</p>
         </div>
 
@@ -464,14 +465,70 @@ stateDiagram-v2
         <table>
           <thead><tr><th>子命令</th><th>作用</th></tr></thead>
           <tbody>
-            <tr><td>gateway &lt;peers-file&gt; [--push] [--cache] [--live N]</td><td>完整 P2P 网关（推荐）。使用 peerd 动态池。<code>--push</code>、<code>--cache</code> 正交、可叠加，默认全关=纯透明 failover。<code>--live</code> 默认 5。生产推荐 <code>--push</code>（不加 <code>--cache</code>）：透明骨干 + 多源加速 + active 故障转移，见 §05。</td></tr>
+            <tr><td>gateway &lt;peers-file&gt; [--push] [--cache] [--live N]</td><td>完整 P2P 网关（推荐）。使用 peerd 动态池。<code>--push</code>、<code>--cache</code> 正交、可叠加，默认全关=纯 transparent failover。<code>--live</code> 默认 5。生产推荐 <code>--push</code>（不加 <code>--cache</code>）：transparent backbone + 多源加速 + active 故障转移，见 §05。</td></tr>
             <tr><td>proxy &lt;peer1,peer2,…&gt; [--push]</td><td>固定 peer 列表的透明代理，覆盖 4000-4010，并在上游 stall 或拨号失败时切换 active peer（§06 的 generation 状态机）。</td></tr>
             <tr><td>relay &lt;port&gt; &lt;upstream&gt;</td><td>单上游多端口(4000-4010)透明中继，用于最小化转发路径或本地调试。</td></tr>
             <tr><td>&lt;port&gt; &lt;peer1,peer2,…&gt;</td><td>（无子命令，第一个参数是端口号）多上游 live block 合并服务，按 round 去重并转发最先到达的副本。</td></tr>
             <tr><td>cache &lt;port&gt; &lt;upstream&gt;</td><td>从单上游捕获 abci_state 并缓存，以本地速度服务后续连接的节点。</td></tr>
-            <tr><td>mock / bench</td><td>回放已捕获 block 进行测试，或运行 round 提取与去重热路径基准（<code>cargo test</code> 额外覆盖 round parity / 私有段过滤 / peer 抽取的单测）。</td></tr>
+            <tr><td>mock / bench</td><td>回放已捕获 block 进行测试，或运行 round 提取与去重 hotpath 基准（<code>cargo test</code> 额外覆盖 round parity / 私有段过滤 / peer 抽取的单测）。</td></tr>
           </tbody>
         </table>
+      </section>
+
+      <!-- 09 PORTS -->
+      <section id="ports">
+        <div class="sec-head"><span class="sec-num">09</span><h2>端口接口对比：4001 / 4002 / 其它</h2></div>
+        <p class="sec-sub">4001、4002 都不是"一个端口一个接口"，而是按 greeting 位或请求内容复用了多种子协议（§8 协议文档）。下表对比每个子接口在 <b>node1</b>（真实 HL 节点，作为出站客户端 / 入站服务端）和 <b>gw</b>（当前部署的 <code>gateway</code> 子命令）上分别提供什么。</p>
+        <div class="scope reveal" style="overflow-x:auto">
+          <table>
+            <thead><tr><th>端口</th><th>子接口</th><th>触发 / 请求方式</th><th>node1 提供 / 使用</th><th>gw 提供（分发行为）</th></tr></thead>
+            <tbody>
+              <tr>
+                <td>4001</td><td>bootstrap 快照流</td>
+                <td>greeting <code>send_abci=1</code></td>
+                <td>出站：按自身状态发 <code>:1</code>(冷启动)；入站：可服务其它真实 peer（abci_state 受per-IP限流）</td>
+                <td><code>--cache</code> 命中缓存 → RAM 原样回放（节点无真实 peer 关系）；未命中/默认 → round-robin 找当前正在发 state 的真实 peer，透传 + 设 <code>active</code></td>
+              </tr>
+              <tr>
+                <td>4001</td><td>live block 流</td>
+                <td>greeting <code>send_abci=0</code></td>
+                <td>出站：已有状态时用此模式；入站：同一角色对外服务</td>
+                <td>无 <code>--push</code> → splice 到 <code>active</code>；有 <code>--push</code> → <code>serve_push</code>（active transparent backbone + 最多 n_live-1 个 shadow 注入去重 + active 故障转移）</td>
+              </tr>
+              <tr>
+                <td>4002</td><td>client-block RANGE 查询</td>
+                <td>请求 tag <code>0x00</code> + <code>[start_round,end_round]</code></td>
+                <td>出站：catch-up 主力，按需追块；入站：可代答其它 peer 的查询</td>
+                <td><code>--cache</code> 冷启动（节点无真实 peer 关系）→ <code>serve_client_blocks</code> 代请求转发；其余（含默认 transparent bootstrap 与 <code>--push</code>，节点有真实 peer 关系）→ <code>dial_active</code>+<code>splice</code> 直连</td>
+              </tr>
+              <tr>
+                <td>4002</td><td>height query</td>
+                <td><code>querying height</code></td>
+                <td>出站：决定是否继续追块；入站：可代答</td>
+                <td>与上一行同一套分发（4002 按 <code>cache_coldstart</code> 整体判断，不区分子 RPC 类型）</td>
+              </tr>
+              <tr>
+                <td>4002</td><td>query_peers</td>
+                <td>—</td>
+                <td>出站：发现新 peer；入站：返回己方已知 peer 表</td>
+                <td>同上（fetch-forward 或直连 splice，协议无关的帧级转发）</td>
+              </tr>
+              <tr>
+                <td>4002</td><td>错误帧（共享 framing）</td>
+                <td>type=0 + <code>0x03</code>+ASCII</td>
+                <td><code>client block round too large</code>（请求超过对端已提交 tip）/ <code>Peer-only request</code>（命中未建立会话的 peer）二者均可能收发</td>
+                <td>fetch-forward 或直连 splice 时原样穿透，不解析</td>
+              </tr>
+              <tr>
+                <td>4000 / 4003-4010</td><td>其它 gossip / broadcast-group 通道（未逆向）</td>
+                <td>—</td>
+                <td>完整 HL peer 对外发布整段端口范围</td>
+                <td>始终 <code>dial_active</code>+<code>splice</code> 纯透传，gw 不解析内容</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p>一句话总结：<b>4001 只有 2 种子接口（bootstrap / live），按 greeting 位切换；4002 有 3+ 种子 RPC（RANGE 查询 / height / peer discovery），按请求内容切换；gw 对 4001 会主动介入（缓存回放/多源合并/故障转移），对 4002 视节点是否有真实 peer 关系决定 fetch-forward 还是直连 splice，对 4000/4003-4010 永远只是透传。</b></p>
       </section>
 
       <footer>
