@@ -241,6 +241,14 @@ async fn main() {
         run_cache(port, upstream).await;
         return;
     }
+    if args.get(1).map(|s| s.as_str()) == Some("peerd") {
+        // peer discovery + probing daemon (env-var config mirrors peerd.sh for a drop-in swap):
+        // HYPERSYNC_DATA (data dir, default ./data), HL_NODE (default hyperliquid-node-1),
+        // HL_SELF_IP (optional, exclude this node's own public IP from candidates).
+        let interval: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(300);
+        run_peerd(interval).await;
+        return;
+    }
     if args.get(1).map(|s| s.as_str()) == Some("gateway") {
         // full P2P gateway: reads the node's OWN peer file (path arg) for its upstream pool, then
         // caches abci_state + round-merges live blocks from many peers + proxies gossip RPC w/ failover.
@@ -983,6 +991,183 @@ async fn capture_bootstrap_raced(
                 spawn_next!();
             }
         }
+    }
+}
+
+// Probe one candidate for LIVE-block serving (send_abci:false — cheap, NOT rate-limited, unlike
+// abci_state). Bounded to ~4s wall-clock total; counts type=1 frames with payload len>1 (excludes
+// the tiny 1-byte status/rejection frames). A peer-controlled frame length is capped before
+// allocating the payload buffer (a live block is a few hundred KB at most).
+async fn probe_live(ip: &str) -> usize {
+    let deadline = Instant::now() + Duration::from_secs(4);
+    let mut s = match timeout(
+        Duration::from_secs(4),
+        TcpStream::connect(format!("{ip}:4001")),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        _ => return 0,
+    };
+    if s.write_all(&GREET_FALSE).await.is_err() {
+        return 0;
+    }
+    let mut blocks = 0usize;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let mut hdr = [0u8; 5];
+        if !matches!(timeout(remaining, s.read_exact(&mut hdr)).await, Ok(Ok(_))) {
+            break;
+        }
+        let len = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as usize;
+        if len > 8_000_000 {
+            break; // sanity cap: a live-probe frame is never this large
+        }
+        let mut payload = vec![0u8; len];
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if !matches!(
+            timeout(remaining, s.read_exact(&mut payload)).await,
+            Ok(Ok(_))
+        ) {
+            break;
+        }
+        if hdr[4] == 1 && len > 1 {
+            blocks += 1;
+        }
+    }
+    blocks
+}
+
+// Peer discovery + probing daemon (Rust port of peerd.sh, kept as its OWN process rather than a
+// background task inside the gateway): discovers candidate peers (the gossipRootIps API +
+// harvesting a running node's own logs for peers it has talked to) and probes each concurrently
+// for live-block serving, writing a ranked pool to <data-dir>/peers.json that `gateway` reads and
+// refreshes every 30s. Deliberately a separate process: a probing storm across 100+ candidates, or
+// a hung `docker logs` call, never touches the gateway process that is actively serving a node.
+async fn run_peerd(interval: u64) {
+    use std::collections::HashSet;
+    let data_dir = std::env::var("HYPERSYNC_DATA").unwrap_or_else(|_| "./data".to_string());
+    tokio::fs::create_dir_all(&data_dir).await.ok();
+    let node = std::env::var("HL_NODE").unwrap_or_else(|_| "hyperliquid-node-1".to_string());
+    // optional: exclude our own public IP (a legitimate routable address, but not a peer to dial)
+    let self_ip = std::env::var("HL_SELF_IP").ok();
+    let cand_path = format!("{data_dir}/peer_candidates.txt");
+    let out_path = format!("{data_dir}/peers.json");
+    let log_path = format!("{data_dir}/peerd.log");
+
+    let mut candidates: HashSet<String> = tokio::fs::read_to_string(&cand_path)
+        .await
+        .map(|s| s.lines().map(str::to_string).collect())
+        .unwrap_or_default();
+
+    loop {
+        // 1. discover: gossipRootIps API + harvest the node's own logs for peers it has talked to.
+        // Shelling out to curl/docker (rather than an HTTPS client / Docker socket API) keeps this
+        // to thin, standard external tools instead of adding heavyweight client dependencies for a
+        // one-shot JSON POST and a log tail.
+        let roots = timeout(
+            Duration::from_secs(15),
+            tokio::process::Command::new("curl")
+                .args([
+                    "-s",
+                    "-X",
+                    "POST",
+                    "-H",
+                    "Content-Type: application/json",
+                    "--data",
+                    r#"{"type":"gossipRootIps"}"#,
+                    "https://api.hyperliquid.xyz/info",
+                ])
+                .output(),
+        )
+        .await;
+        let harvested = timeout(
+            Duration::from_secs(15),
+            tokio::process::Command::new("sudo")
+                .args(["docker", "logs", "--tail", "3000", &node])
+                .output(),
+        )
+        .await;
+
+        if let Ok(Ok(o)) = roots {
+            for ip in extract_ipv4(&String::from_utf8_lossy(&o.stdout)) {
+                if self_ip.as_deref() != Some(ip.as_str()) {
+                    candidates.insert(ip);
+                }
+            }
+        }
+        if let Ok(Ok(o)) = harvested {
+            let text = String::from_utf8_lossy(&o.stdout) + String::from_utf8_lossy(&o.stderr);
+            for ip in extract_ipv4(&text) {
+                if self_ip.as_deref() != Some(ip.as_str()) {
+                    candidates.insert(ip);
+                }
+            }
+        }
+        let _ = tokio::fs::write(
+            &cand_path,
+            candidates.iter().cloned().collect::<Vec<_>>().join("\n"),
+        )
+        .await;
+
+        // 2. probe every known candidate concurrently for live-block serving
+        let cand_vec: Vec<String> = candidates.iter().cloned().collect();
+        let mut set: tokio::task::JoinSet<(String, usize)> = tokio::task::JoinSet::new();
+        for ip in cand_vec.iter().cloned() {
+            set.spawn(async move {
+                let n = probe_live(&ip).await;
+                (ip, n)
+            });
+        }
+        let mut live: Vec<(String, usize)> = Vec::new();
+        while let Some(r) = set.join_next().await {
+            if let Ok((ip, n)) = r {
+                if n >= 2 {
+                    live.push((ip, n));
+                }
+            }
+        }
+        live.sort_by(|a, b| b.1.cmp(&a.1));
+        let ranked: Vec<String> = live.into_iter().map(|(ip, _)| ip).collect();
+
+        // 3. write peers.json (hand-rolled: content is plain IPv4 strings, no escaping needed)
+        let json = format!(
+            "{{\"live_servers\":[{}],\"n_candidates\":{}}}",
+            ranked
+                .iter()
+                .map(|ip| format!("\"{ip}\""))
+                .collect::<Vec<_>>()
+                .join(","),
+            cand_vec.len()
+        );
+        let _ = tokio::fs::write(&out_path, json).await;
+
+        let now = tokio::process::Command::new("date")
+            .arg("+%H:%M:%S")
+            .output()
+            .await
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+        let line = format!(
+            "{now} candidates={} live={} top={:?}\n",
+            cand_vec.len(),
+            ranked.len(),
+            ranked.iter().take(6).collect::<Vec<_>>()
+        );
+        eprint!("[peerd] {line}");
+        if let Ok(mut f) = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .await
+        {
+            let _ = f.write_all(line.as_bytes()).await;
+        }
+
+        tokio::time::sleep(Duration::from_secs(interval)).await;
     }
 }
 

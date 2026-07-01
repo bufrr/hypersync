@@ -8,7 +8,7 @@ name = "hypersync"
 path = "src/main.rs"
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "time", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "time", "sync", "process", "fs"] }
 lz4_flex = "0.11"
 hotpath = "0.19"
 rustc-hash = "2"
