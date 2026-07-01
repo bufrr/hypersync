@@ -245,16 +245,22 @@ async fn main() {
         // full P2P gateway: reads the node's OWN peer file (path arg) for its upstream pool, then
         // caches abci_state + round-merges live blocks from many peers + proxies gossip RPC w/ failover.
         let node_peer_file = args.get(2).cloned().unwrap_or_else(|| "/nodepeers".into());
-        // --push: also merge-push live blocks from multiple peers (lower latency); default off (pure
-        // transparent failover). --live N: concurrent upstreams for the live-block merge (default 5).
+        // --push: merge-push live blocks from multiple peers ON TOP OF a transparent-failover
+        //   backbone (default off = pure transparent failover). --live N: concurrent live upstreams
+        //   (default 5).
+        // --cache: additionally capture the bootstrap and replay it on a node cold-start, avoiding the
+        //   per-IP abci_state rate-limit on node restart. Trade-off: a cache-cold-started node has no
+        //   peer relationship, so its client-block RPC (4002) must be fetched-and-forwarded rather
+        //   than spliced. Default off = robust transparent bootstrap (node keeps a real peer).
         let push = args.iter().any(|a| a == "--push");
+        let cache_coldstart = args.iter().any(|a| a == "--cache");
         let n_live = args
             .iter()
             .position(|a| a == "--live")
             .and_then(|i| args.get(i + 1))
             .and_then(|v| v.parse().ok())
             .unwrap_or(5);
-        run_gateway(node_peer_file, push, n_live).await;
+        run_gateway(node_peer_file, push, cache_coldstart, n_live).await;
         return;
     }
     let port: u16 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(4001);
@@ -987,7 +993,7 @@ async fn capture_bootstrap_raced(
 //   - live blocks: round-merged from several pool peers (fastest-block-first, gap-free);
 //   - gossip RPC (4002 etc.): transparently proxied to an active pool peer, failing over on dial error.
 // If the active peer has a problem the gateway uses the next peer from the (continuously refreshed) pool.
-async fn run_gateway(node_peer_file: String, push: bool, n_live: usize) {
+async fn run_gateway(node_peer_file: String, push: bool, cache_coldstart: bool, n_live: usize) {
     let pool: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(read_node_peers(&node_peer_file)));
     // cached verbatim bootstrap (abci_state + EVM KVs) for cold-start without a peer state fetch
     let boot_blob: Arc<Mutex<Option<Arc<Vec<u8>>>>> = Arc::new(Mutex::new(None));
@@ -996,13 +1002,18 @@ async fn run_gateway(node_peer_file: String, push: bool, n_live: usize) {
                                             // RPC (4002) isn't rejected with "Peer-only request" for hitting a peer that doesn't know the node.
     let active: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     eprintln!(
-        "[gw] full P2P gateway: pool from {} ({} peers); mode={}; live-merge upstreams={}",
+        "[gw] full P2P gateway: pool from {} ({} peers); bootstrap={}; live={}; live-merge upstreams={}",
         node_peer_file,
         pool.lock().unwrap().len(),
-        if push {
-            "transparent + block-push"
+        if cache_coldstart {
+            "cache-coldstart(+transparent fallback)"
         } else {
-            "transparent failover"
+            "transparent"
+        },
+        if push {
+            "block-push(transparent backbone + multi-source + active-failover)"
+        } else {
+            "transparent splice"
         },
         n_live
     );
@@ -1022,7 +1033,7 @@ async fn run_gateway(node_peer_file: String, push: bool, n_live: usize) {
         });
     }
 
-    if push {
+    if cache_coldstart {
         // bootstrap capture: fetch + cache the full bootstrap (abci_state + EVM KVs) verbatim from a
         // serving state-server, so a node can cold-start from cache (no per-IP state rate-limit). Refresh.
         {
@@ -1136,10 +1147,12 @@ async fn run_gateway(node_peer_file: String, push: bool, n_live: usize) {
                             return;
                         }
                         if greet[5] == 1 {
-                            // BOOTSTRAP. With --push + a captured snapshot, serve it FROM CACHE (no peer
-                            // state fetch, no rate-limit); then stream live from a pool peer. The node
-                            // catches up the gap via the client-block RPC server (4002, from the buffer).
-                            if push {
+                            // BOOTSTRAP. With --cache + a captured snapshot, serve it FROM CACHE (no
+                            // peer state fetch, no rate-limit); then stream live from a pool peer. The
+                            // node catches up via the client-block RPC (4002, fetch-forwarded). Default
+                            // (no --cache) falls through to a transparent relay so the node keeps a real
+                            // peer relationship (robust 4002 splice, no cache-capture dependency).
+                            if cache_coldstart {
                                 let blob = boot_blob.lock().unwrap().clone();
                                 if let Some(blob) = blob {
                                     eprintln!(
@@ -1258,11 +1271,14 @@ async fn run_gateway(node_peer_file: String, push: bool, n_live: usize) {
                                 break;
                             }
                         }
-                    } else if push && port == 4002 {
-                        // fetch the node's client-block catch-up range from a real peer and forward it.
+                    } else if cache_coldstart && port == 4002 {
+                        // a cache-cold-started node has NO peer relationship, so its client-block
+                        // catch-up must be fetched from a real peer and forwarded on its behalf.
                         serve_client_blocks(down, active, peers, rr).await;
                     } else {
-                        // other gossip channels: reuse the active peer (consistent for the node)
+                        // 4002 (transparent bootstrap: the node HAS a real peer relationship) and the
+                        // other gossip channels: splice to the node's active peer (robust — no
+                        // fetch-forward). This is why transparent bootstrap keeps the node stable.
                         let Some(upc) = dial_active(&active, &peers, &rr, port).await else {
                             return;
                         };
@@ -1491,21 +1507,25 @@ async fn serve_push(
         }
     }
     // node -> active peer (transparent: RPC requests + acks)
-    {
+    let up = {
         let mut node_r = node_r;
         tokio::spawn(async move {
             let _ = tokio::io::copy(&mut node_r, &mut act_w).await;
-        });
-    }
-    // active peer -> node: block frames deduped by round (greeting already forwarded above)
-    {
+        })
+    };
+    // active peer -> node: the transparent backbone (forwards non-block frames + blocks). When this
+    // task ends the active peer's stream broke, so we tear the whole session down and let the node
+    // reconnect — the gateway then pins a FRESH active (round-robin). This is the proxy-style failover:
+    // the active peer is the guaranteed path; shadows below are best-effort accelerators only.
+    let mut active_task = {
         let tx = tx.clone();
         let dedup = dedup.clone();
         tokio::spawn(async move {
             let _ = pump_merge(act_r, tx, dedup, true).await;
-        });
-    }
+        })
+    };
     // every other peer -> node: live blocks only, deduped (multi-source acceleration)
+    let mut shadows = Vec::new();
     for (i, h) in hosts.iter().enumerate() {
         if i == active_idx {
             continue;
@@ -1513,7 +1533,7 @@ async fn serve_push(
         let target = format!("{}:{}", h, port);
         let tx = tx.clone();
         let dedup = dedup.clone();
-        tokio::spawn(async move {
+        shadows.push(tokio::spawn(async move {
             // Reconnect with backoff: public peers drop their streams, and a shadow source that
             // exited permanently would silently degrade the merge from n_live sources to fewer.
             // Stop only when the node side is gone (the merge channel is closed).
@@ -1532,13 +1552,27 @@ async fn serve_push(
                 }
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
-        });
+        }));
     }
     drop(tx);
-    while let Some(buf) = rx.recv().await {
-        if node_w.write_all(&buf).await.is_err() {
-            break;
+    loop {
+        tokio::select! {
+            maybe = rx.recv() => match maybe {
+                Some(buf) => {
+                    if node_w.write_all(&buf).await.is_err() {
+                        break;
+                    }
+                }
+                None => break,
+            },
+            // active (backbone) peer died -> tear down; the node reconnects to a fresh active
+            _ = &mut active_task => break,
         }
+    }
+    up.abort();
+    active_task.abort();
+    for s in shadows {
+        s.abort();
     }
 }
 
