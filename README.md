@@ -17,6 +17,8 @@ Hyperliquid non-validator nodes sync by dialing peers and streaming consensus / 
 - `proxy <peer1,peer2,...> [--push]` — **failover transparent proxy**: listens on 4000-4010, relays to the active upstream, health-monitors it, and fails over to the next healthy peer (bad peers skipped with a cooldown; no oscillation). Like `gateway` but with a fixed upstream list instead of the live `peerd` pool. Add `--push` to merge-push live blocks from *all* peers on 4001 (round-dedup, fastest-block-first) for lower block-reception latency.
 
 `peerd.sh` is the companion daemon: it discovers peers (the `gossipRootIps` API + harvesting a running node's logs) and probes each for **live-block serving** (`send_abci:false`, cheap and not rate-limited — it never probes the rate-limited abci_state), writing a ranked pool to `peers.json` that `gateway` reads and refreshes.
+
+`soak-test.sh [restart-node-at-start] [samples] [interval-seconds] [log-file]` monitors a running node+gateway pair over time: applied-block rate, sync source, real error count, and container health. Real errors are filtered by *signature* (e.g. `desc: "tcp greeting ... gossip"`) rather than by source IP, since the node never accepts inbound peer connections — that class of error is always internet-scanner noise on its public ports, regardless of which IP sent it.
 - `relay <port> <upstream>` — plain transparent relay of ports 4000-4010 to a single upstream.
 - `<port> <peer1,peer2,...>` (no subcommand) — multi-upstream live-block merge with round-based dedup (freshest block wins, gap-free).
 - `cache <port> <upstream>` — fetches the abci_state snapshot once, caches it, serves connecting nodes at local speed (beats the abci_stream deadline).
