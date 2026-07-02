@@ -21,6 +21,9 @@ use tokio::time::timeout;
 const GREET_FALSE: [u8; 8] = [0, 0, 0, 3, 0, 0, 0, 0]; // send_abci:false (live blocks; no rate-limited state)
 
 // Reference / correctness oracle + fallback: full lz4 decompress, read round @0x5e.
+// Round parsing assumes the `0xfc + u32 LE` varint form. Mainnet rounds (~1.35B, +~14.5/s) stay
+// under u32::MAX for roughly 6 more years; past that the wire varint becomes `0xfd + u64`, these
+// parsers return None, and dedup gracefully degrades to forward-everything (the node de-dups).
 fn block_round_full(payload: &[u8]) -> Option<u32> {
     let dec = lz4_flex::block::decompress_size_prepended(payload).ok()?;
     if dec.len() >= 0x63 && dec[0x5e] == 0xfc {
@@ -206,12 +209,15 @@ async fn main() {
         return;
     }
     if args.get(1).map(|s| s.as_str()) == Some("relay") {
-        let port: u16 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(4001);
+        // `relay <upstream>` — always relays the whole 4000-4010 range (a node's bootstrap needs
+        // 4002 alongside 4001). Accepts the legacy `relay <port> <upstream>` form too; the port
+        // arg was always ignored, so it's no longer documented.
         let upstream = args
             .get(3)
             .cloned()
+            .or_else(|| args.get(2).cloned())
             .unwrap_or_else(|| "172.18.0.2:4001".into());
-        run_relay(port, upstream).await;
+        run_relay(upstream).await;
         return;
     }
     if args.get(1).map(|s| s.as_str()) == Some("proxy") {
@@ -233,6 +239,8 @@ async fn main() {
         return;
     }
     if args.get(1).map(|s| s.as_str()) == Some("cache") {
+        // testing/aux only: binds a single port, but a real node also needs 4002 (gossip RPC)
+        // to bootstrap — use `gateway --cache` for a full node-facing cache.
         let port: u16 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(4001);
         let upstream = args
             .get(3)
@@ -271,6 +279,9 @@ async fn main() {
         run_gateway(node_peer_file, push, cache_coldstart, n_live).await;
         return;
     }
+    // default `<port> <peers>` mode: multi-upstream live-block merge. Testing/aux only — `pump`
+    // drops all type-0 (control) frames, so a real HL node would never receive the peer greeting
+    // through it; it pairs with `mock` (which sends no greeting frame). Use `gateway` for nodes.
     let port: u16 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(4001);
     let upstreams: Vec<String> = match args.get(2) {
         Some(s) => s
@@ -532,11 +543,21 @@ async fn feed_state(
     s.write_all(&[0, 0, 0, 3, 0, 1, 0, 0]).await?; // send_abci:true
     loop {
         let mut hdr = [0u8; 5];
-        s.read_exact(&mut hdr).await?;
+        match timeout(Duration::from_secs(30), s.read_exact(&mut hdr)).await {
+            Ok(res) => res?,
+            Err(_) => return Err(std::io::Error::other("idle timeout")),
+        };
         let len = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as usize;
         let typ = hdr[4];
+        // only legitimately-large frame is the ~950MB abci_state; never trust a bigger length
+        if len > 1_500_000_000 {
+            return Err(std::io::Error::other("oversized frame"));
+        }
         let mut payload = vec![0u8; len];
-        s.read_exact(&mut payload).await?;
+        match timeout(Duration::from_secs(300), s.read_exact(&mut payload)).await {
+            Ok(res) => res?,
+            Err(_) => return Err(std::io::Error::other("payload timeout")),
+        };
         let mut frame = hdr.to_vec();
         frame.extend_from_slice(&payload);
         let frame = Arc::new(frame);
@@ -898,6 +919,11 @@ async fn fetch_bootstrap(upstream: &str) -> std::io::Result<Vec<u8>> {
         }
         blob.extend_from_slice(&hdr);
         blob.extend_from_slice(&payload);
+        // total cap: a real bootstrap is ~4.5GB; a peer that streams bulk forever (staying above
+        // the rate-drop floor) must not inflate the capture unboundedly (x3 concurrent racers).
+        if blob.len() > 10_000_000_000 {
+            return Err(std::io::Error::other("capture too large"));
+        }
         win_bytes += 5 + len;
         // speed gate: right after the abci_state snapshot, require a fast server (else the EVM-KVs
         // capture is slow and the rate-drop detector could mistake a slow tail for the end).
@@ -1047,8 +1073,18 @@ async fn probe_live(ip: &str) -> usize {
 // for live-block serving, writing a ranked pool to <data-dir>/peers.json that `gateway` reads and
 // refreshes every 30s. Deliberately a separate process: a probing storm across 100+ candidates, or
 // a hung `docker logs` call, never touches the gateway process that is actively serving a node.
+// Atomically replace `path` (write temp + rename): the gateway re-reads peers.json every 30s, and
+// a plain truncate-then-write could be observed half-written — extract_ipv4 on a truncated tail
+// can yield a VALID but WRONG address ("…236" cut to "…23") that then enters the dial pool.
+async fn write_atomic(path: &str, contents: &str) {
+    let tmp = format!("{path}.tmp");
+    if tokio::fs::write(&tmp, contents).await.is_ok() {
+        let _ = tokio::fs::rename(&tmp, path).await;
+    }
+}
+
 async fn run_peerd(interval: u64) {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     let data_dir = std::env::var("HYPERSYNC_DATA").unwrap_or_else(|_| "./data".to_string());
     tokio::fs::create_dir_all(&data_dir).await.ok();
     let node = std::env::var("HL_NODE").unwrap_or_else(|_| "hyperliquid-node-1".to_string());
@@ -1062,6 +1098,11 @@ async fn run_peerd(interval: u64) {
         .await
         .map(|s| s.lines().map(str::to_string).collect())
         .unwrap_or_default();
+    // consecutive failed-probe count per candidate; prune after PRUNE_AFTER cycles so stale
+    // harvested IPs don't get re-probed forever (a pruned peer still advertised by discovery is
+    // simply re-added next cycle and gets a fresh count).
+    const PRUNE_AFTER: u32 = 50;
+    let mut fail_counts: HashMap<String, u32> = HashMap::new();
 
     loop {
         // 1. discover: gossipRootIps API + harvest the node's own logs for peers it has talked to.
@@ -1107,27 +1148,47 @@ async fn run_peerd(interval: u64) {
                 }
             }
         }
-        let _ = tokio::fs::write(
+        write_atomic(
             &cand_path,
-            candidates.iter().cloned().collect::<Vec<_>>().join("\n"),
+            &candidates.iter().cloned().collect::<Vec<_>>().join("\n"),
         )
         .await;
 
-        // 2. probe every known candidate concurrently for live-block serving
+        // 2. probe every known candidate concurrently for live-block serving (capped at 64 at a
+        // time so a poisoned harvest source can't turn one cycle into thousands of sockets)
         let cand_vec: Vec<String> = candidates.iter().cloned().collect();
+        let sem = Arc::new(tokio::sync::Semaphore::new(64));
         let mut set: tokio::task::JoinSet<(String, usize)> = tokio::task::JoinSet::new();
         for ip in cand_vec.iter().cloned() {
+            let sem = sem.clone();
             set.spawn(async move {
+                let _permit = sem.acquire().await;
                 let n = probe_live(&ip).await;
                 (ip, n)
             });
         }
         let mut live: Vec<(String, usize)> = Vec::new();
+        let mut failed: Vec<String> = Vec::new();
         while let Some(r) = set.join_next().await {
             if let Ok((ip, n)) = r {
                 if n >= 2 {
                     live.push((ip, n));
+                } else {
+                    failed.push(ip);
                 }
+            }
+        }
+        for ip in &live {
+            fail_counts.remove(&ip.0);
+        }
+        let mut pruned = 0usize;
+        for ip in failed {
+            let c = fail_counts.entry(ip.clone()).or_insert(0);
+            *c += 1;
+            if *c >= PRUNE_AFTER {
+                candidates.remove(&ip);
+                fail_counts.remove(&ip);
+                pruned += 1;
             }
         }
         live.sort_by(|a, b| b.1.cmp(&a.1));
@@ -1143,18 +1204,24 @@ async fn run_peerd(interval: u64) {
                 .join(","),
             cand_vec.len()
         );
-        let _ = tokio::fs::write(&out_path, json).await;
+        write_atomic(&out_path, &json).await;
 
-        let now = tokio::process::Command::new("date")
-            .arg("+%H:%M:%S")
-            .output()
-            .await
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .unwrap_or_default();
+        // UTC HH:MM:SS from the system clock (no `date` subprocess)
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let now = format!(
+            "{:02}:{:02}:{:02}",
+            (secs / 3600) % 24,
+            (secs / 60) % 60,
+            secs % 60
+        );
         let line = format!(
-            "{now} candidates={} live={} top={:?}\n",
+            "{now} candidates={} live={} pruned={} top={:?}\n",
             cand_vec.len(),
             ranked.len(),
+            pruned,
             ranked.iter().take(6).collect::<Vec<_>>()
         );
         eprint!("[peerd] {line}");
@@ -1607,9 +1674,34 @@ async fn run_proxy(upstreams: Vec<String>, push: bool) {
                     down.set_nodelay(true).ok();
                     upc.set_nodelay(true).ok();
                     if push && p == 4001 {
-                        // block-push: merge live blocks from active + all other peers (round-dedup,
-                        // fastest-first); active stays transparent for node->peer + control/state/RPC.
-                        serve_push(down, upc, hosts.clone(), idx, p).await;
+                        // serve_push assumes the node's greeting has ALREADY been forwarded to the
+                        // active peer (its first act is reading the peer's greeting reply, and the
+                        // node->peer copy task only starts after that). Forward it here, like
+                        // run_gateway does — otherwise peer waits for the greeting, gateway waits
+                        // for the peer's reply, and the handshake deadlocks (review finding 1).
+                        let mut down = down;
+                        let mut upc = upc;
+                        let mut greet = [0u8; 8];
+                        if !matches!(
+                            timeout(Duration::from_secs(20), down.read_exact(&mut greet)).await,
+                            Ok(Ok(_))
+                        ) {
+                            return;
+                        }
+                        if upc.write_all(&greet).await.is_err() {
+                            return;
+                        }
+                        if greet[5] == 1 {
+                            // bootstrap (send_abci:true): transparent splice. Multi-source injection
+                            // can't help mid-bootstrap (the abci_state/EVM-KVs boundaries aren't
+                            // detectable), and serve_push's greeting gate would reject the >4MB
+                            // state frame the peer sends first.
+                            splice(down, upc).await;
+                        } else {
+                            // live channel: merge blocks from active + all other peers (round-dedup,
+                            // fastest-first); active stays transparent for node->peer + control/RPC.
+                            serve_push(down, upc, hosts.clone(), idx, p).await;
+                        }
                         return;
                     }
                     let (mut dr, mut dw) = down.into_split();
@@ -1769,17 +1861,35 @@ async fn pump_merge(
     dedup: Arc<RoundDedup>,
     forward_nonblock: bool,
 ) -> std::io::Result<()> {
+    // Live blocks arrive continuously (~4-15/s on mainnet), so >30s of silence means a stalled
+    // connection. Without this idle timeout a silently-stalled-but-open ACTIVE peer would hang
+    // the backbone forever (teardown only fired on EOF/RST); erroring out here makes serve_push
+    // tear the session down so the node reconnects to a fresh active, and makes a stalled shadow
+    // fall into its reconnect loop.
+    const IDLE: Duration = Duration::from_secs(30);
     loop {
         let mut hdr = [0u8; 5];
-        r.read_exact(&mut hdr).await?;
+        match timeout(IDLE, r.read_exact(&mut hdr)).await {
+            Ok(res) => res?,
+            Err(_) => return Err(std::io::Error::other("idle timeout")),
+        };
         let len = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as usize;
         let typ = hdr[4];
-        if len > 60_000_000 && !forward_nonblock {
-            // a non-active (shadow) peer shouldn't send huge frames; drain to stay frame-aligned
+        if len > 60_000_000 {
+            // Legit frames on a live (send_abci:false) channel are <=~1MB (greeting + blocks).
+            // From the ACTIVE peer an oversized length is a broken/hostile stream — error out so
+            // the session tears down (never allocate a peer-controlled multi-GB buffer). From a
+            // shadow, drain to stay frame-aligned and keep the accelerator alive.
+            if forward_nonblock {
+                return Err(std::io::Error::other("oversized frame from active peer"));
+            }
             let mut rem = len;
             let mut buf = vec![0u8; 65536];
             while rem > 0 {
-                let nb = r.read(&mut buf[..rem.min(65536)]).await?;
+                let nb = match timeout(IDLE, r.read(&mut buf[..rem.min(65536)])).await {
+                    Ok(res) => res?,
+                    Err(_) => return Err(std::io::Error::other("idle timeout (drain)")),
+                };
                 if nb == 0 {
                     return Ok(());
                 }
@@ -1788,7 +1898,10 @@ async fn pump_merge(
             continue;
         }
         let mut payload = vec![0u8; len];
-        r.read_exact(&mut payload).await?;
+        match timeout(IDLE, r.read_exact(&mut payload)).await {
+            Ok(res) => res?,
+            Err(_) => return Err(std::io::Error::other("idle timeout (payload)")),
+        };
         let forward = if typ == 1 {
             match block_round(&payload) {
                 Some(rnd) => dedup.is_new(rnd), // block: forward only the first (fastest) copy
@@ -1810,7 +1923,7 @@ async fn pump_merge(
 // Transparent relay: local node <-> single upstream peer. Forwards the node's greeting
 // (send_abci:true) so the upstream serves the full abci_state + live blocks; relays both ways.
 // Used to let a fresh node fully sync THROUGH the gateway from a fast local upstream.
-async fn run_relay(_port: u16, upstream: String) {
+async fn run_relay(upstream: String) {
     // `upstream` is just the host (e.g. "172.18.0.1"); relay the whole HL port range 4000-4010,
     // each port transparently to host:<same port>. The node's bootstrap needs more than the block
     // channel: 4001 = blocks/abci heavy channel, 4002 = gossip RPC (query-height etc). Forwarding
@@ -2022,6 +2135,51 @@ mod tests {
         ] {
             assert!(!is_routable(ip), "{ip} should NOT be routable");
         }
+    }
+
+    #[test]
+    fn block_round_bounded_decode_path() {
+        // A repetitive prefix compresses to a short literal run + back-references, so the
+        // literal fast path (needs >=0x63 leading literals) is skipped and the bounded decoder
+        // lz4_first_n — including its overlapping match-copy loop — does the work.
+        for round in [1u32, 123_456_789, u32::MAX] {
+            let mut dec = vec![0xAAu8; 0x100];
+            dec[0x5e] = 0xfc;
+            dec[0x5f..0x63].copy_from_slice(&round.to_le_bytes());
+            let payload = lz4_flex::block::compress_prepend_size(&dec);
+            assert_eq!(block_round_full(&payload), Some(round), "oracle @ {round}");
+            assert_eq!(block_round(&payload), Some(round), "bounded @ {round}");
+        }
+    }
+
+    #[test]
+    fn read_node_peers_preserves_order_and_dedups() {
+        let dir = std::env::temp_dir().join(format!("hypersync_rnp_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("peers.json");
+        // rank order must survive (the gateway relies on peerd's best-first ordering) and the
+        // duplicate must keep its FIRST position; "3" (n_candidates) is not a 4-octet IP.
+        std::fs::write(
+            &f,
+            r#"{"live_servers":["9.9.9.9","8.8.8.8","9.9.9.9","1.1.1.1"],"n_candidates":3}"#,
+        )
+        .unwrap();
+        let got = read_node_peers(f.to_str().unwrap());
+        assert_eq!(got, vec!["9.9.9.9", "8.8.8.8", "1.1.1.1"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn round_dedup_sliding_window_semantics() {
+        let d = RoundDedup::new(16_384);
+        assert!(d.is_new(5), "first sighting is new");
+        assert!(!d.is_new(5), "repeat is deduped");
+        // same slot (5 + 16384), different round: evicts 5 from the window
+        assert!(d.is_new(5 + 16_384), "colliding round is new");
+        assert!(
+            d.is_new(5),
+            "evicted round counts as new again (window semantics)"
+        );
     }
 
     #[test]
