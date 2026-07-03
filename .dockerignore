@@ -1,0 +1,10 @@
+target
+data
+observations
+.git
+.codex
+.agents
+docs
+review.md
+soak-test.sh
+README.md

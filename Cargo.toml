@@ -10,12 +10,12 @@ path = "src/main.rs"
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "time", "sync", "process", "fs"] }
 lz4_flex = "0.11"
-hotpath = "0.19"
+hotpath = { version = "0.19", optional = true }
 rustc-hash = "2"
 parking_lot = "0.12"
 
 [features]
-hotpath = ["hotpath/hotpath"]
+hotpath = ["dep:hotpath", "hotpath/hotpath"]
 
 [profile.release]
 opt-level = 3
