@@ -1,0 +1,69 @@
+# hypersync gateway + peerd as their own compose project.
+#
+# The gateway serves MULTIPLE downstream hl-nodes (sessions are keyed by the node's source IP —
+# one node per egress IP; two nodes NAT'd through one IP would be conflated). It reads no node
+# files: gw needs only /pd (peers.json + bootstrap.cache), peerd discovers upstream peers via the
+# gossipRootIps API + probing.
+#
+# Deployment modes:
+#   co-located (nodes on this machine):  node compose projects join the attachable gwnet below
+#     as an external network (name: hypersync_gwnet) and dial the gw's static IP 172.28.0.10.
+#     Optionally add stats harvesting: docker compose -f docker-compose.yml \
+#       -f docker-compose.colocated.yml up -d
+#   remote (nodes on other machines):    uncomment the gw `ports:` block and set GW_BIND_IP in
+#     .env to a PRIVATE interface IP of this machine; nodes dial that IP. NEVER bind a public
+#     interface: the gateway has no allowlist, and anyone reaching 4000-4010 can trigger a
+#     ~4.5 GB bootstrap replay. Firewall the ports to the node machines' IPs.
+#
+# Env (.env): HL_SELF_IP = comma-separated public IPs of ALL your nodes (keeps your own nodes out
+# of the upstream pool — otherwise the gateway can end up relaying your nodes to each other).
+
+name: hypersync
+
+networks:
+  gwnet:
+    driver: bridge
+    attachable: true # co-located node projects + fakenode test containers join this
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
+          ip_range: 172.28.0.128/25 # dynamic pool; keeps .10 safe from races
+          gateway: 172.28.0.1
+
+services:
+  gw:
+    image: hypersync:latest
+    build: .
+    container_name: hypersync-gw
+    restart: unless-stopped
+    # worst case: cache blob 4.5G + refresh transient 4.5G + one (single-flight) fallback tap up
+    # to 10G ≈ 19G; a cold-cache start can instead race up to 3 capture buffers. Concurrent
+    # replays to N nodes share one Arc'd blob — no extra memory per node.
+    mem_limit: 24g
+    stop_grace_period: 30s
+    networks:
+      gwnet:
+        ipv4_address: 172.28.0.10 # THE well-known gw address; static, outside ip_range
+    volumes:
+      - ./data:/pd
+    # command defaults to the image CMD: gateway /pd/peers.json --push --cache --live 5
+    # remote mode ONLY — bind to a private interface and firewall to node IPs:
+    # ports:
+    #   - "${GW_BIND_IP:?set GW_BIND_IP to a private interface IP}:4000-4010:4000-4010"
+
+  peerd:
+    image: hypersync:latest
+    container_name: hypersync-peerd
+    restart: unless-stopped
+    mem_limit: 1g
+    command: ["peerd", "300"]
+    environment:
+      HYPERSYNC_DATA: /pd
+      # comma-separated list of ALL our nodes' public IPs (never dialed as upstream peers)
+      HL_SELF_IP: "${HL_SELF_IP:-}"
+      # optional, comma-separated tcp_lz4_stats dirs (co-located only; see the colocated overlay)
+      HL_STATS_DIR: "${HL_STATS_DIR:-}"
+    networks:
+      - gwnet
+    volumes:
+      - ./data:/pd

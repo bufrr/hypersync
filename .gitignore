@@ -1,3 +1,5 @@
 target/
 review.md
 data/
+.env
+observations/

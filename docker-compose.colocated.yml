@@ -1,0 +1,18 @@
+# Overlay for co-located deployments: harvest peer candidates from the local node's own
+# tcp_lz4_stats (richest source — peers the node actually exchanged data with).
+#   docker compose -f docker-compose.yml -f docker-compose.colocated.yml up -d
+# For more nodes on this machine, add one external volume + one /hl/nodeN mount per node and
+# append ",/hl/nodeN/tcp_lz4_stats" to HL_STATS_DIR.
+
+volumes:
+  node1-hl-data:
+    external: true
+    name: hyperliquid_hl-data
+
+services:
+  peerd:
+    environment:
+      HL_STATS_DIR: /hl/node1/tcp_lz4_stats
+    volumes:
+      - ./data:/pd
+      - node1-hl-data:/hl/node1:ro
