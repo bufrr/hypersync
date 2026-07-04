@@ -1932,7 +1932,9 @@ async fn write_atomic(path: &str, contents: &str) {
 const MIN_LIVE_SERVERS_TO_OVERWRITE: usize = 8;
 
 fn should_keep_previous_peer_pool(current_live: usize, previous_live: usize) -> bool {
-    current_live < MIN_LIVE_SERVERS_TO_OVERWRITE && previous_live >= MIN_LIVE_SERVERS_TO_OVERWRITE
+    current_live > 0
+        && current_live < MIN_LIVE_SERVERS_TO_OVERWRITE
+        && previous_live >= MIN_LIVE_SERVERS_TO_OVERWRITE
 }
 
 fn should_write_candidate_fallback(
@@ -1941,7 +1943,7 @@ fn should_write_candidate_fallback(
     candidates: usize,
 ) -> bool {
     current_live < MIN_LIVE_SERVERS_TO_OVERWRITE
-        && previous_live < MIN_LIVE_SERVERS_TO_OVERWRITE
+        && (previous_live < MIN_LIVE_SERVERS_TO_OVERWRITE || current_live == 0)
         && candidates >= MIN_LIVE_SERVERS_TO_OVERWRITE
 }
 
@@ -2185,9 +2187,7 @@ async fn run_gateway(node_peer_file: String, push: bool, cache_coldstart: bool, 
             loop {
                 tokio::time::sleep(Duration::from_secs(30)).await;
                 let p = read_node_peers(&path);
-                if !p.is_empty() {
-                    *pool.lock().unwrap() = p;
-                }
+                *pool.lock().unwrap() = p;
             }
         });
     }
@@ -3409,6 +3409,10 @@ mod tests {
             MIN_LIVE_SERVERS_TO_OVERWRITE
         ));
         assert!(!should_keep_previous_peer_pool(
+            0,
+            MIN_LIVE_SERVERS_TO_OVERWRITE
+        ));
+        assert!(!should_keep_previous_peer_pool(
             MIN_LIVE_SERVERS_TO_OVERWRITE,
             MIN_LIVE_SERVERS_TO_OVERWRITE
         ));
@@ -3432,6 +3436,11 @@ mod tests {
         ));
         assert!(!should_write_candidate_fallback(
             1,
+            MIN_LIVE_SERVERS_TO_OVERWRITE,
+            MIN_LIVE_SERVERS_TO_OVERWRITE
+        ));
+        assert!(should_write_candidate_fallback(
+            0,
             MIN_LIVE_SERVERS_TO_OVERWRITE,
             MIN_LIVE_SERVERS_TO_OVERWRITE
         ));
