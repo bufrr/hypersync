@@ -21,22 +21,66 @@ end-to-end on this host.
 - [x] README: multi-node semantics, peerd env lists, compose deployment, fakenode
 - [x] cargo fmt / clippy -D warnings / test — 25/25 green
 
+## Code review round (28 verified findings, high-effort adversarial)
+- [x] Fixed: capture-permit lifetime (released when capturing stops, not connection end);
+      persist tmp-path race (unique tmp per writer); lazy dial_active pin no longer suppresses
+      cache replay (NodeState.lazy_active); guard Drop stamps last_seen before decrement;
+      replay-stamp reset via compare_exchange; mem_limit 16g→24g; GREET_TRUE + split_csv
+      dedup; &CacheSink; fakenode simplified (3 unused flags dropped, phase fns, shared frame
+      helpers, Peer-only leak = rpc FAIL, strict port parse)
+- Accepted w/ rationale: same-node dual-greet TOCTOU (unrealistic); N concurrent replays
+  (intended, shared Arc); per-replay blob scan (negligible at N=2-3); registry insert at
+  accept (bounded, tiny); guard tuple style
+
+## E2E found bug (not in review scope — needed live traffic)
+- [x] Cache replay wedged at ~2^31 bytes: single write_all over 4.5GB blob + fast reader =
+      one send() treadmills in-kernel until a 32-bit counter overflows; permanent stall,
+      Send-Q=0. Fix: 8MB chunked writes (4.4GB now replays in ~1.5s). Real nodes read too
+      slowly to trigger — fakenode's discard-speed reads exposed it.
+
 ## E2E verification (this host, sudo -n docker)
-- [ ] Build image; stop old hl-gw/hl-peerd (keep containers for rollback); new project up
-      (colocated overlay); verify warm cache adopted
-- [ ] fakenode single smoke (boot/live/rpc PASS)
-- [ ] fakenode ×2 concurrent: both full replays, distinct actives, zero "active session
-      exists" suppressions, no cross-node clears, gw mem < limit
-- [ ] Migrate real node: ~/node compose joins hypersync_gwnet, override → 172.28.0.10
-      (bind-mounted), recreate; soak-test.sh short run (HL_GW=hypersync-gw)
-- [ ] Real node + fakenode churn: node applied-rate unaffected
-- [ ] 1-3h soak; then remove orphaned hl-gw/hl-peerd
-- Rollback: $HC down; docker start hl-gw hl-peerd; node recreate without gwnet (old override
-  re-applied by exec)
+- [x] Build image; stop old hl-gw/hl-peerd (kept for rollback); new project up (colocated
+      overlay); warm cache adopted (4517MB, age 664s); gw static 172.28.0.10; peerd cycle ok
+- [x] fakenode single smoke: boot=PASS 4.4GB/1.5s, live=PASS 451 rounds, rpc=PASS (3.5MB
+      data batch) — after wedge fix
+- [x] fakenode ×2 concurrent: BOTH boot=PASS (concurrent FROM CACHE, zero suppressions),
+      both live+rpc PASS, gw mem flat 4.2GiB/24GiB
+- [x] Migrate real node: recreated on hypersync_gwnet (172.28.0.129), bind-mounted override →
+      172.28.0.10; re-bootstrapped FROM CACHE (2nd attempt after node's own early close —
+      cooldown reset path worked); short soak 5×120s: catch-up at ~2800-4900/120s,
+      realerr=0 at final sample, gwerr=0 throughout, gw mem stable 4.4GiB
+- [x] Real node + fakenode churn: churn1+churn2 both PASS (1.5s replays) during soak s04;
+      node stayed connected (src=gw 4001+4002), applied-rate unaffected
+- [x] 2h soak (24×300s): 24/24 samples, ZERO bad signals (realerr/gwerr/boot_timeout/oom/rc all
+      clean), applied rate steady 4400±100/300s (~14.7 blocks/s), gw mem flat 4.47GiB with
+      expected ~8GiB refresh transients every 10min
+- [x] Orphaned hl-gw/hl-peerd removed after soak pass (rollback no longer needed)
 
 ## Follow-up
-- [ ] Refactor main.rs into modules (protocol/gateway/push/peerd/testing) — pure moves, after soak
+- [x] Refactor main.rs into modules — pure moves, done in a worktree during the soak, verified
+      (fmt/clippy -D warnings/25 tests, line-coverage audit), merged after soak, redeployed,
+      re-smoked with 2 concurrent fakenodes (both PASS), node reattached cleanly
 - Non-goal (documented): per-node upstream anti-affinity; rr rotation spreads naturally
 
 ## Review
-(to fill after e2e)
+
+Delivered: one gateway serves N hl-nodes (per-node sessions keyed by source IP); gw+peerd run
+as their own compose project deployable on a separate machine (no node-file dependencies);
+fully tested on mainnet.
+
+Bugs found and fixed along the way:
+1. (review round, 28 verified findings) capture-permit lifetime, persist tmp race, lazy-pin
+   replay suppression, guard Drop ordering, stamp clobber, mem_limit, plus cleanup batch.
+2. (e2e only — needed live traffic) single write_all over the 4.5GB blob wedges permanently at
+   ~2^31 bytes with a fast reader; fixed with 8MB chunked writes (replay now ~1.5s). Real nodes
+   read too slowly to ever hit it; captured in memory for future debugging.
+
+Observed quirk (non-blocking): fakenode sometimes parses live-round values ~770.5M (vs main
+counter ~1355.7M) depending on which upstream peer its live session pins; the counter advances
+at block rate, so it's a property of that peer's stream, not a relay defect. Real node syncing
+is unaffected. Worth a look if fakenode round assertions ever get stricter.
+
+Final state: hypersync-gw (172.28.0.10, static) + hypersync-peerd under compose project
+"hypersync" with colocated overlay; node dials 172.28.0.10 via bind-mounted
+override_gossip_config.json (survives recreation); main.rs split into 5 modules + dispatch;
+main @ 899b240.
