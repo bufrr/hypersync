@@ -2553,7 +2553,25 @@ async fn run_gateway(node_peer_file: String, push: bool, cache_coldstart: bool, 
                                         blob.len() / 1_000_000
                                     );
                                     node.last_cache_replay_secs.store(now, Ordering::Release);
-                                    if down.write_all(&blob).await.is_err() {
+                                    // Chunked on purpose: one write_all over the whole >4GB blob
+                                    // wedges permanently at ~2^31 bytes when the reader drains
+                                    // faster than the send-buffer copy loop (a single send()
+                                    // syscall then never returns to userspace before its byte
+                                    // count overflows). Bounding each write keeps every syscall
+                                    // small; a real node reads too slowly to trigger it, a
+                                    // cache-draining fakenode reliably does.
+                                    let mut replay_err = false;
+                                    for chunk in blob.chunks(8 * 1024 * 1024) {
+                                        if down.write_all(chunk).await.is_err() {
+                                            replay_err = true;
+                                            break;
+                                        }
+                                    }
+                                    if replay_err {
+                                        eprintln!(
+                                            "[gw] [{}] cache replay write failed; node will re-bootstrap",
+                                            node.ip
+                                        );
                                         // reset the cooldown only if our own stamp is still
                                         // current — never clobber a concurrent newer replay's
                                         let _ = node.last_cache_replay_secs.compare_exchange(
