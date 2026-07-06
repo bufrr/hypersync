@@ -26,7 +26,7 @@ Hyperliquid non-validator nodes sync by dialing peers and streaming consensus / 
 - `fakenode <gw-ip[:base-port]> [--live-secs N] [--rpc] [--label NAME]` — testing-only synthetic downstream node: receives a full bootstrap (counting bytes/frames, never buffering), reads the live stream (parsing block rounds), and optionally sends a real 4002 client-block range query (a leaked "Peer-only request" rejection counts as FAIL — it means the gateway mis-routed the RPC). Prints one machine-checkable `FAKENODE ...` summary line; exit code is a bitmask (0 pass, +1 boot, +2 live, +4 rpc, 64 usage/dial). Run each fakenode as its own container so the gateway sees distinct source IPs.
 - `bench <dir> <iters>` — benchmarks the hot path (lz4 decode + round dedup).
 
-**Deployment note:** the gateway/proxy/relay listeners bind `0.0.0.0:4000-4010` with no peer allowlist — anyone who can reach those ports can trigger a ~4.5 GB bootstrap relay or a cache replay (bandwidth amplification). `--cache` keeps roughly one bootstrap in memory (~4.5 GB) and may briefly hold another during the 10-minute refresh cycle; budget RAM and upstream bandwidth accordingly. Run listeners on an internal/container network only; never publish the gateway's ports to the internet (the node's public 4001/4002 belong to the node itself, not the gateway).
+**Deployment note:** the gateway/proxy/relay listeners bind `0.0.0.0:4000-4010` inside their own network namespace with no peer allowlist — anyone who can reach those ports can trigger a ~4.5 GB bootstrap relay or a cache replay (bandwidth amplification). `--cache` keeps roughly one bootstrap in memory (~4.5 GB) and may briefly hold another during the 10-minute refresh cycle; budget RAM and upstream bandwidth accordingly. Run gateway listeners on an internal/container/private network only; never publish them to the internet. The public 4001/4002 should belong to a real HL node on the same public egress path, not to the gateway.
 
 ## Build & run
 
@@ -43,10 +43,10 @@ Point each node's `override_gossip_config.json` at hypersync and restart it so t
 
 ## Deploy with docker compose
 
-gw + peerd run as their own compose project (`docker-compose.yml` in this repo); they read no node files, so they can live on a machine of their own. Set `HL_SELF_IP` in `.env` to a comma-separated list of all your nodes' public IPs.
+gw + peerd run as their own compose project (`docker-compose.yml` in this repo). The gateway reads no node files; peerd can optionally read mounted/copied `tcp_lz4_stats` to improve discovery. Set `HL_SELF_IP` in `.env` to a comma-separated list of all your nodes' public IPs.
 
-- **Co-located nodes** (same machine): node compose projects join the attachable `hypersync_gwnet` network (`external: true`) and dial the gateway's static IP `172.28.0.10`. Optionally add stats harvesting from the local node: `docker compose -f docker-compose.yml -f docker-compose.colocated.yml up -d`.
-- **Remote nodes** (gw on its own machine): uncomment the gw `ports:` block, set `GW_BIND_IP` to a **private** interface IP, and firewall 4000-4010 to the node machines. Never bind a public interface — the gateway has no allowlist.
+- **Co-located nodes** (same machine): node compose projects join the attachable `hypersync_gwnet` network (`external: true`) and dial the gateway's static IP `172.28.0.10`. Gateway `ports:` stay disabled, so the host's public 4001/4002 remain owned by the real HL node. Optionally add stats harvesting from the local node: `docker compose -f docker-compose.yml -f docker-compose.colocated.yml up -d`.
+- **Remote nodes** (nodes on other machines): expose gateway only on a private/VPN interface and firewall 4000-4010 to the node machines. If this is the same host that also publishes a real HL node, do not let both containers bind the same host `0.0.0.0:4000-4010`; bind the real node to the public IP and gateway to the private/VPN IP. A gateway-only public IP without real HL node 4001/4002 behavior may be deprioritized by upstream peers.
 
 Smoke-test a running gateway with a synthetic node:
 

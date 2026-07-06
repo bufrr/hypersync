@@ -1,27 +1,62 @@
 # hypersync 部署到已有 HL node 服务器
 
-本文档用于把 `hypersync` 部署到一台已经在运行 Hyperliquid HL node 的服务器上。
+本文档用于把 `hypersync` 部署到一台已经在运行 Hyperliquid HL node 的服务器上。生产默认按这个方式部署：
+`gw/peerd` 和至少一个真实 HL node 在同一台 host 或同一个公网出口 IP 后面，让公网 peers 看到的
+`4001/4002` 始终是真实 HL node。
 
-目标拓扑：
+目标拓扑分成两层，下面用 Mermaid/MMD 表达：
 
-```text
-HL node container  ->  hypersync-gw:4000-4010  ->  public HL peers
-                         ^
-                         |
-                    hypersync-peerd
+```mermaid
+flowchart LR
+  subgraph P["Public HL P2P network"]
+    PEERS["Public HL peers"]
+  end
+
+  subgraph H["Existing HL node host / same public egress IP"]
+    PUB["Host public 4001/4002<br/>owned by the real HL node"]
+    HL["Real HL node container"]
+    DATA[("HL node data volume<br/>tcp_lz4_stats")]
+
+    subgraph GNET["Docker network: hypersync_gwnet"]
+      GW["hypersync-gw<br/>172.28.0.10:4000-4010<br/>not published to public internet"]
+      PEERD["hypersync-peerd"]
+      PD[("/pd<br/>peers.json + bootstrap.cache")]
+    end
+  end
+
+  subgraph R["Optional remote downstream nodes"]
+    RHL["HL node on another host"]
+  end
+
+  PEERS <-- "public gossip 4001/4002" --> PUB
+  PUB --- HL
+  HL -- "root_node_ips = 172.28.0.10<br/>container/private traffic 4000-4010" --> GW
+  GW -- "outbound upstream dials<br/>4001 / 4002" --> PEERS
+  PEERD -- "read-only harvest" --> DATA
+  PEERD -- "write live peer pool" --> PD
+  GW -- "read peer pool + cache" --> PD
+  RHL -. "optional private/VPN access only<br/>firewall allowlist 4000-4010" .-> GW
 ```
 
 `hypersync-gw` 和 `hypersync-peerd` 独立作为一个 Docker Compose 项目运行。已有 HL node 不需要放进
 hypersync 的 compose 里，但需要加入 `hypersync_gwnet` 网络，并把
 `override_gossip_config.json` 指向 gateway。
 
+注意这里的 `4001/4002` 有两套不同含义：
+
+- 真实 HL node 的公网 `4001/4002`：给公网 HL peers 访问，用来证明这个公网 IP 有正常 HL node peer 行为。
+- gateway 的 `4001/4002`：给你自己的 HL node 从 Docker 内网或私网访问，只做透明转发/缓存/追块代理。
+
+两者可以在同一台机器同时存在，因为容器内部端口互相隔离；只有把两个容器都 publish 到同一个宿主机
+`0.0.0.0:4001/4002` 时才会冲突。
+
 ## 1. 关键结论
 
 - 先保持已有 HL node 正常运行，不要一开始就停掉或切到 gateway-only。
 - 先启动 `peerd + gw`，让 peerd 读取已有 HL node 的 `tcp_lz4_stats`，建立 live peer pool。
 - 等 `data/peers.json` 有稳定 `live_servers`，并且 `gw` 生成 `data/bootstrap.cache` 后，再切换 HL node。
-- 推荐把 gw/peerd 部署在至少一个真实 HL node 所在机器，或者至少保证 gw 出公网的源 IP 和一个健康 HL node 的公网 peer 行为一致。公网 HL peers 可能根据源 IP 是否有正常 `4001/4002` 行为来降级连接；如果 gw 放在一台没有 HL node 公网端口行为的空机器上，peerd/gw 可能拿不到稳定 live peer。
-- gateway 默认只在 Docker 内网 `hypersync_gwnet` 暴露。同机部署时不要把 gateway 的 `4000-4010` 直接暴露到公网；异机 node 访问 gw 时，也只应发布到私网/VPN IP 并用防火墙只允许 HL node 来源 IP。
+- 生产推荐把 gw/peerd 部署在至少一个真实 HL node 所在机器。备选方案也必须保证 gw 出公网的源 IP 和一个健康 HL node 的公网 peer 行为一致。公网 HL peers 可能根据源 IP 是否有正常 `4001/4002` 行为来降级连接；如果 gw 放在一台没有 HL node 公网端口行为的空机器上，peerd/gw 可能拿不到稳定 live peer。
+- gateway 默认只在 Docker 内网 `hypersync_gwnet` 暴露。同机部署时不要把 gateway 的 `4000-4010` publish 到宿主机；真实 HL node 继续占用宿主机公网 `4001/4002`。异机 node 访问 gw 时，也只应把 gateway 发布到私网/VPN IP，并用防火墙只允许 HL node 来源 IP。
 - HL node 自己的公网 `4001/4002` 可以保持原状；这些端口属于 HL node，不是 gateway。
 - 多个 HL node 可以共用一个 gateway，但 gateway 按 node 的来源 IP 区分 session。共用 gateway 的多个 node 必须在 gateway 看来拥有不同来源 IP，例如不同 Docker container IP。
 - 多 node 同机测试时，内存压力主要来自 HL node 自身，不是 gateway。gateway 常驻通常接近一个 bootstrap cache 的大小，cache refresh 时会短暂升高；每个 HL node 可能到 20GB+，两节点机器要预留足够 RAM/swap。
@@ -32,14 +67,14 @@ hypersync 的 compose 里，但需要加入 `hypersync_gwnet` 网络，并把
 
 - Docker / Docker Compose 可用。
 - HL node 已经运行并且能正常同步。
-- 如果 gw/peerd 和 HL node 在同一台 Docker host，HL node 的数据 volume 可被 hypersync 只读挂载，用于读取：
+- 推荐部署形态是 gw/peerd 和 HL node 在同一台 Docker host。此时 HL node 的数据 volume 可被 hypersync 只读挂载，用于读取：
 
 ```text
 tcp_lz4_stats/
 ```
 
-- 如果 gw/peerd 在另一台机器，不能直接挂载 HL node volume；需要把 `tcp_lz4_stats/` 目录复制或定时同步到 gw/peerd 机器上的某个路径，再把这个路径只读挂载给 peerd。
-- 异机 gw 还有一个额外前提：gw 机器的公网出口 IP 最好本身也有真实 HL node 的 `4001/4002` 行为，或通过网络/NAT 让公网 peers 看到的是已有 HL node 的同一个健康出口 IP。只复制 `tcp_lz4_stats` 能改善候选发现，但不能解决公网 peer 对 gw 源 IP 的互惠/降级判断。
+- 不推荐把 gw/peerd 放在没有真实 HL node 的空机器上。如果必须异机部署，gw 机器的公网出口 IP 仍然必须有真实 HL node 的 `4001/4002` 行为，或通过网络/NAT 让公网 peers 看到的是已有 HL node 的同一个健康出口 IP。只复制 `tcp_lz4_stats` 能改善候选发现，但不能解决公网 peer 对 gw 源 IP 的互惠/降级判断。
+- 如果只是让其它机器上的 HL node 连接这台 gw，这不等于“异机 gw”：gw 仍然部署在已有 HL node 机器上，远端 HL node 通过私网/VPN 访问 gw。
 - `tcp_lz4_stats` 是一个目录，里面通常是一组按日期命名的文件，例如 `20260706`；不要只复制单个文件，至少要复制整个目录。它只给 `peerd` 用，`gw` 不读 HL node 文件。
 
 默认示例假设 HL node volume 名称是：
@@ -171,9 +206,12 @@ services:
 docker exec hypersync-peerd sh -lc 'echo HL_STATS_DIR=$HL_STATS_DIR; ls -lah /hl/node1/tcp_lz4_stats | tail'
 ```
 
-### 异机部署：复制或同步 tcp_lz4_stats
+### 非推荐异机 gw：复制或同步 tcp_lz4_stats
 
-如果 gw/peerd 不在 HL node 所在机器，不能直接挂载 Docker volume。推荐在 gw/peerd 机器上准备一个本地目录：
+生产默认不走这一节。只有在 gw/peerd 不在任何 HL node 所在机器、但已经通过网络/NAT 保证 gw 出公网源 IP
+具备真实 HL node 公网 `4001/4002` 行为时，才考虑复制 `tcp_lz4_stats`。
+
+这种情况下不能直接挂载 Docker volume，需要在 gw/peerd 机器上准备一个本地目录：
 
 ```sh
 cd /opt/hypersync
@@ -193,7 +231,7 @@ docker cp <HL_NODE_CONTAINER>:/home/hluser/hl/data/tcp_lz4_stats ./tcp_lz4_stats
 rsync -az ./tcp_lz4_stats/ <GW_HOST>:/opt/hypersync/hl-stats/node1/tcp_lz4_stats/
 ```
 
-生产上建议用 cron 或 systemd timer 每几分钟同步一次。一次性复制也能帮助首次启动，但后续候选不会继续从 node 新日志更新。
+如果确实采用这种非推荐形态，建议用 cron 或 systemd timer 每几分钟同步一次。一次性复制也能帮助首次启动，但后续候选不会继续从 node 新日志更新。
 
 在 gw/peerd 机器上新增一个本地 overlay，例如 `docker-compose.stats.yml`：
 
@@ -260,6 +298,24 @@ docker logs -f hypersync-peerd
 - 生产切换前建议 `live >= 4`；低于 4 时 gateway 会先暂缓 cache refresh，接近过期时仍会用可用 peer 强制尝试刷新，避免主动等到 cache 过期。
 - `round_tip` 应该是 `Some(...)`。
 - `data/peers.json` 里应该有 `live_servers`。
+
+确认 gateway 没有占用宿主机公网端口：
+
+```sh
+docker inspect hypersync-gw --format '{{json .NetworkSettings.Ports}}'
+docker compose ps
+```
+
+基础同机部署下，`hypersync-gw` 的 `Ports` 应该是 `{}`，`docker compose ps` 里 gateway 的 `PORTS`
+列为空。宿主机上的公网 `4001/4002` 应该来自真实 HL node，而不是 gateway：
+
+```sh
+docker ps --format 'table {{.Names}}\t{{.Ports}}'
+ss -ltnp 'sport = :4001 or sport = :4002'
+```
+
+如果看到 `hypersync-gw` publish 了 `0.0.0.0:4001->4001` 或 `0.0.0.0:4002->4002`，说明部署方式不对：
+gateway 被暴露成公网入口了。
 
 查看 peers 文件：
 
@@ -573,6 +629,25 @@ gateway 没有公网 allowlist，任何人访问都可能触发大流量 bootstr
 这和公网 HL peers 看到的 `4001/4002` 是两件事。gateway 对下游 node 开放的端口不能替代真实 HL node
 的公网 peer 行为；如果 gw 机器本身没有健康 HL node 的公网 `4001/4002` 行为，上游 peers 可能把这个源 IP
 降级，表现为 peerd `header_eof`、`peer_full` 增多或 live pool 不稳定。因此生产上优先同机/同公网出口部署。
+
+### 同机跑 HL node 和 gateway，4001/4002 会冲突吗？
+
+正常不会。冲突只发生在宿主机 publish 层，不发生在容器内部监听层：
+
+```text
+宿主机公网 4001/4002             -> real HL node container
+Docker 内网 172.28.0.10:4001/4002 -> hypersync-gw container
+```
+
+`hypersync-gw` 容器内部监听 `4000-4010`，但基础 compose 没有 `ports:`，所以不会占宿主机端口。
+真实 HL node 可以继续把公网 `4001/4002` 暴露给 HL peers。
+
+会冲突的错误配置是：真实 HL node 已经 publish 了 `0.0.0.0:4001-4010`，同时又把 gateway 也 publish 到
+同一组宿主机端口。这样 Docker 会端口冲突，即使不冲突也会把 gateway 暴露成公网入口。
+
+如果确实有异机 HL node 需要访问同一台机器上的 gateway，优先使用 VPN/overlay 网络让远端 node 加入私网。
+如果必须用宿主机端口发布 gateway，必须绑定到私网/VPN IP，并确保真实 HL node 没有用 `0.0.0.0`
+占住同一组端口；真实 HL node 绑定公网 IP，gateway 绑定私网 IP，两者才可能在同一宿主机端口号上共存。
 
 ### 是否需要先停 HL node？
 

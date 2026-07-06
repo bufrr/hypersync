@@ -8,12 +8,15 @@
 # Deployment modes:
 #   co-located (nodes on this machine):  node compose projects join the attachable gwnet below
 #     as an external network (name: hypersync_gwnet) and dial the gw's static IP 172.28.0.10.
+#     Leave gw `ports:` disabled; the host's public 4001/4002 should stay owned by the real
+#     HL node, not the gateway. Container-internal 4001/4002 do not conflict with the node.
 #     Optionally add stats harvesting: docker compose -f docker-compose.yml \
 #       -f docker-compose.colocated.yml up -d
-#   remote (nodes on other machines):    uncomment the gw `ports:` block and set GW_BIND_IP in
-#     .env to a PRIVATE interface IP of this machine; nodes dial that IP. NEVER bind a public
-#     interface: the gateway has no allowlist, and anyone reaching 4000-4010 can trigger a
-#     ~4.5 GB bootstrap replay. Firewall the ports to the node machines' IPs.
+#   remote (nodes on other machines):    expose gw only on a PRIVATE/VPN interface and firewall
+#     to node IPs. If a real HL node also runs on this host, it cannot already bind
+#     0.0.0.0:4000-4010; bind the node to the public IP and gw to the private/VPN IP. A
+#     gateway-only public IP without real HL node 4001/4002 behavior may be deprioritized by
+#     upstream peers.
 #
 # Env (.env): HL_SELF_IP = comma-separated public IPs of ALL your nodes (keeps your own nodes out
 # of the upstream pool — otherwise the gateway can end up relaying your nodes to each other).
@@ -47,7 +50,8 @@ services:
     volumes:
       - ./data:/pd
     # command defaults to the image CMD: gateway /pd/peers.json --push --cache --live 5
-    # remote mode ONLY — bind to a private interface and firewall to node IPs:
+    # remote mode ONLY — bind to a private/VPN interface and firewall to node IPs.
+    # Never publish gw on the same public 4001/4002 that belongs to the real HL node:
     # ports:
     #   - "${GW_BIND_IP:?set GW_BIND_IP to a private interface IP}:4000-4010:4000-4010"
 
