@@ -31,11 +31,14 @@ hypersync 的 compose 里，但需要加入 `hypersync_gwnet` 网络，并把
 
 - Docker / Docker Compose 可用。
 - HL node 已经运行并且能正常同步。
-- HL node 的数据 volume 可被 hypersync 只读挂载，用于读取：
+- 如果 gw/peerd 和 HL node 在同一台 Docker host，HL node 的数据 volume 可被 hypersync 只读挂载，用于读取：
 
 ```text
 tcp_lz4_stats/
 ```
+
+- 如果 gw/peerd 在另一台机器，不能直接挂载 HL node volume；需要把 `tcp_lz4_stats/` 目录复制或定时同步到 gw/peerd 机器上的某个路径，再把这个路径只读挂载给 peerd。
+- `tcp_lz4_stats` 是一个目录，里面通常是一组按日期命名的文件，例如 `20260706`；不要只复制单个文件，至少要复制整个目录。它只给 `peerd` 用，`gw` 不读 HL node 文件。
 
 默认示例假设 HL node volume 名称是：
 
@@ -101,6 +104,30 @@ HL_SELF_IP=1.1.1.1,2.2.2.2
 
 ## 5. 确认 HL node 数据 volume
 
+先在 HL node 容器里找到 `tcp_lz4_stats` 的实际位置：
+
+```sh
+docker exec <HL_NODE_CONTAINER> sh -lc 'find /home/hluser/hl -maxdepth 5 -type d -name tcp_lz4_stats -print'
+docker exec <HL_NODE_CONTAINER> sh -lc 'ls -lah /home/hluser/hl/data/tcp_lz4_stats | tail'
+```
+
+如果实际路径不是 `/home/hluser/hl/data/tcp_lz4_stats`，后续命令里的路径按实际输出替换。
+
+再确认这个目录来自哪个 Docker volume 或 host bind mount：
+
+```sh
+docker inspect <HL_NODE_CONTAINER> --format '{{json .Mounts}}'
+```
+
+常见情况是容器内 `/home/hluser/hl/data` 对应一个 Docker volume，例如 `hyperliquid_hl-data`。
+那么 `tcp_lz4_stats` 在 volume 根目录下，对 peerd 挂载后会表现为：
+
+```text
+/hl/node1/tcp_lz4_stats
+```
+
+### 同机部署：直接挂载 HL node volume
+
 默认的 `docker-compose.colocated.yml` 内容假设：
 
 ```yaml
@@ -127,12 +154,84 @@ volumes:
 
 peerd 会从这里读取 HL node 实际交换过数据的 peer，作为候选来源。这对首次部署很重要。
 
+此时 `HL_STATS_DIR` 由 `docker-compose.colocated.yml` 设置：
+
+```yaml
+services:
+  peerd:
+    environment:
+      HL_STATS_DIR: /hl/node1/tcp_lz4_stats
+```
+
+确认 peerd 真正看到了这个目录：
+
+```sh
+docker exec hypersync-peerd sh -lc 'echo HL_STATS_DIR=$HL_STATS_DIR; ls -lah /hl/node1/tcp_lz4_stats | tail'
+```
+
+### 异机部署：复制或同步 tcp_lz4_stats
+
+如果 gw/peerd 不在 HL node 所在机器，不能直接挂载 Docker volume。推荐在 gw/peerd 机器上准备一个本地目录：
+
+```sh
+cd /opt/hypersync
+mkdir -p hl-stats/node1/tcp_lz4_stats
+```
+
+从 HL node 机器同步整个目录到 gw/peerd 机器。示例：
+
+```sh
+rsync -az <HL_NODE_HOST>:/path/to/tcp_lz4_stats/ /opt/hypersync/hl-stats/node1/tcp_lz4_stats/
+```
+
+如果只能通过容器取文件，可以先在 HL node 机器上导出：
+
+```sh
+docker cp <HL_NODE_CONTAINER>:/home/hluser/hl/data/tcp_lz4_stats ./tcp_lz4_stats
+rsync -az ./tcp_lz4_stats/ <GW_HOST>:/opt/hypersync/hl-stats/node1/tcp_lz4_stats/
+```
+
+生产上建议用 cron 或 systemd timer 每几分钟同步一次。一次性复制也能帮助首次启动，但后续候选不会继续从 node 新日志更新。
+
+在 gw/peerd 机器上新增一个本地 overlay，例如 `docker-compose.stats.yml`：
+
+```yaml
+services:
+  peerd:
+    environment:
+      HL_STATS_DIR: /hl/node1/tcp_lz4_stats
+    volumes:
+      - ./hl-stats/node1/tcp_lz4_stats:/hl/node1/tcp_lz4_stats:ro
+```
+
+启动时带上这个 overlay：
+
+```sh
+docker compose -f docker-compose.yml -f docker-compose.stats.yml up -d --build
+```
+
+如果暂时没有 `tcp_lz4_stats`，也可以不设置 `HL_STATS_DIR`，peerd 会依赖 `gossipRootIps` API、
+已有 `data/peer_candidates.txt` / `data/peers.json` 和主动 probe。缺点是首次冷启动的 peer 发现会弱一些，
+更容易出现 live pool 建立慢或 `live=0`。
+
 ## 6. 启动 peerd + gateway
 
 已有 HL node 还保持原配置继续运行，先启动 hypersync：
 
 ```sh
 docker compose -f docker-compose.yml -f docker-compose.colocated.yml up -d --build
+```
+
+如果使用上一节的异机复制目录 overlay，则改为：
+
+```sh
+docker compose -f docker-compose.yml -f docker-compose.stats.yml up -d --build
+```
+
+如果完全不提供 `tcp_lz4_stats`，只启动基础 compose：
+
+```sh
+docker compose -f docker-compose.yml up -d --build
 ```
 
 确认容器运行：
@@ -377,7 +476,7 @@ stat -c '%y %s' data/bootstrap.cache
 如果 peerd 长时间 `live=0`：
 
 1. 确认原 HL node 仍在 direct/public 模式运行，并且公网 `4001` 可达。
-2. 确认 `docker-compose.colocated.yml` 挂载的是正确的 HL node 数据 volume。
+2. 同机部署时，确认 `docker-compose.colocated.yml` 挂载的是正确的 HL node 数据 volume；异机部署时，确认 `docker-compose.stats.yml` 挂载的是已经复制/同步过来的 `tcp_lz4_stats` 目录。
 3. 确认 `HL_STATS_DIR` 指向真实存在的 `tcp_lz4_stats`：
 
 ```sh
