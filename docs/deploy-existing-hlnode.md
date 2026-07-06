@@ -20,7 +20,8 @@ hypersync 的 compose 里，但需要加入 `hypersync_gwnet` 网络，并把
 - 先保持已有 HL node 正常运行，不要一开始就停掉或切到 gateway-only。
 - 先启动 `peerd + gw`，让 peerd 读取已有 HL node 的 `tcp_lz4_stats`，建立 live peer pool。
 - 等 `data/peers.json` 有稳定 `live_servers`，并且 `gw` 生成 `data/bootstrap.cache` 后，再切换 HL node。
-- gateway 默认只在 Docker 内网 `hypersync_gwnet` 暴露，不要把 gateway 的 `4000-4010` 直接暴露到公网。
+- 推荐把 gw/peerd 部署在至少一个真实 HL node 所在机器，或者至少保证 gw 出公网的源 IP 和一个健康 HL node 的公网 peer 行为一致。公网 HL peers 可能根据源 IP 是否有正常 `4001/4002` 行为来降级连接；如果 gw 放在一台没有 HL node 公网端口行为的空机器上，peerd/gw 可能拿不到稳定 live peer。
+- gateway 默认只在 Docker 内网 `hypersync_gwnet` 暴露。同机部署时不要把 gateway 的 `4000-4010` 直接暴露到公网；异机 node 访问 gw 时，也只应发布到私网/VPN IP 并用防火墙只允许 HL node 来源 IP。
 - HL node 自己的公网 `4001/4002` 可以保持原状；这些端口属于 HL node，不是 gateway。
 - 多个 HL node 可以共用一个 gateway，但 gateway 按 node 的来源 IP 区分 session。共用 gateway 的多个 node 必须在 gateway 看来拥有不同来源 IP，例如不同 Docker container IP。
 - 多 node 同机测试时，内存压力主要来自 HL node 自身，不是 gateway。gateway 常驻通常接近一个 bootstrap cache 的大小，cache refresh 时会短暂升高；每个 HL node 可能到 20GB+，两节点机器要预留足够 RAM/swap。
@@ -38,6 +39,7 @@ tcp_lz4_stats/
 ```
 
 - 如果 gw/peerd 在另一台机器，不能直接挂载 HL node volume；需要把 `tcp_lz4_stats/` 目录复制或定时同步到 gw/peerd 机器上的某个路径，再把这个路径只读挂载给 peerd。
+- 异机 gw 还有一个额外前提：gw 机器的公网出口 IP 最好本身也有真实 HL node 的 `4001/4002` 行为，或通过网络/NAT 让公网 peers 看到的是已有 HL node 的同一个健康出口 IP。只复制 `tcp_lz4_stats` 能改善候选发现，但不能解决公网 peer 对 gw 源 IP 的互惠/降级判断。
 - `tcp_lz4_stats` 是一个目录，里面通常是一组按日期命名的文件，例如 `20260706`；不要只复制单个文件，至少要复制整个目录。它只给 `peerd` 用，`gw` 不读 HL node 文件。
 
 默认示例假设 HL node volume 名称是：
@@ -564,8 +566,13 @@ docker compose -f docker-compose.yml -f docker-compose.colocated.yml down
 同机部署不需要。推荐使用 Docker bridge 网络 `hypersync_gwnet`，HL node 通过 `172.28.0.10`
 访问 gateway。
 
-只有当 gateway 和 node 不在同一台机器，才考虑发布 gateway 端口到私有网卡，并用防火墙限制来源。
-不要把 gateway 的 `4000-4010` 暴露到公网。
+如果 gateway 和 node 不在同一台机器，node 必须能通过私网/VPN 访问 gateway 的 `4000-4010`，
+可以把 gateway 端口绑定到私有网卡并用防火墙限制来源。不要把 gateway 的 `4000-4010` 裸露到公网：
+gateway 没有公网 allowlist，任何人访问都可能触发大流量 bootstrap replay。
+
+这和公网 HL peers 看到的 `4001/4002` 是两件事。gateway 对下游 node 开放的端口不能替代真实 HL node
+的公网 peer 行为；如果 gw 机器本身没有健康 HL node 的公网 `4001/4002` 行为，上游 peers 可能把这个源 IP
+降级，表现为 peerd `header_eof`、`peer_full` 增多或 live pool 不稳定。因此生产上优先同机/同公网出口部署。
 
 ### 是否需要先停 HL node？
 
