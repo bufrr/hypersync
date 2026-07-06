@@ -23,6 +23,7 @@ hypersync 的 compose 里，但需要加入 `hypersync_gwnet` 网络，并把
 - gateway 默认只在 Docker 内网 `hypersync_gwnet` 暴露，不要把 gateway 的 `4000-4010` 直接暴露到公网。
 - HL node 自己的公网 `4001/4002` 可以保持原状；这些端口属于 HL node，不是 gateway。
 - 多个 HL node 可以共用一个 gateway，但 gateway 按 node 的来源 IP 区分 session。共用 gateway 的多个 node 必须在 gateway 看来拥有不同来源 IP，例如不同 Docker container IP。
+- 多 node 同机测试时，内存压力主要来自 HL node 自身，不是 gateway。gateway 常驻通常接近一个 bootstrap cache 的大小，cache refresh 时会短暂升高；每个 HL node 可能到 20GB+，两节点机器要预留足够 RAM/swap。
 
 ## 2. 前置条件
 
@@ -186,6 +187,15 @@ docker logs -f hypersync-gw
 [gw] bootstrap cache persisted to /pd/bootstrap.cache
 ```
 
+如果日志中偶尔出现类似：
+
+```text
+[gw] bootstrap attempt via <peer> failed: state-server too slow ...
+```
+
+这通常只是 refresh race 淘汰慢 peer，不等同于 gateway 故障。只要后续能看到 cache persisted、
+`data/bootstrap.cache` 的 mtime 持续更新，并且 cache age 不超过 30 分钟，就可以继续观察。
+
 确认 cache 文件：
 
 ```sh
@@ -328,7 +338,7 @@ docker stats --no-stream hypersync-gw hypersync-peerd
 HL node：
 
 ```sh
-docker logs --since 5m <HL_NODE_CONTAINER> 2>&1 | grep -E 'applied block|got [0-9]+ client blocks|new app hashes|ERROR|panic|LimitExceeded|Peer-only'
+docker logs --since 5m <HL_NODE_CONTAINER> 2>&1 | grep -E 'applied block|got [0-9]+ client blocks|new app hashes|ERROR|panic|LimitExceeded|Peer-only|Querying jailed validators|forward_client_blocks'
 docker stats --no-stream <HL_NODE_CONTAINER>
 ```
 
@@ -352,6 +362,9 @@ docker inspect hypersync-gw hypersync-peerd <HL_NODE_CONTAINER> \
 - `hypersync-gw` 没有持续 `4002 client-block fetch failed`。
 - HL node 没有持续 `Peer-only request`、`LimitExceeded`、panic 或 OOM。
 - `data/bootstrap.cache` 持续刷新，mtime 不长期超过 30 分钟。
+- 冷启动 / catch-up 阶段可能短暂出现 `Querying jailed validators for high round` 或
+  `forward_client_blocks no more blocks from reader, reconnecting to a new peer`。如果随后
+  `applied block` 继续增长、gateway 重新选择 live peer、双 node 高度差重新收敛，可以视为可恢复事件；如果持续出现或高度停滞，应按故障处理。
 
 查看 cache 更新时间：
 
@@ -396,7 +409,8 @@ HL node 维持这个公网行为，peerd 可能出现 `header_eof` 或 `live=0`�
 
 - 每个 node 都要加入 `hypersync_gwnet`。
 - 每个 node 的 `override_gossip_config.json` 都指向 `172.28.0.10`。
-- 多个 node 在 gateway 看来必须有不同来源 IP。
+- 多个 node 在 gateway 看来必须有不同来源 IP。gateway 使用 TCP source IP 作为 node session key；
+  如果两个远端 node 经过同一个 NAT / SNAT 到 gateway，gateway 会把它们当成同一个 node，不能这样部署。
 - `HL_SELF_IP` 要包含所有本机/本组 HL node 的公网 IP。
 - 如果多个 node 有多个 hl-data volume，可以扩展 `docker-compose.colocated.yml`：
 
@@ -467,7 +481,9 @@ gateway 会定期刷新 bootstrap cache。当前 fresh cache 窗口是 30 分钟
 ### node 内存高是不是 gateway 导致？
 
 不是。HL node 和 gateway 是独立容器、独立进程。gateway 主要内存来自 bootstrap cache 和刷新过程。
-node 自身同步、catch-up、状态加载也会占用大量内存，需要分别看 `docker stats`。
+node 自身同步、catch-up、状态加载也会占用大量内存，需要分别看 `docker stats`。实测双 node
+同机运行时，gateway 约 4.5GB 常驻、refresh 短时更高，而单个 HL node 可到 20GB+；如果主机开始大量
+使用 swap，node 可能短暂执行落后并触发 `Querying jailed validators`，这不一定是 gateway 断流。
 
 ### peerd live=0 能不能继续切？
 
