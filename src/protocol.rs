@@ -8,9 +8,19 @@ use crate::gateway::{MIN_COMPLETE_BOOTSTRAP_BYTES, MIN_COMPLETE_BOOTSTRAP_FRAMES
 pub(crate) const GREET_FALSE: [u8; 8] = [0, 0, 0, 3, 0, 0, 0, 0]; // send_abci:false (live blocks; no rate-limited state)
 pub(crate) const GREET_TRUE: [u8; 8] = [0, 0, 0, 3, 0, 1, 0, 0]; // send_abci:true (full bootstrap stream)
 pub(crate) const MIN_PLAUSIBLE_MAINNET_ROUND: u32 = 1_000_000_000;
+// Ceiling slack above the observed network round tip (~4h of rounds at ~14.5/s). The ceiling is
+// tip-relative rather than a constant so it keeps rejecting high decode artifacts (e.g. the
+// observed 2_818_597_137 misparse) without ever turning into a wall-clock time bomb as the real
+// round counter grows past any fixed value.
+pub(crate) const NET_TIP_SLACK_ROUNDS: u32 = 200_000;
 
-pub(crate) fn is_plausible_mainnet_round(round: u32) -> bool {
+// `net_tip` is the best-known network round tip (peerd's clustered probe tip via peers.json,
+// raised by bootstrap-cache scans); 0 = unknown, which disables the ceiling and falls back to the
+// floor-only check (clustering downstream still rejects isolated artifacts). A too-high tip only
+// widens the ceiling — it can never block legitimate rounds.
+pub(crate) fn is_plausible_mainnet_round(round: u32, net_tip: u32) -> bool {
     round >= MIN_PLAUSIBLE_MAINNET_ROUND
+        && (net_tip == 0 || round <= net_tip.saturating_add(NET_TIP_SLACK_ROUNDS))
 }
 
 // Reference / correctness oracle + fallback: full lz4 decompress, read round @0x5e.
@@ -264,7 +274,11 @@ pub(crate) fn max_block_round_in_frames(blob: &[u8]) -> Option<u32> {
         let payload = &blob[off..off + len];
         if typ == 1 && len <= MAX_LIVE_BLOCK_FRAME {
             if let Some(round) = block_round(payload) {
-                rounds.push(round);
+                // floor-only prefilter (no tip available here); the cluster scan below rejects
+                // isolated high artifacts
+                if is_plausible_mainnet_round(round, 0) {
+                    rounds.push(round);
+                }
             }
         }
         off += len;
@@ -393,12 +407,12 @@ mod tests {
     fn max_block_round_scans_only_small_complete_block_frames() {
         let mut blob = Vec::new();
         blob.extend_from_slice(&make_frame(0, b"control"));
-        blob.extend_from_slice(&make_frame(1, &make_block(10)));
-        blob.extend_from_slice(&make_frame(1, &make_block(11)));
+        blob.extend_from_slice(&make_frame(1, &make_block(1_055_000_010)));
+        blob.extend_from_slice(&make_frame(1, &make_block(1_055_000_011)));
         blob.extend_from_slice(&make_frame(1, &vec![0u8; 2_000_001]));
-        blob.extend_from_slice(&make_frame(1, &make_block(12)));
-        blob.extend_from_slice(&make_frame(1, &make_block(13)));
-        assert_eq!(max_block_round_in_frames(&blob), Some(13));
+        blob.extend_from_slice(&make_frame(1, &make_block(1_055_000_012)));
+        blob.extend_from_slice(&make_frame(1, &make_block(1_055_000_013)));
+        assert_eq!(max_block_round_in_frames(&blob), Some(1_055_000_013));
 
         let truncated = vec![0, 0, 0, 10, 1, 1, 2];
         assert_eq!(max_block_round_in_frames(&truncated), None);
@@ -408,10 +422,38 @@ mod tests {
         assert_eq!(max_block_round_in_frames(&isolated_false_positive), None);
 
         let mut outlier = Vec::new();
-        for round in [20, 21, 22, 23, 2_818_597_137] {
+        for round in [
+            1_055_000_020,
+            1_055_000_021,
+            1_055_000_022,
+            1_055_000_023,
+            2_818_597_137,
+        ] {
             outlier.extend_from_slice(&make_frame(1, &make_block(round)));
         }
-        assert_eq!(max_block_round_in_frames(&outlier), Some(23));
+        assert_eq!(max_block_round_in_frames(&outlier), Some(1_055_000_023));
+    }
+
+    #[test]
+    fn plausible_mainnet_round_rejects_low_and_high_decode_artifacts() {
+        let tip = 1_356_000_000;
+        // floor applies regardless of tip knowledge
+        assert!(!is_plausible_mainnet_round(
+            MIN_PLAUSIBLE_MAINNET_ROUND - 1,
+            tip
+        ));
+        assert!(!is_plausible_mainnet_round(770_000_000, 0));
+        assert!(is_plausible_mainnet_round(MIN_PLAUSIBLE_MAINNET_ROUND, tip));
+        // ceiling is tip-relative: tip + slack passes, beyond it fails
+        assert!(is_plausible_mainnet_round(tip + NET_TIP_SLACK_ROUNDS, tip));
+        assert!(!is_plausible_mainnet_round(
+            tip + NET_TIP_SLACK_ROUNDS + 1,
+            tip
+        ));
+        assert!(!is_plausible_mainnet_round(2_818_597_137, tip));
+        // unknown tip disables the ceiling (never blocks legitimate growth), keeps the floor
+        assert!(is_plausible_mainnet_round(2_818_597_137, 0));
+        assert!(is_plausible_mainnet_round(u32::MAX, 0));
     }
 
     #[test]

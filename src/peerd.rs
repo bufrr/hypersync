@@ -240,7 +240,8 @@ async fn probe_live(ip: &str) -> LiveProbe {
         }
         if hdr[4] == 1 && len > 1 {
             if let Some(round) = block_round(&payload) {
-                if is_plausible_mainnet_round(round) {
+                // floor-only during a probe; the per-cycle clustered tip filters high artifacts
+                if is_plausible_mainnet_round(round, 0) {
                     blocks += 1;
                     max_round = Some(max_round.map_or(round, |prev: u32| prev.max(round)));
                     status = ProbeStatus::Live;
@@ -251,6 +252,9 @@ async fn probe_live(ip: &str) -> LiveProbe {
                 status = ProbeStatus::UnparseableBlock;
             }
         }
+    }
+    if blocks >= MIN_LIVE_BLOCKS {
+        status = ProbeStatus::Live;
     }
     LiveProbe {
         blocks,
@@ -297,6 +301,18 @@ fn previous_peer_pool_is_trusted(contents: &str) -> bool {
     !contents.contains("\"candidate_fallback\":true") && !extract_ipv4(contents).is_empty()
 }
 
+// Parse the "round_tip" field back out of peers.json (hand-rolled to match the hand-rolled
+// writer). The gateway uses it as its network-tip reference for round plausibility.
+pub(crate) fn extract_round_tip(contents: &str) -> Option<u32> {
+    let key = "\"round_tip\":";
+    let at = contents.find(key)? + key.len();
+    let digits: String = contents[at..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse().ok()
+}
+
 fn clustered_probe_tip(probes: &[(String, LiveProbe)]) -> Option<u32> {
     let mut rounds: Vec<u32> = probes
         .iter()
@@ -308,6 +324,28 @@ fn clustered_probe_tip(probes: &[(String, LiveProbe)]) -> Option<u32> {
     max_clustered_round(&mut rounds, 2, MAX_LIVE_ROUND_LAG)
 }
 
+fn split_live_by_tip(
+    probed_live: Vec<(String, LiveProbe)>,
+    round_tip: Option<u32>,
+) -> (Vec<(String, LiveProbe)>, Vec<String>) {
+    let Some(tip) = round_tip else {
+        return (probed_live, Vec::new());
+    };
+    let mut live = Vec::new();
+    let mut lagged = Vec::new();
+    for (ip, probe) in probed_live {
+        if probe.max_round.is_some_and(|round| {
+            round.saturating_add(MAX_LIVE_ROUND_LAG) >= tip
+                && round <= tip.saturating_add(MAX_LIVE_ROUND_LAG)
+        }) {
+            live.push((ip, probe));
+        } else {
+            lagged.push(ip);
+        }
+    }
+    (live, lagged)
+}
+
 fn env_usize(name: &str, default: usize, min: usize, max: usize) -> usize {
     std::env::var(name)
         .ok()
@@ -317,11 +355,12 @@ fn env_usize(name: &str, default: usize, min: usize, max: usize) -> usize {
 }
 
 fn env_u64(name: &str, default: u64, min: u64, max: u64) -> u64 {
+    let max = max.max(min);
     std::env::var(name)
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .map(|v| v.clamp(min, max))
-        .unwrap_or(default)
+        .unwrap_or_else(|| default.clamp(min, max))
 }
 
 fn empty_pool_sleep_secs(interval: u64, empty_live_streak: u32, max_backoff: u64) -> u64 {
@@ -440,7 +479,9 @@ pub(crate) async fn run_peerd(interval: u64) {
             if let Ok((ip, probe)) = r {
                 *reason_counts.entry(probe.status.as_str()).or_insert(0) += 1;
                 if probe.blocks >= MIN_LIVE_BLOCKS
-                    && probe.max_round.is_some_and(is_plausible_mainnet_round)
+                    && probe
+                        .max_round
+                        .is_some_and(|round| is_plausible_mainnet_round(round, 0))
                 {
                     probed_live.push((ip, probe));
                 } else {
@@ -452,19 +493,8 @@ pub(crate) async fn run_peerd(interval: u64) {
             }
         }
         let round_tip = clustered_probe_tip(&probed_live);
-        let mut live = Vec::new();
-        if let Some(tip) = round_tip {
-            for (ip, probe) in probed_live {
-                if probe
-                    .max_round
-                    .is_some_and(|round| round.saturating_add(MAX_LIVE_ROUND_LAG) >= tip)
-                {
-                    live.push((ip, probe));
-                } else {
-                    failed.push(ip);
-                }
-            }
-        }
+        let (mut live, lagged) = split_live_by_tip(probed_live, round_tip);
+        failed.extend(lagged);
         for ip in &live {
             fail_counts.remove(&ip.0);
         }
@@ -660,6 +690,12 @@ mod tests {
     }
 
     #[test]
+    fn peerd_env_u64_handles_min_above_max() {
+        std::env::remove_var("PEERD_TEST_BACKOFF");
+        assert_eq!(env_u64("PEERD_TEST_BACKOFF", 1800, 9000, 7200), 9000);
+    }
+
+    #[test]
     fn peerd_clusters_probe_tip_to_ignore_single_outlier() {
         let probes = vec![
             (
@@ -698,6 +734,69 @@ mod tests {
             },
         )];
         assert_eq!(clustered_probe_tip(&one), Some(1_355_730_000));
+    }
+
+    #[test]
+    fn peerd_keeps_probed_live_when_tip_cannot_cluster() {
+        let probes = vec![
+            (
+                "1.1.1.1".to_string(),
+                LiveProbe {
+                    blocks: 2,
+                    max_round: Some(1_355_730_000),
+                    ..LiveProbe::default()
+                },
+            ),
+            (
+                "2.2.2.2".to_string(),
+                LiveProbe {
+                    blocks: 2,
+                    max_round: Some(1_355_900_000),
+                    ..LiveProbe::default()
+                },
+            ),
+        ];
+        let tip = clustered_probe_tip(&probes);
+        assert_eq!(tip, None);
+
+        let (live, failed) = split_live_by_tip(probes, tip);
+        assert_eq!(live.len(), 2);
+        assert!(failed.is_empty());
+    }
+
+    #[test]
+    fn peerd_tip_filter_rejects_high_misparse_peers() {
+        let mk = |round: u32| LiveProbe {
+            blocks: 2,
+            max_round: Some(round),
+            ..LiveProbe::default()
+        };
+        let probes = vec![
+            ("1.1.1.1".to_string(), mk(1_355_900_000)),
+            ("2.2.2.2".to_string(), mk(1_355_900_100)),
+            // a high decode artifact must not survive the tip filter (it would rank first)
+            ("3.3.3.3".to_string(), mk(2_818_597_137)),
+        ];
+        let tip = clustered_probe_tip(&probes);
+        assert_eq!(tip, Some(1_355_900_100));
+        let (live, failed) = split_live_by_tip(probes, tip);
+        assert_eq!(live.len(), 2);
+        assert_eq!(failed, vec!["3.3.3.3".to_string()]);
+    }
+
+    #[test]
+    fn peerd_extracts_round_tip_from_pool_json() {
+        assert_eq!(
+            extract_round_tip(
+                "{\"live_servers\":[\"1.1.1.1\"],\"n_candidates\":9,\"round_tip\":1355962971,\"candidate_fallback\":false}"
+            ),
+            Some(1_355_962_971)
+        );
+        assert_eq!(
+            extract_round_tip("{\"live_servers\":[],\"n_candidates\":9,\"round_tip\":null,\"candidate_fallback\":false}"),
+            None
+        );
+        assert_eq!(extract_round_tip("{\"live_servers\":[]}"), None);
     }
 
     #[test]

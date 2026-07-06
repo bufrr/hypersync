@@ -293,6 +293,8 @@ pub(crate) async fn run_proxy(upstreams: Vec<String>, push: bool) {
                                     prefetched_frames: Vec::new(),
                                     initial_last_forwarded: 0,
                                     live_floor: Arc::new(AtomicU32::new(0)),
+                                    // proxy mode has no peerd tip: floor-only plausibility
+                                    net_round_tip: Arc::new(AtomicU32::new(0)),
                                 },
                             )
                             .await;
@@ -354,6 +356,9 @@ pub(crate) struct PushConfig {
     pub(crate) prefetched_frames: Vec<Vec<u8>>,
     pub(crate) initial_last_forwarded: u32,
     pub(crate) live_floor: Arc<AtomicU32>,
+    // best-known network round tip (0 = unknown); makes the round-plausibility ceiling
+    // tip-relative instead of a fixed constant
+    pub(crate) net_round_tip: Arc<AtomicU32>,
 }
 
 pub(crate) async fn serve_push(node: TcpStream, active_conn: TcpStream, cfg: PushConfig) {
@@ -401,9 +406,16 @@ pub(crate) async fn serve_push(node: TcpStream, active_conn: TcpStream, cfg: Pus
         })
     };
     for frame in cfg.prefetched_frames {
-        if process_live_frame(frame, &tx, &forward_gate, &cfg.live_floor, true)
-            .await
-            .is_err()
+        if process_live_frame(
+            frame,
+            &tx,
+            &forward_gate,
+            &cfg.live_floor,
+            &cfg.net_round_tip,
+            true,
+        )
+        .await
+        .is_err()
         {
             return;
         }
@@ -416,8 +428,9 @@ pub(crate) async fn serve_push(node: TcpStream, active_conn: TcpStream, cfg: Pus
         let tx = tx.clone();
         let forward_gate = forward_gate.clone();
         let live_floor = cfg.live_floor.clone();
+        let net_round_tip = cfg.net_round_tip.clone();
         tokio::spawn(async move {
-            let _ = pump_merge(act_r, tx, forward_gate, live_floor, true).await;
+            let _ = pump_merge(act_r, tx, forward_gate, live_floor, net_round_tip, true).await;
         })
     };
     // every other peer -> node: live blocks only, deduped. Keep this off until shadow blocks are
@@ -432,6 +445,7 @@ pub(crate) async fn serve_push(node: TcpStream, active_conn: TcpStream, cfg: Pus
             let tx = tx.clone();
             let forward_gate = forward_gate.clone();
             let live_floor = cfg.live_floor.clone();
+            let net_round_tip = cfg.net_round_tip.clone();
             shadows.push(tokio::spawn(async move {
                 // Reconnect with backoff: public peers drop their streams, and a shadow source that
                 // exited permanently would silently degrade the merge from n_live sources to fewer.
@@ -448,6 +462,7 @@ pub(crate) async fn serve_push(node: TcpStream, active_conn: TcpStream, cfg: Pus
                                 tx.clone(),
                                 forward_gate.clone(),
                                 live_floor.clone(),
+                                net_round_tip.clone(),
                                 false,
                             )
                             .await;
@@ -490,6 +505,7 @@ async fn pump_merge(
     tx: mpsc::Sender<Vec<u8>>,
     forward_gate: Arc<tokio::sync::Mutex<RoundForwardGate>>,
     live_floor: Arc<AtomicU32>,
+    net_round_tip: Arc<AtomicU32>,
     forward_nonblock: bool,
 ) -> std::io::Result<()> {
     // Live blocks arrive continuously (~4-15/s on mainnet), so >30s of silence means a stalled
@@ -535,7 +551,7 @@ async fn pump_merge(
         };
         if typ == 1 {
             if let Some(rnd) = block_round(&payload) {
-                if !is_plausible_mainnet_round(rnd) {
+                if !is_plausible_mainnet_round(rnd, net_round_tip.load(Ordering::Acquire)) {
                     if forward_nonblock {
                         return Err(std::io::Error::other(format!(
                             "implausible active block round {rnd}"
@@ -580,6 +596,7 @@ async fn process_live_frame(
     tx: &mpsc::Sender<Vec<u8>>,
     forward_gate: &Arc<tokio::sync::Mutex<RoundForwardGate>>,
     live_floor: &Arc<AtomicU32>,
+    net_round_tip: &Arc<AtomicU32>,
     forward_nonblock: bool,
 ) -> std::io::Result<()> {
     if frame.len() < 5 {
@@ -593,7 +610,7 @@ async fn process_live_frame(
     let payload = &frame[5..];
     if typ == 1 {
         if let Some(rnd) = block_round(payload) {
-            if !is_plausible_mainnet_round(rnd) {
+            if !is_plausible_mainnet_round(rnd, net_round_tip.load(Ordering::Acquire)) {
                 if forward_nonblock {
                     return Err(std::io::Error::other(format!(
                         "implausible active block round {rnd}"
