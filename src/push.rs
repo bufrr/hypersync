@@ -6,7 +6,9 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
-use crate::protocol::{block_round, RoundDedup, RoundForwardGate, GREET_FALSE};
+use crate::protocol::{
+    block_round, is_plausible_mainnet_round, RoundDedup, RoundForwardGate, GREET_FALSE,
+};
 
 pub(crate) async fn serve(mut down: TcpStream, upstreams: Vec<String>) -> std::io::Result<()> {
     down.set_nodelay(true).ok();
@@ -288,6 +290,7 @@ pub(crate) async fn run_proxy(upstreams: Vec<String>, push: bool) {
                                     active_idx: idx,
                                     port: p,
                                     prefetched_greeting: None,
+                                    prefetched_frames: Vec::new(),
                                     initial_last_forwarded: 0,
                                     live_floor: Arc::new(AtomicU32::new(0)),
                                 },
@@ -348,6 +351,7 @@ pub(crate) struct PushConfig {
     pub(crate) active_idx: usize,
     pub(crate) port: u16,
     pub(crate) prefetched_greeting: Option<Vec<u8>>,
+    pub(crate) prefetched_frames: Vec<Vec<u8>>,
     pub(crate) initial_last_forwarded: u32,
     pub(crate) live_floor: Arc<AtomicU32>,
 }
@@ -396,6 +400,14 @@ pub(crate) async fn serve_push(node: TcpStream, active_conn: TcpStream, cfg: Pus
             let _ = tokio::io::copy(&mut node_r, &mut act_w).await;
         })
     };
+    for frame in cfg.prefetched_frames {
+        if process_live_frame(frame, &tx, &forward_gate, &cfg.live_floor, true)
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
     // active peer -> node: the transparent backbone (forwards non-block frames + blocks). When this
     // task ends the active peer's stream broke, so we tear the whole session down and let the node
     // reconnect — the gateway then pins a FRESH active (round-robin). This is the proxy-style failover;
@@ -523,6 +535,14 @@ async fn pump_merge(
         };
         if typ == 1 {
             if let Some(rnd) = block_round(&payload) {
+                if !is_plausible_mainnet_round(rnd) {
+                    if forward_nonblock {
+                        return Err(std::io::Error::other(format!(
+                            "implausible active block round {rnd}"
+                        )));
+                    }
+                    continue;
+                }
                 if rnd <= live_floor.load(Ordering::Acquire) {
                     continue;
                 }
@@ -536,6 +556,14 @@ async fn pump_merge(
                 }
                 continue;
             }
+            if forward_nonblock {
+                let mut frame = hdr.to_vec();
+                frame.extend_from_slice(&payload);
+                if tx.send(frame).await.is_err() {
+                    return Ok(());
+                }
+            }
+            continue;
         }
         if forward_nonblock {
             let mut frame = hdr.to_vec();
@@ -545,6 +573,50 @@ async fn pump_merge(
             }
         }
     }
+}
+
+async fn process_live_frame(
+    frame: Vec<u8>,
+    tx: &mpsc::Sender<Vec<u8>>,
+    forward_gate: &Arc<tokio::sync::Mutex<RoundForwardGate>>,
+    live_floor: &Arc<AtomicU32>,
+    forward_nonblock: bool,
+) -> std::io::Result<()> {
+    if frame.len() < 5 {
+        return Err(std::io::Error::other("short prefetched frame"));
+    }
+    let len = u32::from_be_bytes([frame[0], frame[1], frame[2], frame[3]]) as usize;
+    let typ = frame[4];
+    if len != frame.len().saturating_sub(5) {
+        return Err(std::io::Error::other("mis-sized prefetched frame"));
+    }
+    let payload = &frame[5..];
+    if typ == 1 {
+        if let Some(rnd) = block_round(payload) {
+            if !is_plausible_mainnet_round(rnd) {
+                if forward_nonblock {
+                    return Err(std::io::Error::other(format!(
+                        "implausible active block round {rnd}"
+                    )));
+                }
+                return Ok(());
+            }
+            if rnd <= live_floor.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            let mut gate = forward_gate.lock().await;
+            if !gate.should_forward(rnd, forward_nonblock) {
+                return Ok(());
+            }
+        } else if !forward_nonblock {
+            return Ok(());
+        }
+    } else if !forward_nonblock {
+        return Ok(());
+    }
+    tx.send(frame)
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "node writer closed"))
 }
 
 // Transparent relay: local node <-> single upstream peer. Forwards the node's greeting

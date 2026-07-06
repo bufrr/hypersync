@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -6,7 +6,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 
-use crate::protocol::GREET_FALSE;
+use crate::protocol::{block_round, is_plausible_mainnet_round, max_clustered_round, GREET_FALSE};
 
 fn is_ipv4(s: &str) -> bool {
     let mut parts = 0;
@@ -102,12 +102,63 @@ pub(crate) fn peer_candidates_path(node_peer_file: &str) -> PathBuf {
         .join("peer_candidates.txt")
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ProbeStatus {
+    #[default]
+    NoLiveFrame,
+    Live,
+    ConnectTimeout,
+    ConnectError,
+    GreetWriteError,
+    HeaderTimeout,
+    HeaderEof,
+    HeaderError,
+    PayloadTimeout,
+    PayloadEof,
+    PayloadError,
+    OversizedFrame,
+    PeerFull,
+    StatusFrame,
+    LowRound,
+    UnparseableBlock,
+}
+
+impl ProbeStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            ProbeStatus::NoLiveFrame => "no_live_frame",
+            ProbeStatus::Live => "live",
+            ProbeStatus::ConnectTimeout => "connect_timeout",
+            ProbeStatus::ConnectError => "connect_error",
+            ProbeStatus::GreetWriteError => "greet_write_error",
+            ProbeStatus::HeaderTimeout => "header_timeout",
+            ProbeStatus::HeaderEof => "header_eof",
+            ProbeStatus::HeaderError => "header_error",
+            ProbeStatus::PayloadTimeout => "payload_timeout",
+            ProbeStatus::PayloadEof => "payload_eof",
+            ProbeStatus::PayloadError => "payload_error",
+            ProbeStatus::OversizedFrame => "oversized_frame",
+            ProbeStatus::PeerFull => "peer_full",
+            ProbeStatus::StatusFrame => "status_frame",
+            ProbeStatus::LowRound => "low_round",
+            ProbeStatus::UnparseableBlock => "unparseable_block",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct LiveProbe {
+    blocks: usize,
+    max_round: Option<u32>,
+    status: ProbeStatus,
+}
+
 // Probe one candidate for LIVE-block serving (send_abci:false — cheap, NOT rate-limited, unlike
-// abci_state). Bounded to ~4s wall-clock total; counts type=1 frames with payload len>1 (excludes
-// the tiny 1-byte status/rejection frames). A peer-controlled frame length is capped before
-// allocating the payload buffer (a live block is a few hundred KB at most).
-async fn probe_live(ip: &str) -> usize {
-    let deadline = Instant::now() + Duration::from_secs(4);
+// abci_state). Bounded to a short wall-clock total; counts parseable type=1 live rounds (excludes
+// tiny status/rejection frames). A peer-controlled frame length is capped before allocating the
+// payload buffer (a live block is a few hundred KB at most).
+async fn probe_live(ip: &str) -> LiveProbe {
+    let deadline = Instant::now() + Duration::from_secs(6);
     let mut s = match timeout(
         Duration::from_secs(4),
         TcpStream::connect(format!("{ip}:4001")),
@@ -115,38 +166,97 @@ async fn probe_live(ip: &str) -> usize {
     .await
     {
         Ok(Ok(s)) => s,
-        _ => return 0,
+        Ok(Err(_)) => {
+            return LiveProbe {
+                status: ProbeStatus::ConnectError,
+                ..LiveProbe::default()
+            };
+        }
+        Err(_) => {
+            return LiveProbe {
+                status: ProbeStatus::ConnectTimeout,
+                ..LiveProbe::default()
+            };
+        }
     };
     if s.write_all(&GREET_FALSE).await.is_err() {
-        return 0;
+        return LiveProbe {
+            status: ProbeStatus::GreetWriteError,
+            ..LiveProbe::default()
+        };
     }
     let mut blocks = 0usize;
+    let mut max_round = None;
+    let mut status = ProbeStatus::NoLiveFrame;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             break;
         }
         let mut hdr = [0u8; 5];
-        if !matches!(timeout(remaining, s.read_exact(&mut hdr)).await, Ok(Ok(_))) {
-            break;
-        }
+        match timeout(remaining, s.read_exact(&mut hdr)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                status = ProbeStatus::HeaderEof;
+                break;
+            }
+            Ok(Err(_)) => {
+                status = ProbeStatus::HeaderError;
+                break;
+            }
+            Err(_) => {
+                status = ProbeStatus::HeaderTimeout;
+                break;
+            }
+        };
         let len = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as usize;
         if len > 8_000_000 {
-            break; // sanity cap: a live-probe frame is never this large
+            status = ProbeStatus::OversizedFrame;
+            break;
         }
         let mut payload = vec![0u8; len];
         let remaining = deadline.saturating_duration_since(Instant::now());
-        if !matches!(
-            timeout(remaining, s.read_exact(&mut payload)).await,
-            Ok(Ok(_))
-        ) {
+        match timeout(remaining, s.read_exact(&mut payload)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                status = ProbeStatus::PayloadEof;
+                break;
+            }
+            Ok(Err(_)) => {
+                status = ProbeStatus::PayloadError;
+                break;
+            }
+            Err(_) => {
+                status = ProbeStatus::PayloadTimeout;
+                break;
+            }
+        };
+        if hdr[4] == 0 && len == 1 && payload.first() == Some(&4) {
+            status = ProbeStatus::PeerFull;
             break;
         }
+        if hdr[4] == 0 {
+            status = ProbeStatus::StatusFrame;
+        }
         if hdr[4] == 1 && len > 1 {
-            blocks += 1;
+            if let Some(round) = block_round(&payload) {
+                if is_plausible_mainnet_round(round) {
+                    blocks += 1;
+                    max_round = Some(max_round.map_or(round, |prev: u32| prev.max(round)));
+                    status = ProbeStatus::Live;
+                } else {
+                    status = ProbeStatus::LowRound;
+                }
+            } else {
+                status = ProbeStatus::UnparseableBlock;
+            }
         }
     }
-    blocks
+    LiveProbe {
+        blocks,
+        max_round,
+        status,
+    }
 }
 
 // Peer discovery + probing daemon (kept as its OWN process rather than a background task inside
@@ -168,21 +278,60 @@ async fn write_atomic(path: &str, contents: &str) {
 }
 
 const MIN_LIVE_SERVERS_TO_OVERWRITE: usize = 8;
+const MIN_LIVE_BLOCKS: usize = 2;
+const MAX_LIVE_ROUND_LAG: u32 = 50_000;
 
-fn should_keep_previous_peer_pool(current_live: usize, previous_live: usize) -> bool {
-    current_live > 0
-        && current_live < MIN_LIVE_SERVERS_TO_OVERWRITE
-        && previous_live >= MIN_LIVE_SERVERS_TO_OVERWRITE
-}
-
-fn should_write_candidate_fallback(
+fn should_keep_previous_peer_pool(
     current_live: usize,
     previous_live: usize,
-    candidates: usize,
+    previous_trusted: bool,
 ) -> bool {
-    current_live < MIN_LIVE_SERVERS_TO_OVERWRITE
-        && (previous_live < MIN_LIVE_SERVERS_TO_OVERWRITE || current_live == 0)
-        && candidates >= MIN_LIVE_SERVERS_TO_OVERWRITE
+    previous_trusted
+        && previous_live > 0
+        && (current_live == 0
+            || (current_live < MIN_LIVE_SERVERS_TO_OVERWRITE
+                && previous_live >= MIN_LIVE_SERVERS_TO_OVERWRITE))
+}
+
+fn previous_peer_pool_is_trusted(contents: &str) -> bool {
+    !contents.contains("\"candidate_fallback\":true") && !extract_ipv4(contents).is_empty()
+}
+
+fn clustered_probe_tip(probes: &[(String, LiveProbe)]) -> Option<u32> {
+    let mut rounds: Vec<u32> = probes
+        .iter()
+        .filter_map(|(_, probe)| probe.max_round)
+        .collect();
+    if rounds.len() == 1 {
+        return rounds.first().copied();
+    }
+    max_clustered_round(&mut rounds, 2, MAX_LIVE_ROUND_LAG)
+}
+
+fn env_usize(name: &str, default: usize, min: usize, max: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|v| v.clamp(min, max))
+        .unwrap_or(default)
+}
+
+fn env_u64(name: &str, default: u64, min: u64, max: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|v| v.clamp(min, max))
+        .unwrap_or(default)
+}
+
+fn empty_pool_sleep_secs(interval: u64, empty_live_streak: u32, max_backoff: u64) -> u64 {
+    if empty_live_streak == 0 {
+        return interval;
+    }
+    let multiplier = 1u64 << empty_live_streak.min(3);
+    interval
+        .saturating_mul(multiplier)
+        .clamp(interval, max_backoff.max(interval))
 }
 
 pub(crate) fn split_csv(v: &str) -> Vec<String> {
@@ -211,6 +360,8 @@ pub(crate) async fn run_peerd(interval: u64) {
     let cand_path = format!("{data_dir}/peer_candidates.txt");
     let out_path = format!("{data_dir}/peers.json");
     let log_path = format!("{data_dir}/peerd.log");
+    let probe_concurrency = env_usize("PEERD_PROBE_CONCURRENCY", 8, 1, 64);
+    let empty_backoff_max = env_u64("PEERD_EMPTY_BACKOFF_MAX_SECS", 1800, interval, 7200);
 
     let mut candidates: HashSet<String> = tokio::fs::read_to_string(&cand_path)
         .await
@@ -221,6 +372,7 @@ pub(crate) async fn run_peerd(interval: u64) {
     // simply re-added next cycle and gets a fresh count).
     const PRUNE_AFTER: u32 = 50;
     let mut fail_counts: HashMap<String, u32> = HashMap::new();
+    let mut empty_live_streak = 0u32;
 
     loop {
         // 1. discover: gossipRootIps API + the node's own tcp_lz4_stats files (peers the node has
@@ -266,25 +418,48 @@ pub(crate) async fn run_peerd(interval: u64) {
         )
         .await;
 
-        // 2. probe every known candidate concurrently for live-block serving (capped at 64 at a
-        // time so a poisoned harvest source can't turn one cycle into thousands of sockets)
+        // 2. probe every known candidate for live-block serving. Keep concurrency deliberately low:
+        // each candidate is cheap, but a collapsed pool should not keep punching all public peers
+        // from the same source IP in a tight burst.
         let cand_vec: Vec<String> = candidates.iter().cloned().collect();
-        let sem = Arc::new(tokio::sync::Semaphore::new(64));
-        let mut set: tokio::task::JoinSet<(String, usize)> = tokio::task::JoinSet::new();
+        let sem = Arc::new(tokio::sync::Semaphore::new(probe_concurrency));
+        let mut set: tokio::task::JoinSet<(String, LiveProbe)> = tokio::task::JoinSet::new();
         for ip in cand_vec.iter().cloned() {
             let sem = sem.clone();
             set.spawn(async move {
                 let _permit = sem.acquire().await;
-                let n = probe_live(&ip).await;
-                (ip, n)
+                let probe = probe_live(&ip).await;
+                (ip, probe)
             });
         }
-        let mut live: Vec<(String, usize)> = Vec::new();
+        let mut probed_live: Vec<(String, LiveProbe)> = Vec::new();
         let mut failed: Vec<String> = Vec::new();
+        let mut reason_counts: BTreeMap<&'static str, usize> = BTreeMap::new();
+        let mut failed_samples: Vec<String> = Vec::new();
         while let Some(r) = set.join_next().await {
-            if let Ok((ip, n)) = r {
-                if n >= 2 {
-                    live.push((ip, n));
+            if let Ok((ip, probe)) = r {
+                *reason_counts.entry(probe.status.as_str()).or_insert(0) += 1;
+                if probe.blocks >= MIN_LIVE_BLOCKS
+                    && probe.max_round.is_some_and(is_plausible_mainnet_round)
+                {
+                    probed_live.push((ip, probe));
+                } else {
+                    if failed_samples.len() < 8 {
+                        failed_samples.push(format!("{}:{}", ip, probe.status.as_str()));
+                    }
+                    failed.push(ip);
+                }
+            }
+        }
+        let round_tip = clustered_probe_tip(&probed_live);
+        let mut live = Vec::new();
+        if let Some(tip) = round_tip {
+            for (ip, probe) in probed_live {
+                if probe
+                    .max_round
+                    .is_some_and(|round| round.saturating_add(MAX_LIVE_ROUND_LAG) >= tip)
+                {
+                    live.push((ip, probe));
                 } else {
                     failed.push(ip);
                 }
@@ -303,34 +478,43 @@ pub(crate) async fn run_peerd(interval: u64) {
                 pruned += 1;
             }
         }
-        live.sort_by(|a, b| b.1.cmp(&a.1));
+        live.sort_by(|a, b| {
+            b.1.max_round
+                .cmp(&a.1.max_round)
+                .then_with(|| b.1.blocks.cmp(&a.1.blocks))
+        });
         let ranked: Vec<String> = live.into_iter().map(|(ip, _)| ip).collect();
 
-        let previous_live = tokio::fs::read_to_string(&out_path)
+        let previous_contents = tokio::fs::read_to_string(&out_path)
             .await
-            .map(|s| extract_ipv4(&s).len())
-            .unwrap_or(0);
-        let kept_previous = should_keep_previous_peer_pool(ranked.len(), previous_live);
-        let candidate_fallback =
-            should_write_candidate_fallback(ranked.len(), previous_live, cand_vec.len());
-        let output_pool = if candidate_fallback {
-            &cand_vec
-        } else {
-            &ranked
-        };
+            .unwrap_or_default();
+        let previous_live = extract_ipv4(&previous_contents).len();
+        let previous_trusted = previous_peer_pool_is_trusted(&previous_contents);
+        let kept_previous =
+            should_keep_previous_peer_pool(ranked.len(), previous_live, previous_trusted);
         // 3. write peers.json (hand-rolled: content is plain IPv4 strings, no escaping needed)
+        let round_tip_json = round_tip
+            .map(|round| round.to_string())
+            .unwrap_or_else(|| "null".to_string());
         let json = format!(
-            "{{\"live_servers\":[{}],\"n_candidates\":{}}}",
-            output_pool
+            "{{\"live_servers\":[{}],\"n_candidates\":{},\"round_tip\":{},\"candidate_fallback\":false}}",
+            ranked
                 .iter()
                 .map(|ip| format!("\"{ip}\""))
                 .collect::<Vec<_>>()
                 .join(","),
-            cand_vec.len()
+            cand_vec.len(),
+            round_tip_json
         );
         if !kept_previous {
             write_atomic(&out_path, &json).await;
         }
+        if ranked.is_empty() {
+            empty_live_streak = empty_live_streak.saturating_add(1);
+        } else {
+            empty_live_streak = 0;
+        }
+        let sleep_secs = empty_pool_sleep_secs(interval, empty_live_streak, empty_backoff_max);
 
         // UTC HH:MM:SS from the system clock (no `date` subprocess)
         let secs = std::time::SystemTime::now()
@@ -344,12 +528,18 @@ pub(crate) async fn run_peerd(interval: u64) {
             secs % 60
         );
         let line = format!(
-            "{now} candidates={} live={} pruned={} kept_previous={} candidate_fallback={} top={:?}\n",
+            "{now} candidates={} live={} round_tip={:?} pruned={} kept_previous={} probe_concurrency={} empty_streak={} sleep={}s reasons={:?} samples={:?} candidate_fallback={} top={:?}\n",
             cand_vec.len(),
             ranked.len(),
+            round_tip,
             pruned,
             kept_previous,
-            candidate_fallback,
+            probe_concurrency,
+            empty_live_streak,
+            sleep_secs,
+            reason_counts,
+            failed_samples,
+            false,
             ranked.iter().take(6).collect::<Vec<_>>()
         );
         eprint!("[peerd] {line}");
@@ -362,7 +552,7 @@ pub(crate) async fn run_peerd(interval: u64) {
             let _ = f.write_all(line.as_bytes()).await;
         }
 
-        tokio::time::sleep(Duration::from_secs(interval)).await;
+        tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
     }
 }
 
@@ -413,49 +603,101 @@ mod tests {
     fn peerd_keeps_previous_pool_on_probe_collapse() {
         assert!(should_keep_previous_peer_pool(
             MIN_LIVE_SERVERS_TO_OVERWRITE - 1,
-            MIN_LIVE_SERVERS_TO_OVERWRITE
+            MIN_LIVE_SERVERS_TO_OVERWRITE,
+            true
         ));
-        assert!(!should_keep_previous_peer_pool(
+        assert!(should_keep_previous_peer_pool(
             0,
-            MIN_LIVE_SERVERS_TO_OVERWRITE
+            MIN_LIVE_SERVERS_TO_OVERWRITE,
+            true
         ));
         assert!(!should_keep_previous_peer_pool(
             MIN_LIVE_SERVERS_TO_OVERWRITE,
-            MIN_LIVE_SERVERS_TO_OVERWRITE
+            MIN_LIVE_SERVERS_TO_OVERWRITE,
+            true
         ));
         assert!(!should_keep_previous_peer_pool(
             1,
-            MIN_LIVE_SERVERS_TO_OVERWRITE - 1
+            MIN_LIVE_SERVERS_TO_OVERWRITE - 1,
+            true
+        ));
+        assert!(should_keep_previous_peer_pool(
+            0,
+            MIN_LIVE_SERVERS_TO_OVERWRITE - 1,
+            true
+        ));
+        assert!(!should_keep_previous_peer_pool(
+            0,
+            MIN_LIVE_SERVERS_TO_OVERWRITE,
+            false
         ));
     }
 
     #[test]
-    fn peerd_uses_candidate_fallback_when_previous_pool_is_already_bad() {
-        assert!(should_write_candidate_fallback(
-            1,
-            1,
-            MIN_LIVE_SERVERS_TO_OVERWRITE
+    fn peerd_trusts_only_round_annotated_previous_pool() {
+        assert!(previous_peer_pool_is_trusted(
+            r#"{"live_servers":["1.1.1.1"],"round_tip":1355000000,"candidate_fallback":false}"#
         ));
-        assert!(!should_write_candidate_fallback(
-            MIN_LIVE_SERVERS_TO_OVERWRITE,
-            1,
-            MIN_LIVE_SERVERS_TO_OVERWRITE
+        assert!(previous_peer_pool_is_trusted(
+            r#"{"live_servers":["1.1.1.1"],"n_candidates":48}"#
         ));
-        assert!(!should_write_candidate_fallback(
-            1,
-            MIN_LIVE_SERVERS_TO_OVERWRITE,
-            MIN_LIVE_SERVERS_TO_OVERWRITE
+        assert!(!previous_peer_pool_is_trusted(
+            r#"{"live_servers":["1.1.1.1"],"round_tip":null,"candidate_fallback":true}"#
         ));
-        assert!(should_write_candidate_fallback(
-            0,
-            MIN_LIVE_SERVERS_TO_OVERWRITE,
-            MIN_LIVE_SERVERS_TO_OVERWRITE
+        assert!(!previous_peer_pool_is_trusted(
+            r#"{"live_servers":[],"round_tip":null,"candidate_fallback":false}"#
         ));
-        assert!(!should_write_candidate_fallback(
-            1,
-            1,
-            MIN_LIVE_SERVERS_TO_OVERWRITE - 1
-        ));
+    }
+
+    #[test]
+    fn peerd_empty_pool_sleep_backs_off_and_caps() {
+        assert_eq!(empty_pool_sleep_secs(300, 0, 1800), 300);
+        assert_eq!(empty_pool_sleep_secs(300, 1, 1800), 600);
+        assert_eq!(empty_pool_sleep_secs(300, 2, 1800), 1200);
+        assert_eq!(empty_pool_sleep_secs(300, 3, 1800), 1800);
+        assert_eq!(empty_pool_sleep_secs(300, 9, 1800), 1800);
+        assert_eq!(empty_pool_sleep_secs(300, 1, 100), 300);
+    }
+
+    #[test]
+    fn peerd_clusters_probe_tip_to_ignore_single_outlier() {
+        let probes = vec![
+            (
+                "1.1.1.1".to_string(),
+                LiveProbe {
+                    blocks: 2,
+                    max_round: Some(1_355_730_000),
+                    ..LiveProbe::default()
+                },
+            ),
+            (
+                "2.2.2.2".to_string(),
+                LiveProbe {
+                    blocks: 2,
+                    max_round: Some(1_355_731_000),
+                    ..LiveProbe::default()
+                },
+            ),
+            (
+                "3.3.3.3".to_string(),
+                LiveProbe {
+                    blocks: 2,
+                    max_round: Some(2_818_597_137),
+                    ..LiveProbe::default()
+                },
+            ),
+        ];
+        assert_eq!(clustered_probe_tip(&probes), Some(1_355_731_000));
+
+        let one = vec![(
+            "1.1.1.1".to_string(),
+            LiveProbe {
+                blocks: 2,
+                max_round: Some(1_355_730_000),
+                ..LiveProbe::default()
+            },
+        )];
+        assert_eq!(clustered_probe_tip(&one), Some(1_355_730_000));
     }
 
     #[test]

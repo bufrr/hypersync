@@ -12,9 +12,9 @@ use tokio::time::timeout;
 
 use crate::peerd::{peer_candidates_path, read_node_peers};
 use crate::protocol::{
-    complete_bootstrap_at_frame_boundary, complete_frame_count, finish_header_after_partial,
-    max_block_round_in_frames, read_header_or_timeout, unix_secs, HeaderRead, GREET_FALSE,
-    GREET_TRUE,
+    block_round, complete_bootstrap_at_frame_boundary, complete_frame_count,
+    finish_header_after_partial, is_plausible_mainnet_round, max_block_round_in_frames,
+    read_header_or_timeout, unix_secs, HeaderRead, GREET_FALSE, GREET_TRUE,
 };
 use crate::push::{serve_push, splice, PushConfig};
 
@@ -304,11 +304,19 @@ async fn read_live_greeting_with_timeout(
     s: &mut TcpStream,
     wait: Duration,
 ) -> std::io::Result<Vec<u8>> {
+    read_live_frame_with_timeout(s, wait, 1000).await
+}
+
+async fn read_live_frame_with_timeout(
+    s: &mut TcpStream,
+    wait: Duration,
+    max_len: usize,
+) -> std::io::Result<Vec<u8>> {
     let mut hdr = [0u8; 5];
     timeout(wait, s.read_exact(&mut hdr)).await??;
     let len = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as usize;
-    if len > 1000 {
-        return Err(std::io::Error::other("live greeting too large"));
+    if len > max_len {
+        return Err(std::io::Error::other("live frame too large"));
     }
     let mut payload = vec![0u8; len];
     timeout(wait, s.read_exact(&mut payload)).await??;
@@ -317,16 +325,106 @@ async fn read_live_greeting_with_timeout(
     Ok(frame)
 }
 
-async fn read_live_greeting(s: &mut TcpStream) -> std::io::Result<Vec<u8>> {
-    read_live_greeting_with_timeout(s, Duration::from_secs(20)).await
+struct LivePeerSession {
+    ip: String,
+    stream: TcpStream,
+    greeting: Vec<u8>,
+    prefetched_frames: Vec<Vec<u8>>,
+    first_round: u32,
 }
 
-async fn open_live_peer_session(ip: &str, wait: Duration) -> std::io::Result<TcpStream> {
-    let mut s = timeout(wait, TcpStream::connect(format!("{ip}:4001"))).await??;
-    s.set_nodelay(true).ok();
-    timeout(wait, s.write_all(&GREET_FALSE)).await??;
-    read_live_greeting_with_timeout(&mut s, wait).await?;
-    Ok(s)
+const LIVE_SELECT_WAIT: Duration = Duration::from_millis(3500);
+const LIVE_SELECT_MAX_PARALLEL: usize = 4;
+
+async fn open_live_peer_session_with_greet(
+    ip: String,
+    greet: [u8; 8],
+    wait: Duration,
+    min_round_exclusive: u32,
+) -> std::io::Result<LivePeerSession> {
+    let connect_ip = ip.clone();
+    let (stream, greeting, prefetched_frames, first_round) = timeout(wait, async move {
+        let mut s = TcpStream::connect(format!("{connect_ip}:4001")).await?;
+        s.set_nodelay(true).ok();
+        s.write_all(&greet).await?;
+        let greeting = read_live_greeting_with_timeout(&mut s, wait).await?;
+        if response_is_peer_full(&greeting) {
+            return Err(std::io::Error::other("peer full"));
+        }
+        let deadline = Instant::now() + wait;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(std::io::Error::other("no live block before deadline"));
+            }
+            let frame = read_live_frame_with_timeout(&mut s, remaining, 8_000_000).await?;
+            let round = if frame.len() >= 5 && frame[4] == 1 {
+                block_round(&frame[5..])
+            } else {
+                None
+            };
+            if let Some(round) = round {
+                if is_plausible_mainnet_round(round) && round > min_round_exclusive {
+                    return Ok::<_, std::io::Error>((s, greeting, vec![frame], round));
+                }
+            }
+        }
+    })
+    .await??;
+    Ok(LivePeerSession {
+        ip,
+        stream,
+        greeting,
+        prefetched_frames,
+        first_round,
+    })
+}
+
+async fn select_live_peer(
+    peers: &[String],
+    start: usize,
+    greet: [u8; 8],
+    min_round_exclusive: u32,
+) -> Option<LivePeerSession> {
+    if peers.is_empty() {
+        return None;
+    }
+    let batch_size = LIVE_SELECT_MAX_PARALLEL.min(peers.len());
+    let mut offset = 0usize;
+    while offset < peers.len() {
+        let mut set = tokio::task::JoinSet::new();
+        for k in 0..batch_size.min(peers.len() - offset) {
+            let ip = peers[(start + offset + k) % peers.len()].clone();
+            set.spawn(open_live_peer_session_with_greet(
+                ip,
+                greet,
+                LIVE_SELECT_WAIT,
+                min_round_exclusive,
+            ));
+        }
+        let mut best = None;
+        while let Some(joined) = set.join_next().await {
+            if let Ok(Ok(session)) = joined {
+                if best
+                    .as_ref()
+                    .is_none_or(|prev: &LivePeerSession| session.first_round > prev.first_round)
+                {
+                    best = Some(session);
+                }
+            }
+        }
+        if best.is_some() {
+            return best;
+        }
+        offset += batch_size;
+    }
+    None
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ActivePeer {
+    ip: String,
+    epoch: u64,
 }
 
 // Connect to the session's active peer (the one serving the node's bootstrap) on `port`, waiting
@@ -344,7 +442,7 @@ async fn dial_active(
     // brief wait in case a concurrent bootstrap is about to set the active peer
     let mut target = None;
     for _ in 0..15 {
-        if let Some(a) = node.active.lock().unwrap().clone() {
+        if let Some(a) = node.active_snapshot() {
             target = Some(a);
             break;
         }
@@ -357,19 +455,11 @@ async fn dial_active(
     let target = match target {
         Some(t) => t,
         None => {
-            let mut a = node.active.lock().unwrap();
-            match a.clone() {
-                Some(t) => t,
-                None => {
-                    let t = peers[rr.fetch_add(1, Ordering::Relaxed) % n].clone();
-                    *a = Some(t.clone());
-                    node.lazy_active.store(true, Ordering::Release);
-                    t
-                }
-            }
+            let t = peers[rr.fetch_add(1, Ordering::Relaxed) % n].clone();
+            node.pin_lazy_active(&t)
         }
     };
-    let up = format!("{}:{}", target, port);
+    let up = format!("{}:{}", target.ip, port);
     match timeout(Duration::from_secs(5), TcpStream::connect(&up)).await {
         Ok(Ok(c)) => {
             c.set_nodelay(true).ok();
@@ -382,17 +472,22 @@ async fn dial_active(
     }
 }
 
-fn clear_active_if_current(active: &Mutex<Option<String>>, ip: &str) {
-    let mut guard = active.lock().unwrap();
-    if guard.as_deref() == Some(ip) {
-        *guard = None;
-    }
-}
-
 pub(crate) fn response_is_peer_only(payload: &[u8]) -> bool {
     payload
         .windows(b"Peer-only request".len())
         .any(|w| w == b"Peer-only request")
+}
+
+fn response_is_peer_full(payload: &[u8]) -> bool {
+    // On the live 4001 greeting path, upstream refusal is often encoded as a compact binary
+    // status frame. 0x03 is the normal accepted greeting before live block frames; 0x04 is the
+    // observed peer-full refusal and must not be forwarded as a usable live greeting.
+    if payload.len() == 6 && payload[..4] == [0, 0, 0, 1] && payload[4] == 0 {
+        return payload[5] == 4;
+    }
+    payload
+        .windows(b"Peer full".len())
+        .any(|w| w == b"Peer full")
 }
 
 fn response_has_no_client_blocks(payload: &[u8]) -> bool {
@@ -413,67 +508,27 @@ fn response_has_client_block_round_too_small(payload: &[u8]) -> bool {
         .any(|w| w == b"client block round too small")
 }
 
-async fn wait_active_peer(active: &Mutex<Option<String>>) -> Option<String> {
+async fn wait_active_peer(node: &NodeState) -> Option<ActivePeer> {
     for _ in 0..12 {
-        if let Some(ip) = active.lock().unwrap().clone() {
-            return Some(ip);
+        if let Some(peer) = node.active_snapshot() {
+            return Some(peer);
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
     None
 }
 
-fn client_block_peer_candidates(
-    current: Option<String>,
-    peers: &[String],
-    rr: &AtomicUsize,
-    limit: usize,
-) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut seen = HashSet::new();
-    if let Some(ip) = current {
-        if seen.insert(ip.clone()) {
-            out.push(ip);
-        }
-    }
-    if peers.is_empty() || out.len() >= limit {
-        return out;
-    }
-    let start = rr.fetch_add(limit.max(1), Ordering::Relaxed);
-    for k in 0..peers.len() {
-        if out.len() >= limit {
-            break;
-        }
-        let ip = peers[(start + k) % peers.len()].clone();
-        if seen.insert(ip.clone()) {
-            out.push(ip);
-        }
-    }
-    out
-}
-
 enum ClientBlockUpstreamResponse {
     Frames(Vec<u8>),
     PeerOnly,
-    TerminalError {
-        frame: Vec<u8>,
-        reason: &'static str,
-    },
+    TerminalError(Vec<u8>),
 }
 
 async fn fetch_client_blocks_from_peer(
     ip: String,
     req: Arc<Vec<u8>>,
-    prewarm_live: bool,
 ) -> (String, std::io::Result<ClientBlockUpstreamResponse>) {
     let result = async {
-        // A fallback candidate must first have a live 4001 peer relationship, otherwise many
-        // public peers reject the separate 4002 RPC as "Peer-only request".
-        let _live_guard = if prewarm_live {
-            Some(open_live_peer_session(&ip, Duration::from_secs(4)).await?)
-        } else {
-            None
-        };
         let mut upc = timeout(
             Duration::from_secs(4),
             TcpStream::connect(format!("{ip}:4002")),
@@ -498,16 +553,10 @@ async fn fetch_client_blocks_from_peer(
         let mut frame = rh.to_vec();
         frame.extend_from_slice(&rp);
         if response_has_no_client_blocks(&rp) {
-            return Ok(ClientBlockUpstreamResponse::TerminalError {
-                frame,
-                reason: "no client blocks",
-            });
+            return Ok(ClientBlockUpstreamResponse::TerminalError(frame));
         }
         if response_has_client_block_round_too_large(&rp) {
-            return Ok(ClientBlockUpstreamResponse::TerminalError {
-                frame,
-                reason: "client block round too large",
-            });
+            return Ok(ClientBlockUpstreamResponse::TerminalError(frame));
         }
         if response_has_client_block_round_too_small(&rp) {
             return Err(std::io::Error::other("client block round too small"));
@@ -518,17 +567,11 @@ async fn fetch_client_blocks_from_peer(
     (ip, result)
 }
 
-// Serve the node's client-block RPC (port 4002). Prefer the current 4001 active peer, but hedge
-// against a slow/stalled active by briefly opening live 4001 sessions to a few pool candidates and
-// racing their 4002 responses. The temporary live session is kept open until the 4002 response is
-// fully read, which satisfies peers that require a live peer relationship for client-block RPC.
-async fn serve_client_blocks(
-    down: TcpStream,
-    node: Arc<NodeState>,
-    peers: Vec<String>,
-    rr: Arc<AtomicUsize>,
-) {
-    let active = &node.active;
+// Serve the node's client-block RPC (port 4002). This must stay pinned to the current 4001 active
+// peer: mixing client-block responses from another peer into a bootstrap/live session can cross
+// hardfork or state-view boundaries and crash the node. If the active peer cannot answer, close this
+// request and let the node reconnect its 4001 session so the gateway can pin a fresh active.
+async fn serve_client_blocks(down: TcpStream, node: Arc<NodeState>) {
     let mut down = down;
     let mut hdr = [0u8; 5];
     if !matches!(
@@ -553,71 +596,55 @@ async fn serve_client_blocks(
 
     let req = Arc::new(req);
     let started = Instant::now();
-    let mut first_attempt = true;
-    let mut last_failures = Vec::new();
-    let mut last_terminal = None;
+    let mut last_failure = None;
     while started.elapsed() < Duration::from_secs(45) {
-        let current = if first_attempt {
-            first_attempt = false;
-            wait_active_peer(active).await
-        } else {
-            active.lock().unwrap().clone()
+        let Some(peer) = wait_active_peer(&node).await else {
+            last_failure = Some("no active peer".to_string());
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            continue;
         };
-        let candidates = client_block_peer_candidates(current.clone(), &peers, &rr, 8);
-        if candidates.is_empty() {
-            return;
-        }
-
-        let mut attempts = tokio::task::JoinSet::new();
-        for ip in candidates {
-            let prewarm_live = current.as_deref() != Some(ip.as_str());
-            attempts.spawn(fetch_client_blocks_from_peer(ip, req.clone(), prewarm_live));
-        }
-
-        let mut failures = Vec::new();
-        let mut terminal = None;
-        while let Some(joined) = attempts.join_next().await {
-            let Ok((ip, result)) = joined else {
-                continue;
-            };
-            match result {
-                Ok(ClientBlockUpstreamResponse::Frames(frame)) => {
-                    attempts.abort_all();
-                    let _ = down.write_all(&frame).await;
-                    return;
+        match fetch_client_blocks_from_peer(peer.ip.clone(), req.clone())
+            .await
+            .1
+        {
+            Ok(ClientBlockUpstreamResponse::Frames(frame)) => {
+                if !node.active_is_current(&peer) {
+                    last_failure = Some(format!("{}: stale active epoch {}", peer.ip, peer.epoch));
+                    continue;
                 }
-                Ok(ClientBlockUpstreamResponse::PeerOnly) => {
-                    if current.as_deref() == Some(ip.as_str()) {
-                        clear_active_if_current(active, &ip);
-                    }
-                    failures.push(format!("{ip}: peer-only"));
+                let _ = down.write_all(&frame).await;
+                return;
+            }
+            Ok(ClientBlockUpstreamResponse::PeerOnly) => {
+                node.clear_active_if_current(&peer);
+                last_failure = Some(format!("{}: peer-only", peer.ip));
+                break;
+            }
+            Ok(ClientBlockUpstreamResponse::TerminalError(frame)) => {
+                if !node.active_is_current(&peer) {
+                    last_failure = Some(format!("{}: stale active epoch {}", peer.ip, peer.epoch));
+                    continue;
                 }
-                Ok(ClientBlockUpstreamResponse::TerminalError { frame, reason }) => {
-                    if terminal.is_none() {
-                        terminal = Some(frame);
-                    }
-                    failures.push(format!("{ip}: {reason}"));
+                let _ = down.write_all(&frame).await;
+                return;
+            }
+            Err(e) => {
+                if !node.active_is_current(&peer) {
+                    last_failure = Some(format!(
+                        "{}: stale active epoch {} ({e})",
+                        peer.ip, peer.epoch
+                    ));
+                    continue;
                 }
-                Err(e) => {
-                    failures.push(format!("{ip}: {e}"));
-                }
+                last_failure = Some(format!("{}: {e}", peer.ip));
+                break;
             }
         }
-        if terminal.is_some() {
-            last_terminal = terminal;
-        }
-        last_failures = failures;
-        tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    if let Some(frame) = last_terminal {
-        let _ = down.write_all(&frame).await;
-        return;
-    }
-    if !last_failures.is_empty() {
+    if let Some(failure) = last_failure {
         eprintln!(
             "[gw] [{}] 4002 client-block fetch failed via {}",
-            node.ip,
-            last_failures.join("; ")
+            node.ip, failure
         );
     }
 }
@@ -648,6 +675,7 @@ const MAX_BOOTSTRAP_CACHE_AGE_SECS: u64 = 30 * 60;
 const CACHE_REFRESH_SECS: u64 = 10 * 60;
 const CACHE_REFRESH_RETRY_SECS: u64 = 2 * 60;
 const MIN_BOOTSTRAP_RATE_BYTES_PER_SEC: f64 = 5_000_000.0;
+const MIN_LIVE_PEERS_FOR_CACHE_REFRESH: usize = 4;
 
 fn cache_parent_writable(path: &Path) -> bool {
     let Some(parent) = path.parent() else {
@@ -1018,7 +1046,8 @@ struct NodeState {
     ip: IpAddr,
     // the upstream peer serving THIS node's bootstrap; all of this node's connections reuse it
     // so client-block RPC (4002) isn't rejected with "Peer-only request".
-    active: Mutex<Option<String>>,
+    active: Mutex<Option<ActivePeer>>,
+    next_active_epoch: AtomicU64,
     // Non-zero only after this gateway actually replayed boot_blob to THIS node. The short replay
     // cooldown only prevents duplicate replays from immediate reconnects while allowing normal
     // node restarts to use cache.
@@ -1042,6 +1071,7 @@ impl NodeState {
         Self {
             ip,
             active: Mutex::new(None),
+            next_active_epoch: AtomicU64::new(0),
             last_cache_replay_secs: AtomicU64::new(0),
             live_floor: Arc::new(AtomicU32::new(0)),
             last_seen_secs: AtomicU64::new(now),
@@ -1051,9 +1081,43 @@ impl NodeState {
     }
 
     // Pin this node's active peer from a real 4001 session (bootstrap or live/resume).
-    fn pin_active(&self, ip: &str) {
-        *self.active.lock().unwrap() = Some(ip.to_string());
+    fn pin_active(&self, ip: &str) -> ActivePeer {
+        let peer = ActivePeer {
+            ip: ip.to_string(),
+            epoch: self.next_active_epoch.fetch_add(1, Ordering::AcqRel) + 1,
+        };
+        *self.active.lock().unwrap() = Some(peer.clone());
         self.lazy_active.store(false, Ordering::Release);
+        peer
+    }
+
+    fn pin_lazy_active(&self, ip: &str) -> ActivePeer {
+        let mut active = self.active.lock().unwrap();
+        if let Some(peer) = active.clone() {
+            return peer;
+        }
+        let peer = ActivePeer {
+            ip: ip.to_string(),
+            epoch: self.next_active_epoch.fetch_add(1, Ordering::AcqRel) + 1,
+        };
+        *active = Some(peer.clone());
+        self.lazy_active.store(true, Ordering::Release);
+        peer
+    }
+
+    fn active_snapshot(&self) -> Option<ActivePeer> {
+        self.active.lock().unwrap().clone()
+    }
+
+    fn active_is_current(&self, peer: &ActivePeer) -> bool {
+        self.active.lock().unwrap().as_ref() == Some(peer)
+    }
+
+    fn clear_active_if_current(&self, peer: &ActivePeer) {
+        let mut active = self.active.lock().unwrap();
+        if active.as_ref() == Some(peer) {
+            *active = None;
+        }
     }
 
     // "This node has a live session" — a lazy misc-port pin doesn't count.
@@ -1259,6 +1323,14 @@ pub(crate) async fn run_gateway(
                                     .min(CACHE_REFRESH_RETRY_SECS),
                             ))
                             .await;
+                            continue;
+                        }
+                        let live_count = pool.lock().unwrap().len();
+                        if live_count < MIN_LIVE_PEERS_FOR_CACHE_REFRESH {
+                            eprintln!(
+                                "[gw] bootstrap cache refresh skipped: only {live_count} validated live peer(s)"
+                            );
+                            tokio::time::sleep(Duration::from_secs(CACHE_REFRESH_RETRY_SECS)).await;
                             continue;
                         }
                     }
@@ -1489,50 +1561,42 @@ pub(crate) async fn run_gateway(
                                         );
                                     }
                                     let start = rr.fetch_add(1, Ordering::Relaxed);
-                                    for k in 0..n {
-                                        let ip = peers[(start + k) % n].clone();
-                                        if let Ok(Ok(mut upc)) = timeout(
-                                            Duration::from_secs(5),
-                                            TcpStream::connect(&format!("{}:4001", ip)),
-                                        )
-                                        .await
-                                        {
-                                            upc.set_nodelay(true).ok();
-                                            if upc.write_all(&GREET_FALSE).await.is_ok() {
-                                                let peer_greeting =
-                                                    match read_live_greeting(&mut upc).await {
-                                                        Ok(g) => g,
-                                                        Err(_) => continue,
-                                                    };
-                                                node.pin_active(&ip);
-                                                let mut hosts = vec![ip.clone()];
-                                                if push {
-                                                    for p in peers.iter() {
-                                                        if hosts.len() >= n_live {
-                                                            break;
-                                                        }
-                                                        if *p != ip {
-                                                            hosts.push(p.clone());
-                                                        }
-                                                    }
+                                    if let Some(live) =
+                                        select_live_peer(&peers, start, GREET_FALSE, cache_floor)
+                                            .await
+                                    {
+                                        eprintln!(
+                                            "[gw] [{}] selected live peer {} first_round={}",
+                                            node.ip, live.ip, live.first_round
+                                        );
+                                        let active_peer = node.pin_active(&live.ip);
+                                        let mut hosts = vec![live.ip.clone()];
+                                        if push {
+                                            for p in peers.iter() {
+                                                if hosts.len() >= n_live {
+                                                    break;
                                                 }
-                                                serve_push(
-                                                    down,
-                                                    upc,
-                                                    PushConfig {
-                                                        hosts: Arc::new(hosts),
-                                                        active_idx: 0,
-                                                        port: 4001,
-                                                        prefetched_greeting: Some(peer_greeting),
-                                                        initial_last_forwarded: cache_floor,
-                                                        live_floor: node.live_floor.clone(),
-                                                    },
-                                                )
-                                                .await;
-                                                clear_active_if_current(&node.active, &ip);
-                                                return;
+                                                if *p != live.ip {
+                                                    hosts.push(p.clone());
+                                                }
                                             }
                                         }
+                                        serve_push(
+                                            down,
+                                            live.stream,
+                                            PushConfig {
+                                                hosts: Arc::new(hosts),
+                                                active_idx: 0,
+                                                port: 4001,
+                                                prefetched_greeting: Some(live.greeting),
+                                                prefetched_frames: live.prefetched_frames,
+                                                initial_last_forwarded: cache_floor,
+                                                live_floor: node.live_floor.clone(),
+                                            },
+                                        )
+                                        .await;
+                                        node.clear_active_if_current(&active_peer);
+                                        return;
                                     }
                                     return;
                                 }
@@ -1561,7 +1625,7 @@ pub(crate) async fn run_gateway(
                                 abci_len,
                                 payload_prefix.len() / 1_000_000
                             );
-                            node.pin_active(&ip);
+                            let active_peer = node.pin_active(&ip);
                             let tap_permit = if cache_coldstart {
                                 capture_tap.clone().try_acquire_owned().ok()
                             } else {
@@ -1596,12 +1660,48 @@ pub(crate) async fn run_gateway(
                                 }
                                 splice(down, upc).await;
                             }
-                            clear_active_if_current(&node.active, &ip);
+                            node.clear_active_if_current(&active_peer);
                         } else {
                             // live/resume channel: choose a reachable peer, make it THIS node's active
                             // session peer (so its client-block RPC on 4002 hits the same peer), forward
                             // the greeting, and relay. This is what (re)establishes `active`.
                             let start = rr.fetch_add(1, Ordering::Relaxed);
+                            if push {
+                                if let Some(live) = select_live_peer(&peers, start, greet, 0).await {
+                                    eprintln!(
+                                        "[gw] [{}] selected live peer {} first_round={}",
+                                        node.ip, live.ip, live.first_round
+                                    );
+                                    let active_peer = node.pin_active(&live.ip);
+                                    // active stays transparent and owns the peer relationship used by
+                                    // 4002. Shadow multi-source injection is disabled for correctness.
+                                    let mut hosts = vec![live.ip.clone()];
+                                    for p in peers.iter() {
+                                        if hosts.len() >= n_live {
+                                            break;
+                                        }
+                                        if *p != live.ip {
+                                            hosts.push(p.clone());
+                                        }
+                                    }
+                                    serve_push(
+                                        down,
+                                        live.stream,
+                                        PushConfig {
+                                            hosts: Arc::new(hosts),
+                                            active_idx: 0,
+                                            port: 4001,
+                                            prefetched_greeting: Some(live.greeting),
+                                            prefetched_frames: live.prefetched_frames,
+                                            initial_last_forwarded: 0,
+                                            live_floor: node.live_floor.clone(),
+                                        },
+                                    )
+                                    .await;
+                                    node.clear_active_if_current(&active_peer);
+                                }
+                                return;
+                            }
                             for k in 0..n {
                                 let ip = peers[(start + k) % n].clone();
                                 let up = format!("{}:4001", ip);
@@ -1618,42 +1718,9 @@ pub(crate) async fn run_gateway(
                                 if upc.write_all(&greet).await.is_err() {
                                     continue;
                                 }
-                                if push {
-                                    let peer_greeting = match read_live_greeting(&mut upc).await {
-                                        Ok(g) => g,
-                                        Err(_) => continue,
-                                    };
-                                    node.pin_active(&ip);
-                                    // active stays transparent and owns the peer relationship used by
-                                    // 4002. Shadow multi-source injection is disabled for correctness.
-                                    let mut hosts = vec![ip.clone()];
-                                    for p in peers.iter() {
-                                        if hosts.len() >= n_live {
-                                            break;
-                                        }
-                                        if *p != ip {
-                                            hosts.push(p.clone());
-                                        }
-                                    }
-                                    serve_push(
-                                        down,
-                                        upc,
-                                        PushConfig {
-                                            hosts: Arc::new(hosts),
-                                            active_idx: 0,
-                                            port: 4001,
-                                            prefetched_greeting: Some(peer_greeting),
-                                            initial_last_forwarded: 0,
-                                            live_floor: node.live_floor.clone(),
-                                        },
-                                    )
-                                    .await;
-                                    clear_active_if_current(&node.active, &ip);
-                                } else {
-                                    node.pin_active(&ip);
-                                    splice(down, upc).await;
-                                    clear_active_if_current(&node.active, &ip);
-                                }
+                                let active_peer = node.pin_active(&ip);
+                                splice(down, upc).await;
+                                node.clear_active_if_current(&active_peer);
                                 break;
                             }
                         }
@@ -1661,7 +1728,7 @@ pub(crate) async fn run_gateway(
                         // 4002 client-block RPC is request/response. Always fetch-forward it through
                         // the current active peer so we can detect "Peer-only request" and wait for a
                         // fresh active instead of leaking the rejection to the node.
-                        serve_client_blocks(down, node.clone(), peers, rr).await;
+                        serve_client_blocks(down, node.clone()).await;
                     } else {
                         // Other gossip channels stay transparently spliced to the node's active peer.
                         let Some(upc) = dial_active(&node, &peers, &rr, port).await else {
@@ -1718,29 +1785,18 @@ mod tests {
     }
 
     #[test]
-    fn client_block_candidates_prefer_active_then_round_robin_fallbacks() {
-        let rr = AtomicUsize::new(0);
-        let peers = vec![
-            "1.1.1.1".to_string(),
-            "2.2.2.2".to_string(),
-            "3.3.3.3".to_string(),
-            "4.4.4.4".to_string(),
-        ];
-
-        assert_eq!(
-            client_block_peer_candidates(Some("2.2.2.2".to_string()), &peers, &rr, 4),
-            vec!["2.2.2.2", "1.1.1.1", "3.3.3.3", "4.4.4.4"]
-        );
-        assert_eq!(
-            client_block_peer_candidates(None, &peers, &rr, 3),
-            vec!["1.1.1.1", "2.2.2.2", "3.3.3.3"]
-        );
-    }
-
-    #[test]
     fn peer_only_response_is_detected_without_parsing_rpc() {
         assert!(response_is_peer_only(br#"{"Error":"Peer-only request"}"#));
         assert!(!response_is_peer_only(br#"{"Ok":{"blocks":[]}}"#));
+    }
+
+    #[test]
+    fn peer_full_response_is_detected_without_parsing_rpc() {
+        assert!(response_is_peer_full(br#"{"Error":"Peer full"}"#));
+        assert!(response_is_peer_full(&[0, 0, 0, 1, 0, 4]));
+        assert!(!response_is_peer_full(&[0, 0, 0, 1, 0, 3]));
+        assert!(!response_is_peer_full(&[0, 0, 0, 3, 0, 0, 0, 0]));
+        assert!(!response_is_peer_full(br#"{"Ok":{"round":1}}"#));
     }
 
     #[test]
@@ -1782,14 +1838,16 @@ mod tests {
     }
 
     #[test]
-    fn clear_active_only_clears_matching_peer() {
-        let active = Arc::new(Mutex::new(Some("1.1.1.1".to_string())));
+    fn clear_active_only_clears_matching_epoch() {
+        let node = NodeState::new("10.0.0.1".parse().unwrap(), 1);
+        let first = node.pin_active("1.1.1.1");
+        let second = node.pin_active("1.1.1.1");
 
-        clear_active_if_current(&active, "2.2.2.2");
-        assert_eq!(active.lock().unwrap().as_deref(), Some("1.1.1.1"));
+        node.clear_active_if_current(&first);
+        assert_eq!(node.active_snapshot(), Some(second.clone()));
 
-        clear_active_if_current(&active, "1.1.1.1");
-        assert!(active.lock().unwrap().is_none());
+        node.clear_active_if_current(&second);
+        assert!(node.active_snapshot().is_none());
     }
 
     #[test]
@@ -1858,12 +1916,12 @@ mod tests {
         let t0 = unix_secs();
 
         let (a1, a1_guard) = reg.get_or_insert(ip_a, t0);
-        *a1.active.lock().unwrap() = Some("1.1.1.1".to_string());
+        let peer = a1.pin_active("1.1.1.1");
 
         // same ip reconnecting -> same state (active survives), last_seen bumped
         let (a2, a2_guard) = reg.get_or_insert(ip_a, t0 + 10);
         assert!(Arc::ptr_eq(&a1, &a2));
-        assert_eq!(a2.active.lock().unwrap().as_deref(), Some("1.1.1.1"));
+        assert_eq!(a2.active_snapshot(), Some(peer));
         assert_eq!(a2.last_seen_secs.load(Ordering::Acquire), t0 + 10);
         assert_eq!(a2.open_conns.load(Ordering::Acquire), 2);
         drop(a2_guard);

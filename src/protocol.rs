@@ -7,6 +7,11 @@ use crate::gateway::{MIN_COMPLETE_BOOTSTRAP_BYTES, MIN_COMPLETE_BOOTSTRAP_FRAMES
 
 pub(crate) const GREET_FALSE: [u8; 8] = [0, 0, 0, 3, 0, 0, 0, 0]; // send_abci:false (live blocks; no rate-limited state)
 pub(crate) const GREET_TRUE: [u8; 8] = [0, 0, 0, 3, 0, 1, 0, 0]; // send_abci:true (full bootstrap stream)
+pub(crate) const MIN_PLAUSIBLE_MAINNET_ROUND: u32 = 1_000_000_000;
+
+pub(crate) fn is_plausible_mainnet_round(round: u32) -> bool {
+    round >= MIN_PLAUSIBLE_MAINNET_ROUND
+}
 
 // Reference / correctness oracle + fallback: full lz4 decompress, read round @0x5e.
 // Round parsing assumes the `0xfc + u32 LE` varint form. Mainnet rounds (~1.35B, +~14.5/s) stay
@@ -244,8 +249,10 @@ pub(crate) fn complete_frame_count(buf: &[u8]) -> Option<u64> {
 
 pub(crate) fn max_block_round_in_frames(blob: &[u8]) -> Option<u32> {
     const MAX_LIVE_BLOCK_FRAME: usize = 2_000_000;
+    const MIN_ROUND_CLUSTER: usize = 4;
+    const MAX_ROUND_CLUSTER_GAP: u32 = 10_000;
     let mut off = 0usize;
-    let mut max_round = None;
+    let mut rounds = Vec::new();
     while off + 5 <= blob.len() {
         let len =
             u32::from_be_bytes([blob[off], blob[off + 1], blob[off + 2], blob[off + 3]]) as usize;
@@ -257,12 +264,45 @@ pub(crate) fn max_block_round_in_frames(blob: &[u8]) -> Option<u32> {
         let payload = &blob[off..off + len];
         if typ == 1 && len <= MAX_LIVE_BLOCK_FRAME {
             if let Some(round) = block_round(payload) {
-                max_round = Some(max_round.map_or(round, |prev: u32| prev.max(round)));
+                rounds.push(round);
             }
         }
         off += len;
     }
-    max_round
+    max_clustered_round(&mut rounds, MIN_ROUND_CLUSTER, MAX_ROUND_CLUSTER_GAP)
+}
+
+pub(crate) fn max_clustered_round(
+    rounds: &mut [u32],
+    min_cluster: usize,
+    max_gap: u32,
+) -> Option<u32> {
+    if rounds.len() < min_cluster || min_cluster == 0 {
+        return None;
+    }
+    rounds.sort_unstable();
+    let mut best_len = 1usize;
+    let mut best_max = rounds[0];
+    let mut cur_len = 1usize;
+    let mut cur_max = rounds[0];
+    for pair in rounds.windows(2) {
+        if pair[1].saturating_sub(pair[0]) <= max_gap {
+            cur_len += 1;
+            cur_max = pair[1];
+        } else {
+            if cur_len > best_len || (cur_len == best_len && cur_max > best_max) {
+                best_len = cur_len;
+                best_max = cur_max;
+            }
+            cur_len = 1;
+            cur_max = pair[1];
+        }
+    }
+    if cur_len > best_len || (cur_len == best_len && cur_max > best_max) {
+        best_len = cur_len;
+        best_max = cur_max;
+    }
+    (best_len >= min_cluster).then_some(best_max)
 }
 
 fn should_forward_block_round(
@@ -354,12 +394,24 @@ mod tests {
         let mut blob = Vec::new();
         blob.extend_from_slice(&make_frame(0, b"control"));
         blob.extend_from_slice(&make_frame(1, &make_block(10)));
+        blob.extend_from_slice(&make_frame(1, &make_block(11)));
         blob.extend_from_slice(&make_frame(1, &vec![0u8; 2_000_001]));
         blob.extend_from_slice(&make_frame(1, &make_block(12)));
-        assert_eq!(max_block_round_in_frames(&blob), Some(12));
+        blob.extend_from_slice(&make_frame(1, &make_block(13)));
+        assert_eq!(max_block_round_in_frames(&blob), Some(13));
 
         let truncated = vec![0, 0, 0, 10, 1, 1, 2];
         assert_eq!(max_block_round_in_frames(&truncated), None);
+
+        let mut isolated_false_positive = Vec::new();
+        isolated_false_positive.extend_from_slice(&make_frame(1, &make_block(2_818_597_137)));
+        assert_eq!(max_block_round_in_frames(&isolated_false_positive), None);
+
+        let mut outlier = Vec::new();
+        for round in [20, 21, 22, 23, 2_818_597_137] {
+            outlier.extend_from_slice(&make_frame(1, &make_block(round)));
+        }
+        assert_eq!(max_block_round_in_frames(&outlier), Some(23));
     }
 
     #[test]
