@@ -219,7 +219,7 @@ pub(crate) async fn run_proxy(upstreams: Vec<String>, push: bool) {
                 }
             };
             loop {
-                let (down, _addr) = match l.accept().await {
+                let (down, addr) = match l.accept().await {
                     Ok(x) => x,
                     Err(_) => continue,
                 };
@@ -282,7 +282,8 @@ pub(crate) async fn run_proxy(upstreams: Vec<String>, push: bool) {
                         } else {
                             // live channel: merge blocks from active + all other peers (round-dedup,
                             // fastest-first); active stays transparent for node->peer + control/RPC.
-                            serve_push(
+                            let active_peer = hosts[idx].clone();
+                            let exit_reason = serve_push(
                                 down,
                                 upc,
                                 PushConfig {
@@ -298,6 +299,10 @@ pub(crate) async fn run_proxy(upstreams: Vec<String>, push: bool) {
                                 },
                             )
                             .await;
+                            eprintln!(
+                                "[proxy] :{p} {addr} push session ended active_peer={} reason={}",
+                                active_peer, exit_reason
+                            );
                         }
                         return;
                     }
@@ -361,7 +366,7 @@ pub(crate) struct PushConfig {
     pub(crate) net_round_tip: Arc<AtomicU32>,
 }
 
-pub(crate) async fn serve_push(node: TcpStream, active_conn: TcpStream, cfg: PushConfig) {
+pub(crate) async fn serve_push(node: TcpStream, active_conn: TcpStream, cfg: PushConfig) -> String {
     let forward_gate = Arc::new(tokio::sync::Mutex::new(
         RoundForwardGate::with_last_forwarded(16_384, cfg.initial_last_forwarded),
     ));
@@ -376,26 +381,26 @@ pub(crate) async fn serve_push(node: TcpStream, active_conn: TcpStream, cfg: Pus
     // node ahead of the greeting, and the node reads the block's length as the greeting length and
     // bails ("tcp read bytes over limit").
     if let Some(greet) = cfg.prefetched_greeting {
-        if node_w.write_all(&greet).await.is_err() {
-            return;
+        if let Err(e) = node_w.write_all(&greet).await {
+            return format!("node greeting write failed: {e}");
         }
     } else {
         let mut hdr = [0u8; 5];
-        if act_r.read_exact(&mut hdr).await.is_err() {
-            return;
+        if let Err(e) = act_r.read_exact(&mut hdr).await {
+            return format!("active greeting header read failed: {e}");
         }
         let len = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as usize;
         if len > 1000 {
-            return; // first frame from a live (send_abci:false) peer must be the small greeting
+            return format!("active greeting oversized len={len}");
         }
         let mut g = vec![0u8; len];
-        if act_r.read_exact(&mut g).await.is_err() {
-            return;
+        if let Err(e) = act_r.read_exact(&mut g).await {
+            return format!("active greeting payload read failed: {e}");
         }
         let mut greet = hdr.to_vec();
         greet.extend_from_slice(&g);
-        if node_w.write_all(&greet).await.is_err() {
-            return;
+        if let Err(e) = node_w.write_all(&greet).await {
+            return format!("node greeting write failed: {e}");
         }
     }
     // node -> active peer (transparent: RPC requests + acks)
@@ -406,7 +411,7 @@ pub(crate) async fn serve_push(node: TcpStream, active_conn: TcpStream, cfg: Pus
         })
     };
     for frame in cfg.prefetched_frames {
-        if process_live_frame(
+        if let Err(e) = process_live_frame(
             frame,
             &tx,
             &forward_gate,
@@ -415,9 +420,10 @@ pub(crate) async fn serve_push(node: TcpStream, active_conn: TcpStream, cfg: Pus
             true,
         )
         .await
-        .is_err()
         {
-            return;
+            // `up` is already running; don't leave the node->active copy behind on this early exit
+            up.abort();
+            return format!("prefetched frame processing failed: {e}");
         }
     }
     // active peer -> node: the transparent backbone (forwards non-block frames + blocks). When this
@@ -430,7 +436,7 @@ pub(crate) async fn serve_push(node: TcpStream, active_conn: TcpStream, cfg: Pus
         let live_floor = cfg.live_floor.clone();
         let net_round_tip = cfg.net_round_tip.clone();
         tokio::spawn(async move {
-            let _ = pump_merge(act_r, tx, forward_gate, live_floor, net_round_tip, true).await;
+            pump_merge(act_r, tx, forward_gate, live_floor, net_round_tip, true).await
         })
     };
     // every other peer -> node: live blocks only, deduped. Keep this off until shadow blocks are
@@ -477,25 +483,37 @@ pub(crate) async fn serve_push(node: TcpStream, active_conn: TcpStream, cfg: Pus
         }
     }
     drop(tx);
-    loop {
+    fn active_exit_reason(joined: Result<std::io::Result<()>, tokio::task::JoinError>) -> String {
+        match joined {
+            Ok(Ok(())) => "active stream ended".to_string(),
+            Ok(Err(e)) => format!("active stream error: {e}"),
+            Err(e) => format!("active task join error: {e}"),
+        }
+    }
+    let exit_reason = loop {
         tokio::select! {
             maybe = rx.recv() => match maybe {
                 Some(buf) => {
-                    if node_w.write_all(&buf).await.is_err() {
-                        break;
+                    if let Err(e) = node_w.write_all(&buf).await {
+                        break format!("node write failed: {e}");
                     }
                 }
-                None => break,
+                // all senders gone. With shadows disabled the active pump holds the only tx
+                // clone, so the channel can only close because it ended — join it for the REAL
+                // reason instead of reporting the generic channel close (select! is unbiased,
+                // so this arm often fires first when both become ready together).
+                None => break active_exit_reason((&mut active_task).await),
             },
             // active (backbone) peer died -> tear down; the node reconnects to a fresh active
-            _ = &mut active_task => break,
+            joined = &mut active_task => break active_exit_reason(joined),
         }
-    }
+    };
     up.abort();
     active_task.abort();
     for s in shadows {
         s.abort();
     }
+    exit_reason
 }
 
 // Frame reader for serve_push: forward block frames (type=1 with a round) deduped; if forward_nonblock

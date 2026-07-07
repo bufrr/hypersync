@@ -466,11 +466,11 @@ async fn serve_push_4001_fallback(
             node.ip, ip
         );
         let active_peer = node.pin_active(&ip);
-        serve_push(
+        let exit_reason = serve_push(
             down,
             upc,
             PushConfig {
-                hosts: Arc::new(vec![ip]),
+                hosts: Arc::new(vec![ip.clone()]),
                 active_idx: 0,
                 port: 4001,
                 prefetched_greeting: Some(greeting),
@@ -481,6 +481,10 @@ async fn serve_push_4001_fallback(
             },
         )
         .await;
+        eprintln!(
+            "[gw] [{}] 4001 push session ended active_peer={} mode=fallback reason={}",
+            node.ip, ip, exit_reason
+        );
         node.clear_active_if_current(&active_peer);
         return;
     }
@@ -1822,7 +1826,7 @@ pub(crate) async fn run_gateway(
                                                 }
                                             }
                                         }
-                                        serve_push(
+                                        let exit_reason = serve_push(
                                             down,
                                             live.stream,
                                             PushConfig {
@@ -1834,9 +1838,13 @@ pub(crate) async fn run_gateway(
                                                 initial_last_forwarded: cache_floor,
                                                 live_floor: node.live_floor.clone(),
                                                 net_round_tip: net_round_tip.clone(),
-                                            },
-                                        )
-                                        .await;
+                                        },
+                                    )
+                                    .await;
+                                        eprintln!(
+                                            "[gw] [{}] 4001 push session ended active_peer={} mode=cache-live reason={}",
+                                            node.ip, live.ip, exit_reason
+                                        );
                                         node.clear_active_if_current(&active_peer);
                                         return;
                                     }
@@ -1945,7 +1953,7 @@ pub(crate) async fn run_gateway(
                                             hosts.push(p.clone());
                                         }
                                     }
-                                    serve_push(
+                                    let exit_reason = serve_push(
                                         down,
                                         live.stream,
                                         PushConfig {
@@ -1960,6 +1968,10 @@ pub(crate) async fn run_gateway(
                                         },
                                     )
                                     .await;
+                                    eprintln!(
+                                        "[gw] [{}] 4001 push session ended active_peer={} mode=live reason={}",
+                                        node.ip, live.ip, exit_reason
+                                    );
                                     node.clear_active_if_current(&active_peer);
                                 } else {
                                     serve_push_4001_fallback(
