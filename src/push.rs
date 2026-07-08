@@ -87,28 +87,24 @@ async fn pump(
             }
             continue;
         }
-        let mut payload = vec![0u8; len];
-        s.read_exact(&mut payload).await?;
+        // single allocation: read the payload directly into the send-ready frame (see pump_merge)
+        let mut frame = vec![0u8; 5 + len];
+        frame[..5].copy_from_slice(&hdr);
+        s.read_exact(&mut frame[5..]).await?;
         if typ != 1 {
             continue;
         }
-        match block_round(&payload) {
+        match block_round(&frame[5..]) {
             Some(r) => {
                 if first {
                     eprintln!("[gw] upstream {ip}: first round = {r}");
                     first = false;
                 }
-                if dedup.is_new(r) {
-                    let mut frame = hdr.to_vec();
-                    frame.extend_from_slice(&payload);
-                    if tx.send(frame).await.is_err() {
-                        return Ok(());
-                    }
+                if dedup.is_new(r) && tx.send(frame).await.is_err() {
+                    return Ok(());
                 }
             }
             None => {
-                let mut frame = hdr.to_vec();
-                frame.extend_from_slice(&payload);
                 if tx.send(frame).await.is_err() {
                     return Ok(());
                 }
@@ -666,13 +662,17 @@ async fn pump_merge(
             }
             continue;
         }
-        let mut payload = vec![0u8; len];
-        match timeout(IDLE, r.read_exact(&mut payload)).await {
+        // Read the payload straight into a ready-to-send frame (header + payload): forwarding is
+        // the common case, and rebuilding the frame from a separate payload Vec would cost an
+        // extra allocation + full copy per live block.
+        let mut frame = vec![0u8; 5 + len];
+        frame[..5].copy_from_slice(&hdr);
+        match timeout(IDLE, r.read_exact(&mut frame[5..])).await {
             Ok(res) => res?,
             Err(_) => return Err(std::io::Error::other("idle timeout (payload)")),
         };
         if typ == 1 {
-            if let Some(rnd) = block_round(&payload) {
+            if let Some(rnd) = block_round(&frame[5..]) {
                 if !is_plausible_mainnet_round(rnd, net_round_tip.load(Ordering::Acquire)) {
                     if forward_nonblock {
                         return Err(std::io::Error::other(format!(
@@ -685,30 +685,18 @@ async fn pump_merge(
                     continue;
                 }
                 let mut gate = forward_gate.lock().await;
-                if gate.should_forward(rnd, forward_nonblock) {
-                    let mut frame = hdr.to_vec();
-                    frame.extend_from_slice(&payload);
-                    if tx.send(frame).await.is_err() {
-                        return Ok(());
-                    }
+                if gate.should_forward(rnd, forward_nonblock) && tx.send(frame).await.is_err() {
+                    return Ok(());
                 }
                 continue;
             }
-            if forward_nonblock {
-                let mut frame = hdr.to_vec();
-                frame.extend_from_slice(&payload);
-                if tx.send(frame).await.is_err() {
-                    return Ok(());
-                }
+            if forward_nonblock && tx.send(frame).await.is_err() {
+                return Ok(());
             }
             continue;
         }
-        if forward_nonblock {
-            let mut frame = hdr.to_vec();
-            frame.extend_from_slice(&payload);
-            if tx.send(frame).await.is_err() {
-                return Ok(());
-            }
+        if forward_nonblock && tx.send(frame).await.is_err() {
+            return Ok(());
         }
     }
 }
