@@ -465,7 +465,15 @@ async fn serve_push_4001_fallback(
             "[gw] [{}] 4001 push fallback via {} ({reason})",
             node.ip, ip
         );
-        let active_peer = node.pin_active(&ip);
+        let active_slot = Arc::new(Mutex::new(Some(node.pin_active(&ip))));
+        let on_active_peer = {
+            let node = node.clone();
+            let active_slot = active_slot.clone();
+            Arc::new(move |ip: &str| {
+                let peer = node.pin_active(ip);
+                *active_slot.lock().unwrap() = Some(peer);
+            }) as Arc<dyn Fn(&str) + Send + Sync>
+        };
         let exit_reason = serve_push(
             down,
             upc,
@@ -473,19 +481,30 @@ async fn serve_push_4001_fallback(
                 hosts: Arc::new(vec![ip.clone()]),
                 active_idx: 0,
                 port: 4001,
+                node_greeting: greet,
                 prefetched_greeting: Some(greeting),
                 prefetched_frames: Vec::new(),
                 initial_last_forwarded,
                 live_floor: node.live_floor.clone(),
                 net_round_tip,
+                on_active_peer: Some(on_active_peer),
             },
         )
         .await;
+        let final_active = active_slot
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|peer| peer.ip.clone())
+            .unwrap_or_else(|| ip.clone());
         eprintln!(
             "[gw] [{}] 4001 push session ended active_peer={} mode=fallback reason={}",
-            node.ip, ip, exit_reason
+            node.ip, final_active, exit_reason
         );
-        node.clear_active_if_current(&active_peer);
+        let active_to_clear = active_slot.lock().unwrap().take();
+        if let Some(peer) = active_to_clear {
+            node.clear_active_if_current(&peer);
+        }
         return;
     }
     eprintln!("[gw] [{}] 4001 push fallback failed ({reason})", node.ip);
@@ -858,12 +877,17 @@ fn bootstrap_capture_err(
 pub(crate) const MIN_COMPLETE_BOOTSTRAP_BYTES: usize = 4_400_000_000;
 pub(crate) const MIN_COMPLETE_BOOTSTRAP_FRAMES: u64 = 4_000;
 const CACHE_REPLAY_COOLDOWN_SECS: u64 = 30;
-const MAX_BOOTSTRAP_CACHE_AGE_SECS: u64 = 30 * 60;
-const CACHE_REFRESH_SECS: u64 = 10 * 60;
-const CACHE_REFRESH_RETRY_SECS: u64 = 2 * 60;
-const CACHE_REFRESH_FORCE_BEFORE_EXPIRY_SECS: u64 = 5 * 60;
+// hl-node's live/bootstrap reader times out in roughly five minutes once it sees the live
+// stream's first block. A very old cache forces too much client-block catch-up before that
+// first live round can be processed, so keep the replay window intentionally short.
+const MAX_BOOTSTRAP_CACHE_AGE_SECS: u64 = 8 * 60;
+const CACHE_REFRESH_SECS: u64 = 6 * 60;
+const CACHE_REFRESH_RETRY_SECS: u64 = 60;
+const CACHE_REFRESH_FORCE_BEFORE_EXPIRY_SECS: u64 = 90;
 const MIN_BOOTSTRAP_RATE_BYTES_PER_SEC: f64 = 5_000_000.0;
 const MIN_LIVE_PEERS_FOR_CACHE_REFRESH: usize = 4;
+const FRESH_CACHE_REFRESH_MAX_INFLIGHT: usize = 2;
+const COLD_CACHE_REFRESH_MAX_INFLIGHT: usize = 3;
 const MAX_BOOTSTRAP_CAPTURE_BYTES: usize = 6_000_000_000;
 
 fn cache_parent_writable(path: &Path) -> bool {
@@ -1591,9 +1615,14 @@ pub(crate) async fn run_gateway(
                         }
                     };
                     cycle = cycle.wrapping_add(1);
-                    // Refresh is not urgent once a usable cache exists; keep it single-flight so
-                    // periodic refreshes do not stack multiple multi-GB bootstrap buffers.
-                    let max_inflight = if have_fresh_cache { 1 } else { 3 };
+                    // Refreshes still need a small hedge: a single slow-but-readable state server
+                    // can push the cache past the freshness window. Limit fresh-cache refreshes to
+                    // two concurrent captures so one slow peer does not block the next candidate.
+                    let max_inflight = if have_fresh_cache {
+                        FRESH_CACHE_REFRESH_MAX_INFLIGHT
+                    } else {
+                        COLD_CACHE_REFRESH_MAX_INFLIGHT
+                    };
                     let got = if let Some((blob, ip)) =
                         capture_bootstrap_raced(peers, max_inflight, Duration::from_secs(40)).await
                     {
@@ -1814,7 +1843,17 @@ pub(crate) async fn run_gateway(
                                             "[gw] [{}] selected live peer {} first_round={}",
                                             node.ip, live.ip, live.first_round
                                         );
-                                        let active_peer = node.pin_active(&live.ip);
+                                        let active_slot =
+                                            Arc::new(Mutex::new(Some(node.pin_active(&live.ip))));
+                                        let on_active_peer = {
+                                            let node = node.clone();
+                                            let active_slot = active_slot.clone();
+                                            Arc::new(move |ip: &str| {
+                                                let peer = node.pin_active(ip);
+                                                *active_slot.lock().unwrap() = Some(peer);
+                                            })
+                                                as Arc<dyn Fn(&str) + Send + Sync>
+                                        };
                                         let mut hosts = vec![live.ip.clone()];
                                         if push {
                                             for p in peers.iter() {
@@ -1833,19 +1872,31 @@ pub(crate) async fn run_gateway(
                                                 hosts: Arc::new(hosts),
                                                 active_idx: 0,
                                                 port: 4001,
+                                                node_greeting: GREET_FALSE,
                                                 prefetched_greeting: Some(live.greeting),
                                                 prefetched_frames: live.prefetched_frames,
                                                 initial_last_forwarded: cache_floor,
                                                 live_floor: node.live_floor.clone(),
                                                 net_round_tip: net_round_tip.clone(),
+                                                on_active_peer: Some(on_active_peer),
                                         },
                                     )
                                     .await;
+                                        let final_active = active_slot
+                                            .lock()
+                                            .unwrap()
+                                            .as_ref()
+                                            .map(|peer| peer.ip.clone())
+                                            .unwrap_or_else(|| live.ip.clone());
                                         eprintln!(
                                             "[gw] [{}] 4001 push session ended active_peer={} mode=cache-live reason={}",
-                                            node.ip, live.ip, exit_reason
+                                            node.ip, final_active, exit_reason
                                         );
-                                        node.clear_active_if_current(&active_peer);
+                                        let active_to_clear =
+                                            active_slot.lock().unwrap().take();
+                                        if let Some(peer) = active_to_clear {
+                                            node.clear_active_if_current(&peer);
+                                        }
                                         return;
                                     }
                                     serve_push_4001_fallback(
@@ -1941,7 +1992,17 @@ pub(crate) async fn run_gateway(
                                         "[gw] [{}] selected live peer {} first_round={}",
                                         node.ip, live.ip, live.first_round
                                     );
-                                    let active_peer = node.pin_active(&live.ip);
+                                    let active_slot =
+                                        Arc::new(Mutex::new(Some(node.pin_active(&live.ip))));
+                                    let on_active_peer = {
+                                        let node = node.clone();
+                                        let active_slot = active_slot.clone();
+                                        Arc::new(move |ip: &str| {
+                                            let peer = node.pin_active(ip);
+                                            *active_slot.lock().unwrap() = Some(peer);
+                                        })
+                                            as Arc<dyn Fn(&str) + Send + Sync>
+                                    };
                                     // active stays transparent and owns the peer relationship used by
                                     // 4002. Shadow multi-source injection is disabled for correctness.
                                     let mut hosts = vec![live.ip.clone()];
@@ -1960,19 +2021,30 @@ pub(crate) async fn run_gateway(
                                             hosts: Arc::new(hosts),
                                             active_idx: 0,
                                             port: 4001,
+                                            node_greeting: greet,
                                             prefetched_greeting: Some(live.greeting),
                                             prefetched_frames: live.prefetched_frames,
                                             initial_last_forwarded: 0,
                                             live_floor: node.live_floor.clone(),
                                             net_round_tip: net_round_tip.clone(),
+                                            on_active_peer: Some(on_active_peer),
                                         },
                                     )
                                     .await;
+                                    let final_active = active_slot
+                                        .lock()
+                                        .unwrap()
+                                        .as_ref()
+                                        .map(|peer| peer.ip.clone())
+                                        .unwrap_or_else(|| live.ip.clone());
                                     eprintln!(
                                         "[gw] [{}] 4001 push session ended active_peer={} mode=live reason={}",
-                                        node.ip, live.ip, exit_reason
+                                        node.ip, final_active, exit_reason
                                     );
-                                    node.clear_active_if_current(&active_peer);
+                                    let active_to_clear = active_slot.lock().unwrap().take();
+                                    if let Some(peer) = active_to_clear {
+                                        node.clear_active_if_current(&peer);
+                                    }
                                 } else {
                                     serve_push_4001_fallback(
                                         down,
@@ -2060,7 +2132,11 @@ mod tests {
             false,
             cached_at
         ));
-        assert!(is_bootstrap_cache_fresh(cached_at + 15 * 60, cached_at));
+        assert!(is_bootstrap_cache_fresh(
+            cached_at + MAX_BOOTSTRAP_CACHE_AGE_SECS,
+            cached_at
+        ));
+        assert!(!is_bootstrap_cache_fresh(cached_at + 15 * 60, cached_at));
     }
 
     #[test]

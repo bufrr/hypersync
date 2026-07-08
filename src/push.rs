@@ -2,6 +2,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
@@ -290,12 +291,14 @@ pub(crate) async fn run_proxy(upstreams: Vec<String>, push: bool) {
                                     hosts: hosts.clone(),
                                     active_idx: idx,
                                     port: p,
+                                    node_greeting: greet,
                                     prefetched_greeting: None,
                                     prefetched_frames: Vec::new(),
                                     initial_last_forwarded: 0,
                                     live_floor: Arc::new(AtomicU32::new(0)),
                                     // proxy mode has no peerd tip: floor-only plausibility
                                     net_round_tip: Arc::new(AtomicU32::new(0)),
+                                    on_active_peer: None,
                                 },
                             )
                             .await;
@@ -357,6 +360,7 @@ pub(crate) struct PushConfig {
     pub(crate) hosts: Arc<Vec<String>>,
     pub(crate) active_idx: usize,
     pub(crate) port: u16,
+    pub(crate) node_greeting: [u8; 8],
     pub(crate) prefetched_greeting: Option<Vec<u8>>,
     pub(crate) prefetched_frames: Vec<Vec<u8>>,
     pub(crate) initial_last_forwarded: u32,
@@ -364,6 +368,75 @@ pub(crate) struct PushConfig {
     // best-known network round tip (0 = unknown); makes the round-plausibility ceiling
     // tip-relative instead of a fixed constant
     pub(crate) net_round_tip: Arc<AtomicU32>,
+    // Called after an in-session active-peer failover succeeds. Gateway mode uses this to
+    // repin the node's 4002 RPC path to the same upstream now feeding 4001.
+    pub(crate) on_active_peer: Option<ActivePeerCallback>,
+}
+
+pub(crate) type ActivePeerCallback = Arc<dyn Fn(&str) + Send + Sync>;
+
+fn spawn_active_pump(
+    act_r: OwnedReadHalf,
+    tx: mpsc::Sender<Vec<u8>>,
+    forward_gate: Arc<tokio::sync::Mutex<RoundForwardGate>>,
+    live_floor: Arc<AtomicU32>,
+    net_round_tip: Arc<AtomicU32>,
+) -> tokio::task::JoinHandle<std::io::Result<()>> {
+    tokio::spawn(async move {
+        pump_merge(act_r, tx, forward_gate, live_floor, net_round_tip, true).await
+    })
+}
+
+async fn read_discard_peer_greeting(r: &mut OwnedReadHalf) -> std::io::Result<()> {
+    let mut hdr = [0u8; 5];
+    timeout(Duration::from_secs(5), r.read_exact(&mut hdr)).await??;
+    let len = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as usize;
+    if len > 1000 {
+        return Err(std::io::Error::other(format!(
+            "replacement greeting oversized len={len}"
+        )));
+    }
+    let mut payload = vec![0u8; len];
+    timeout(Duration::from_secs(5), r.read_exact(&mut payload)).await??;
+    Ok(())
+}
+
+async fn connect_replacement_active(
+    host: &str,
+    port: u16,
+    greet: [u8; 8],
+) -> std::io::Result<(OwnedReadHalf, OwnedWriteHalf)> {
+    let target = format!("{host}:{port}");
+    let mut s = timeout(Duration::from_secs(5), TcpStream::connect(&target)).await??;
+    s.set_nodelay(true).ok();
+    timeout(Duration::from_secs(5), s.write_all(&greet)).await??;
+    let (mut r, w) = s.into_split();
+    read_discard_peer_greeting(&mut r).await?;
+    Ok((r, w))
+}
+
+async fn connect_next_active(
+    hosts: &[String],
+    current_idx: usize,
+    port: u16,
+    greet: [u8; 8],
+) -> Result<(usize, String, OwnedReadHalf, OwnedWriteHalf), String> {
+    if hosts.is_empty() {
+        return Err("empty host set".to_string());
+    }
+    let mut errors = Vec::new();
+    for off in 1..=hosts.len() {
+        let idx = (current_idx + off) % hosts.len();
+        let host = &hosts[idx];
+        match connect_replacement_active(host, port, greet).await {
+            Ok((r, w)) => return Ok((idx, host.clone(), r, w)),
+            Err(e) => errors.push(format!("{host}: {e}")),
+        }
+    }
+    Err(format!(
+        "no replacement active peer ({})",
+        errors.join("; ")
+    ))
 }
 
 pub(crate) async fn serve_push(node: TcpStream, active_conn: TcpStream, cfg: PushConfig) -> String {
@@ -426,19 +499,24 @@ pub(crate) async fn serve_push(node: TcpStream, active_conn: TcpStream, cfg: Pus
             return format!("prefetched frame processing failed: {e}");
         }
     }
-    // active peer -> node: the transparent backbone (forwards non-block frames + blocks). When this
-    // task ends the active peer's stream broke, so we tear the whole session down and let the node
-    // reconnect — the gateway then pins a FRESH active (round-robin). This is the proxy-style failover;
-    // shadow sources remain disabled unless validation is added.
-    let mut active_task = {
-        let tx = tx.clone();
-        let forward_gate = forward_gate.clone();
-        let live_floor = cfg.live_floor.clone();
-        let net_round_tip = cfg.net_round_tip.clone();
-        tokio::spawn(async move {
-            pump_merge(act_r, tx, forward_gate, live_floor, net_round_tip, true).await
-        })
-    };
+    // active peer -> node: the transparent backbone (forwards non-block frames + blocks). If the
+    // active stream stalls or dies, switch the incoming backbone to another peer before hl-node's
+    // own abci reader times out. Shadow sources remain disabled unless validation is added.
+    let mut current_active_idx = cfg.active_idx;
+    let mut current_active_peer = cfg
+        .hosts
+        .get(current_active_idx)
+        .cloned()
+        .unwrap_or_else(|| "<unknown>".to_string());
+    let mut active_failovers = 0usize;
+    let mut _replacement_active_write: Option<OwnedWriteHalf> = None;
+    let mut active_task = spawn_active_pump(
+        act_r,
+        tx.clone(),
+        forward_gate.clone(),
+        cfg.live_floor.clone(),
+        cfg.net_round_tip.clone(),
+    );
     // every other peer -> node: live blocks only, deduped. Keep this off until shadow blocks are
     // validated beyond round number.
     let mut shadows = Vec::new();
@@ -482,7 +560,6 @@ pub(crate) async fn serve_push(node: TcpStream, active_conn: TcpStream, cfg: Pus
             }));
         }
     }
-    drop(tx);
     fn active_exit_reason(joined: Result<std::io::Result<()>, tokio::task::JoinError>) -> String {
         match joined {
             Ok(Ok(())) => "active stream ended".to_string(),
@@ -504,8 +581,34 @@ pub(crate) async fn serve_push(node: TcpStream, active_conn: TcpStream, cfg: Pus
                 // so this arm often fires first when both become ready together).
                 None => break active_exit_reason((&mut active_task).await),
             },
-            // active (backbone) peer died -> tear down; the node reconnects to a fresh active
-            joined = &mut active_task => break active_exit_reason(joined),
+            // active (backbone) peer died/stalled -> switch upstream inside this node connection.
+            joined = &mut active_task => {
+                let reason = active_exit_reason(joined);
+                match connect_next_active(&cfg.hosts, current_active_idx, cfg.port, cfg.node_greeting).await {
+                    Ok((idx, peer, r, w)) => {
+                        active_failovers += 1;
+                        eprintln!(
+                            "[push] active peer failover {} -> {} reason={}",
+                            current_active_peer, peer, reason
+                        );
+                        current_active_idx = idx;
+                        current_active_peer = peer.clone();
+                        if let Some(on_active_peer) = cfg.on_active_peer.as_ref() {
+                            on_active_peer(&peer);
+                        }
+                        _replacement_active_write = Some(w);
+                        active_task = spawn_active_pump(
+                            r,
+                            tx.clone(),
+                            forward_gate.clone(),
+                            cfg.live_floor.clone(),
+                            cfg.net_round_tip.clone(),
+                        );
+                        continue;
+                    }
+                    Err(e) => break format!("{reason}; failover failed: {e}"),
+                }
+            },
         }
     };
     up.abort();
@@ -513,7 +616,11 @@ pub(crate) async fn serve_push(node: TcpStream, active_conn: TcpStream, cfg: Pus
     for s in shadows {
         s.abort();
     }
-    exit_reason
+    if active_failovers == 0 {
+        exit_reason
+    } else {
+        format!("{exit_reason}; active_failovers={active_failovers}")
+    }
 }
 
 // Frame reader for serve_push: forward block frames (type=1 with a round) deduped; if forward_nonblock
@@ -526,12 +633,9 @@ async fn pump_merge(
     net_round_tip: Arc<AtomicU32>,
     forward_nonblock: bool,
 ) -> std::io::Result<()> {
-    // Live blocks arrive continuously (~4-15/s on mainnet), so >30s of silence means a stalled
-    // connection. Without this idle timeout a silently-stalled-but-open ACTIVE peer would hang
-    // the backbone forever (teardown only fired on EOF/RST); erroring out here makes serve_push
-    // tear the session down so the node reconnects to a fresh active, and makes a stalled shadow
-    // fall into its reconnect loop.
-    const IDLE: Duration = Duration::from_secs(30);
+    // Live blocks arrive continuously (~4-15/s on mainnet). Keep this below hl-node's own abci
+    // read deadline so the gateway can switch active peers before the node reconnects.
+    const IDLE: Duration = Duration::from_secs(10);
     loop {
         let mut hdr = [0u8; 5];
         match timeout(IDLE, r.read_exact(&mut hdr)).await {
