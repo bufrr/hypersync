@@ -352,6 +352,29 @@ pub(crate) async fn run_proxy(upstreams: Vec<String>, push: bool) {
 const PUSH_MERGE_QUEUE_FRAMES: usize = 256;
 const ENABLE_SHADOW_PUSH: bool = false;
 
+struct ActiveWriteHalf {
+    generation: u64,
+    writer: OwnedWriteHalf,
+}
+
+#[derive(Debug)]
+struct OutboundWriteFailure {
+    generation: u64,
+    reason: String,
+}
+
+async fn replace_active_writer(
+    active_w: &Arc<tokio::sync::Mutex<ActiveWriteHalf>>,
+    active_write_generation: &Arc<AtomicU64>,
+    writer: OwnedWriteHalf,
+) -> u64 {
+    let mut active = active_w.lock().await;
+    let generation = active.generation.wrapping_add(1);
+    *active = ActiveWriteHalf { generation, writer };
+    active_write_generation.store(generation, Ordering::Release);
+    generation
+}
+
 pub(crate) struct PushConfig {
     pub(crate) hosts: Arc<Vec<String>>,
     pub(crate) active_idx: usize,
@@ -443,7 +466,7 @@ pub(crate) async fn serve_push(node: TcpStream, active_conn: TcpStream, cfg: Pus
     // writer backpressures upstream readers instead of allowing multi-GB queued Vecs.
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(PUSH_MERGE_QUEUE_FRAMES);
     let (node_r, mut node_w) = node.into_split();
-    let (mut act_r, mut act_w) = active_conn.into_split();
+    let (mut act_r, act_w) = active_conn.into_split();
     // The node's first read on 4001 is the peer's greeting ("abci_stream recv greeting", max 1000
     // bytes). Forward the active peer's greeting frame to the node BEFORE starting the shadow
     // injectors: they all share node_w, so a shadow peer's first live block can otherwise reach the
@@ -472,13 +495,63 @@ pub(crate) async fn serve_push(node: TcpStream, active_conn: TcpStream, cfg: Pus
             return format!("node greeting write failed: {e}");
         }
     }
-    // node -> active peer (transparent: RPC requests + acks)
+    // node -> active peer (transparent: RPC requests + acks). The write half is shared so an
+    // in-session failover can swap in the replacement peer's socket. On write failure, notify the
+    // main loop and stop reading more node outbound until the write generation changes; otherwise
+    // one broken peer can silently drop a run of node->peer chunks.
+    let active_w = Arc::new(tokio::sync::Mutex::new(ActiveWriteHalf {
+        generation: 0,
+        writer: act_w,
+    }));
+    let active_write_generation = Arc::new(AtomicU64::new(0));
+    let (outbound_fail_tx, mut outbound_fail_rx) = mpsc::channel::<OutboundWriteFailure>(1);
     let up = {
+        let active_w = active_w.clone();
+        let active_write_generation = active_write_generation.clone();
+        let outbound_fail_tx = outbound_fail_tx.clone();
         let mut node_r = node_r;
         tokio::spawn(async move {
-            let _ = tokio::io::copy(&mut node_r, &mut act_w).await;
+            let mut buf = vec![0u8; 65536];
+            loop {
+                match node_r.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        // Bounded write: a stalled peer with a full send buffer would otherwise
+                        // park write_all while holding the lock the failover arm needs to swap
+                        // in the replacement socket.
+                        let (generation, failure) = {
+                            let mut active = active_w.lock().await;
+                            let generation = active.generation;
+                            let result =
+                                timeout(Duration::from_secs(5), active.writer.write_all(&buf[..n]))
+                                    .await;
+                            let failure = match result {
+                                Ok(Ok(())) => None,
+                                Ok(Err(e)) => Some(format!("write failed: {e}")),
+                                Err(_) => Some("write timeout".to_string()),
+                            };
+                            (generation, failure)
+                        };
+                        if let Some(reason) = failure {
+                            if outbound_fail_tx
+                                .send(OutboundWriteFailure { generation, reason })
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                            while active_write_generation.load(Ordering::Acquire) == generation
+                                && !outbound_fail_tx.is_closed()
+                            {
+                                tokio::time::sleep(Duration::from_millis(50)).await;
+                            }
+                        }
+                    }
+                }
+            }
         })
     };
+    drop(outbound_fail_tx);
     for frame in cfg.prefetched_frames {
         if let Err(e) = process_live_frame(
             frame,
@@ -505,7 +578,6 @@ pub(crate) async fn serve_push(node: TcpStream, active_conn: TcpStream, cfg: Pus
         .cloned()
         .unwrap_or_else(|| "<unknown>".to_string());
     let mut active_failovers = 0usize;
-    let mut _replacement_active_write: Option<OwnedWriteHalf> = None;
     let mut active_task = spawn_active_pump(
         act_r,
         tx.clone(),
@@ -571,11 +643,48 @@ pub(crate) async fn serve_push(node: TcpStream, active_conn: TcpStream, cfg: Pus
                         break format!("node write failed: {e}");
                     }
                 }
-                // all senders gone. With shadows disabled the active pump holds the only tx
-                // clone, so the channel can only close because it ended — join it for the REAL
-                // reason instead of reporting the generic channel close (select! is unbiased,
-                // so this arm often fires first when both become ready together).
+                // Unreachable in practice: serve_push itself keeps a tx clone alive for
+                // failover respawns, so the channel never reports closed. Kept as a safe
+                // fallback that surfaces the active pump's real exit reason.
                 None => break active_exit_reason((&mut active_task).await),
+            },
+            outbound = outbound_fail_rx.recv() => match outbound {
+                Some(failure) => {
+                    let current_generation = active_write_generation.load(Ordering::Acquire);
+                    if failure.generation != current_generation {
+                        continue;
+                    }
+                    let reason = format!(
+                        "node outbound {} generation={}",
+                        failure.reason, failure.generation
+                    );
+                    match connect_next_active(&cfg.hosts, current_active_idx, cfg.port, cfg.node_greeting).await {
+                        Ok((idx, peer, r, w)) => {
+                            active_failovers += 1;
+                            eprintln!(
+                                "[push] active peer failover {} -> {} reason={}",
+                                current_active_peer, peer, reason
+                            );
+                            active_task.abort();
+                            current_active_idx = idx;
+                            current_active_peer = peer.clone();
+                            if let Some(on_active_peer) = cfg.on_active_peer.as_ref() {
+                                on_active_peer(&peer);
+                            }
+                            replace_active_writer(&active_w, &active_write_generation, w).await;
+                            active_task = spawn_active_pump(
+                                r,
+                                tx.clone(),
+                                forward_gate.clone(),
+                                cfg.live_floor.clone(),
+                                cfg.net_round_tip.clone(),
+                            );
+                            continue;
+                        }
+                        Err(e) => break format!("{reason}; failover failed: {e}"),
+                    }
+                }
+                None => break "node outbound ended".to_string(),
             },
             // active (backbone) peer died/stalled -> switch upstream inside this node connection.
             joined = &mut active_task => {
@@ -592,7 +701,9 @@ pub(crate) async fn serve_push(node: TcpStream, active_conn: TcpStream, cfg: Pus
                         if let Some(on_active_peer) = cfg.on_active_peer.as_ref() {
                             on_active_peer(&peer);
                         }
-                        _replacement_active_write = Some(w);
+                        // swap the node->peer outbound to the replacement's write half so acks
+                        // and RPC requests reach the peer that is now feeding the backbone
+                        replace_active_writer(&active_w, &active_write_generation, w).await;
                         active_task = spawn_active_pump(
                             r,
                             tx.clone(),

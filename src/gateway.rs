@@ -552,6 +552,20 @@ struct ActivePeer {
     epoch: u64,
 }
 
+// Pairs `pin_active` with `clear_active_if_current` regardless of how the caller's scope exits
+// (early return, panic) — a pin left dangling after a failed relay can wrongly suppress cache
+// replay and route 4002 RPC at a stale peer.
+struct ActivePinGuard {
+    node: Arc<NodeState>,
+    peer: ActivePeer,
+}
+
+impl Drop for ActivePinGuard {
+    fn drop(&mut self) {
+        self.node.clear_active_if_current(&self.peer);
+    }
+}
+
 // Connect to the session's active peer (the one serving the node's bootstrap) on `port`, waiting
 // briefly for the bootstrap to set it; falls back to a round-robin pool peer if none is set yet.
 async fn dial_active(
@@ -917,14 +931,19 @@ const CACHE_REPLAY_COOLDOWN_SECS: u64 = 30;
 // stream's first block. A very old cache forces too much client-block catch-up before that
 // first live round can be processed, so keep the replay window intentionally short.
 const MAX_BOOTSTRAP_CACHE_AGE_SECS: u64 = 8 * 60;
-const CACHE_REFRESH_SECS: u64 = 6 * 60;
-const CACHE_REFRESH_RETRY_SECS: u64 = 60;
+const CACHE_REFRESH_SECS: u64 = 4 * 60;
+const CACHE_REFRESH_RETRY_SECS: u64 = 30;
 const CACHE_REFRESH_FORCE_BEFORE_EXPIRY_SECS: u64 = 90;
 const MIN_BOOTSTRAP_RATE_BYTES_PER_SEC: f64 = 5_000_000.0;
 const MIN_LIVE_PEERS_FOR_CACHE_REFRESH: usize = 4;
 const FRESH_CACHE_REFRESH_MAX_INFLIGHT: usize = 2;
 const COLD_CACHE_REFRESH_MAX_INFLIGHT: usize = 3;
 const MAX_BOOTSTRAP_CAPTURE_BYTES: usize = 6_000_000_000;
+// capture_bootstrap_raced's rate gates catch slow or stalled peers. Keep fresh refreshes bounded
+// so one bad race cannot monopolize the cache loop, but give cold-cache capture enough time for a
+// valid multi-GB bootstrap instead of killing it with the short fresh-refresh deadline.
+const FRESH_BOOTSTRAP_REFRESH_MAX_SECS: u64 = 5 * 60;
+const COLD_BOOTSTRAP_REFRESH_MAX_SECS: u64 = 15 * 60;
 
 fn cache_parent_writable(path: &Path) -> bool {
     let Some(parent) = path.parent() else {
@@ -970,6 +989,26 @@ fn should_delay_cache_refresh_for_live_pool(now: u64, cached_at: u64, live_count
     let cache_age = now.saturating_sub(cached_at);
     let seconds_left = MAX_BOOTSTRAP_CACHE_AGE_SECS.saturating_sub(cache_age);
     seconds_left > CACHE_REFRESH_FORCE_BEFORE_EXPIRY_SECS
+}
+
+fn fresh_cache_retry_delay_secs(now: u64, cached_at: u64) -> u64 {
+    let cache_age = now.saturating_sub(cached_at);
+    let seconds_left = MAX_BOOTSTRAP_CACHE_AGE_SECS.saturating_sub(cache_age);
+    if seconds_left <= CACHE_REFRESH_FORCE_BEFORE_EXPIRY_SECS {
+        1
+    } else {
+        (seconds_left - CACHE_REFRESH_FORCE_BEFORE_EXPIRY_SECS)
+            .min(CACHE_REFRESH_RETRY_SECS)
+            .max(1)
+    }
+}
+
+fn bootstrap_capture_deadline_secs(have_fresh_cache: bool) -> u64 {
+    if have_fresh_cache {
+        FRESH_BOOTSTRAP_REFRESH_MAX_SECS
+    } else {
+        COLD_BOOTSTRAP_REFRESH_MAX_SECS
+    }
 }
 
 fn load_bootstrap_cache(path: &Path, now: u64) -> std::io::Result<Option<(Vec<u8>, u64)>> {
@@ -1669,6 +1708,10 @@ async fn transparent_bootstrap(
         payload_prefix.len() / 1_000_000
     );
     let active_peer = node.pin_active(&ip);
+    let _active_guard = ActivePinGuard {
+        node: node.clone(),
+        peer: active_peer,
+    };
     let tap_permit = if ctx.cache_coldstart {
         ctx.capture_tap.clone().try_acquire_owned().ok()
     } else {
@@ -1703,7 +1746,6 @@ async fn transparent_bootstrap(
         }
         splice(down, upc).await;
     }
-    node.clear_active_if_current(&active_peer);
 }
 
 // 4001 with a bootstrap greet (send_abci:true). With --cache + a fresh captured snapshot, serve
@@ -1946,10 +1988,11 @@ pub(crate) async fn run_gateway(
                             let cache_age = now.saturating_sub(cached_at);
                             let seconds_left =
                                 MAX_BOOTSTRAP_CACHE_AGE_SECS.saturating_sub(cache_age);
+                            let delay = fresh_cache_retry_delay_secs(now, cached_at);
                             eprintln!(
-                                "[gw] bootstrap cache refresh skipped: only {live_count} validated live peer(s); cache expires in {seconds_left}s"
+                                "[gw] bootstrap cache refresh skipped: only {live_count} validated live peer(s); cache expires in {seconds_left}s; retry in {delay}s"
                             );
-                            tokio::time::sleep(Duration::from_secs(CACHE_REFRESH_RETRY_SECS)).await;
+                            tokio::time::sleep(Duration::from_secs(delay)).await;
                             continue;
                         } else if live_count < MIN_LIVE_PEERS_FOR_CACHE_REFRESH {
                             let cache_age = now.saturating_sub(cached_at);
@@ -1988,9 +2031,22 @@ pub(crate) async fn run_gateway(
                     } else {
                         COLD_CACHE_REFRESH_MAX_INFLIGHT
                     };
-                    let got = if let Some((blob, ip)) =
-                        capture_bootstrap_raced(peers, max_inflight, Duration::from_secs(40)).await
+                    let capture_deadline_secs = bootstrap_capture_deadline_secs(have_fresh_cache);
+                    let raced = match timeout(
+                        Duration::from_secs(capture_deadline_secs),
+                        capture_bootstrap_raced(peers, max_inflight, Duration::from_secs(40)),
+                    )
+                    .await
                     {
+                        Ok(result) => result,
+                        Err(_) => {
+                            eprintln!(
+                                "[gw] bootstrap race: exceeded {capture_deadline_secs}s total deadline, aborting"
+                            );
+                            None
+                        }
+                    };
+                    let got = if let Some((blob, ip)) = raced {
                         eprintln!(
                             "[gw] bootstrap captured: {} MB via {} (raced)",
                             blob.len() / 1_000_000,
@@ -2025,7 +2081,7 @@ pub(crate) async fn run_gateway(
                         fails = 0;
                         CACHE_REFRESH_SECS
                     } else if have_fresh_cache {
-                        CACHE_REFRESH_RETRY_SECS
+                        fresh_cache_retry_delay_secs(unix_secs(), cached_at)
                     } else {
                         // A failed initial capture may already have consumed quota/bandwidth across
                         // a full rotated window. Back off in minutes, not seconds, so --cache does
@@ -2184,6 +2240,45 @@ mod tests {
     }
 
     #[test]
+    fn fresh_cache_retry_delay_does_not_sleep_past_expiry_margin() {
+        let cached_at = 1_000_000;
+
+        assert_eq!(
+            fresh_cache_retry_delay_secs(cached_at + CACHE_REFRESH_SECS, cached_at),
+            CACHE_REFRESH_RETRY_SECS
+        );
+        assert_eq!(
+            fresh_cache_retry_delay_secs(
+                cached_at + MAX_BOOTSTRAP_CACHE_AGE_SECS
+                    - CACHE_REFRESH_FORCE_BEFORE_EXPIRY_SECS
+                    - 1,
+                cached_at
+            ),
+            1
+        );
+        assert_eq!(
+            fresh_cache_retry_delay_secs(cached_at + MAX_BOOTSTRAP_CACHE_AGE_SECS - 10, cached_at),
+            1
+        );
+    }
+
+    #[test]
+    fn cold_capture_deadline_is_not_the_short_fresh_refresh_deadline() {
+        assert_eq!(
+            bootstrap_capture_deadline_secs(true),
+            FRESH_BOOTSTRAP_REFRESH_MAX_SECS
+        );
+        assert_eq!(
+            bootstrap_capture_deadline_secs(false),
+            COLD_BOOTSTRAP_REFRESH_MAX_SECS
+        );
+        assert!(
+            bootstrap_capture_deadline_secs(false) > bootstrap_capture_deadline_secs(true),
+            "cold cache fill must allow valid multi-GB bootstraps that exceed the fresh refresh cap"
+        );
+    }
+
+    #[test]
     fn client_block_fetch_forward_is_always_used_for_4002() {
         assert!(should_fetch_forward_client_blocks(4002));
         assert!(!should_fetch_forward_client_blocks(4001));
@@ -2254,6 +2349,35 @@ mod tests {
 
         node.clear_active_if_current(&second);
         assert!(node.active_snapshot().is_none());
+    }
+
+    #[test]
+    fn active_pin_guard_clears_pin_on_early_drop() {
+        let node = Arc::new(NodeState::new("10.0.0.1".parse().unwrap(), 1));
+        let peer = node.pin_active("1.1.1.1");
+        {
+            let _guard = ActivePinGuard {
+                node: node.clone(),
+                peer,
+            };
+            assert!(node.has_active_session());
+            // guard drops here, as it would on an early `return` out of transparent_bootstrap
+        }
+        assert!(!node.has_active_session());
+    }
+
+    #[test]
+    fn active_pin_guard_leaves_a_newer_pin_untouched() {
+        let node = Arc::new(NodeState::new("10.0.0.1".parse().unwrap(), 1));
+        let stale = node.pin_active("1.1.1.1");
+        let guard = ActivePinGuard {
+            node: node.clone(),
+            peer: stale,
+        };
+        // a fresh session pins over the guarded one before it drops (e.g. node reconnected)
+        let fresh = node.pin_active("2.2.2.2");
+        drop(guard);
+        assert_eq!(node.active_snapshot(), Some(fresh));
     }
 
     #[test]

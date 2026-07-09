@@ -67,6 +67,11 @@ services:
       HL_SELF_IP: "${HL_SELF_IP:-}"
       # optional, comma-separated tcp_lz4_stats dirs (co-located only; see the colocated overlay)
       HL_STATS_DIR: "${HL_STATS_DIR:-}"
+      # trim the steady-state pool: ~90 live peers is plenty of rotation headroom for the
+      # 4-minute cache refresh while cutting probe traffic ~2.7x vs the 256 default
+      PEERD_PROBE_MAX_PER_CYCLE: "96"
+      PEERD_CRAWL_MAX_QUERIES: "50"
+      PEERD_CRAWL_DEPTH: "2"
     networks:
       - gwnet
     volumes:

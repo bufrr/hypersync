@@ -564,6 +564,50 @@ fn empty_pool_sleep_secs(interval: u64, empty_live_streak: u32, max_backoff: u64
         .clamp(interval, max_backoff.max(interval))
 }
 
+fn select_probe_candidates(
+    all_candidates: &[String],
+    previous_live: &[String],
+    max_per_cycle: usize,
+    cursor: &mut usize,
+) -> Vec<String> {
+    let max_per_cycle = max_per_cycle.max(1);
+    let previous_limit = (max_per_cycle / 2).max(1);
+    let candidate_set: HashSet<&str> = all_candidates.iter().map(String::as_str).collect();
+    let mut selected = Vec::new();
+    let mut seen = HashSet::new();
+
+    for ip in previous_live {
+        if selected.len() >= previous_limit {
+            break;
+        }
+        if candidate_set.contains(ip.as_str()) && seen.insert(ip.clone()) {
+            selected.push(ip.clone());
+        }
+    }
+
+    let remaining = max_per_cycle.saturating_sub(selected.len());
+    let n = all_candidates.len();
+    if remaining > 0 && n > 0 {
+        let start = *cursor % n;
+        let mut added = 0usize;
+        let mut scanned = 0usize;
+        for off in 0..n {
+            scanned = off + 1;
+            let ip = &all_candidates[(start + off) % n];
+            if seen.insert(ip.clone()) {
+                selected.push(ip.clone());
+                added += 1;
+                if added >= remaining {
+                    break;
+                }
+            }
+        }
+        *cursor = (start + scanned) % n;
+    }
+
+    selected
+}
+
 pub(crate) fn split_csv(v: &str) -> Vec<String> {
     v.split(',')
         .map(str::trim)
@@ -596,6 +640,7 @@ pub(crate) async fn run_peerd(interval: u64) {
     let crawl_depth = env_usize("PEERD_CRAWL_DEPTH", 3, 1, 6);
     let crawl_max_queries = env_usize("PEERD_CRAWL_MAX_QUERIES", 200, 10, 2000);
     let crawl_concurrency = env_usize("PEERD_CRAWL_CONCURRENCY", 8, 1, 64);
+    let probe_max_per_cycle = env_usize("PEERD_PROBE_MAX_PER_CYCLE", 256, 32, 5000);
 
     let mut candidates: HashSet<String> = tokio::fs::read_to_string(&cand_path)
         .await
@@ -607,8 +652,10 @@ pub(crate) async fn run_peerd(interval: u64) {
     const PRUNE_AFTER: u32 = 50;
     let mut fail_counts: HashMap<String, u32> = HashMap::new();
     let mut empty_live_streak = 0u32;
+    let mut probe_cursor = 0usize;
 
     loop {
+        let cycle_start = Instant::now();
         // 1. discover. Primary source: the gossipRootIps API (seed) + a query_peers crawl of the
         // gossip peer graph (self-contained, no co-located node needed). tcp_lz4_stats stays as an
         // optional supplementary source. Shelling out to curl (rather than an HTTPS client) keeps
@@ -670,10 +717,23 @@ pub(crate) async fn run_peerd(interval: u64) {
         )
         .await;
 
-        // 2. probe every known candidate for live-block serving. Keep concurrency deliberately low:
-        // each candidate is cheap, but a collapsed pool should not keep punching all public peers
-        // from the same source IP in a tight burst.
-        let cand_vec: Vec<String> = candidates.iter().cloned().collect();
+        // 2. Probe a bounded slice for live-block serving. The candidate set can grow into the
+        // hundreds; probing all of it with low concurrency makes a single cycle exceed the
+        // configured interval. Keep the previous top live peers hot, then rotate through the rest
+        // so stale candidates are still aged out over multiple cycles.
+        let previous_contents = tokio::fs::read_to_string(&out_path)
+            .await
+            .unwrap_or_default();
+        let previous_live_ips = extract_ipv4(&previous_contents);
+        let mut all_candidates: Vec<String> = candidates.iter().cloned().collect();
+        all_candidates.sort();
+        let total_candidates = all_candidates.len();
+        let cand_vec = select_probe_candidates(
+            &all_candidates,
+            &previous_live_ips,
+            probe_max_per_cycle,
+            &mut probe_cursor,
+        );
         let sem = Arc::new(tokio::sync::Semaphore::new(probe_concurrency));
         let mut set: tokio::task::JoinSet<(String, LiveProbe)> = tokio::task::JoinSet::new();
         for ip in cand_vec.iter().cloned() {
@@ -728,10 +788,7 @@ pub(crate) async fn run_peerd(interval: u64) {
         });
         let ranked: Vec<String> = live.into_iter().map(|(ip, _)| ip).collect();
 
-        let previous_contents = tokio::fs::read_to_string(&out_path)
-            .await
-            .unwrap_or_default();
-        let previous_live = extract_ipv4(&previous_contents).len();
+        let previous_live = previous_live_ips.len();
         let previous_trusted = previous_peer_pool_is_trusted(&previous_contents);
         let kept_previous =
             should_keep_previous_peer_pool(ranked.len(), previous_live, previous_trusted);
@@ -746,7 +803,7 @@ pub(crate) async fn run_peerd(interval: u64) {
                 .map(|ip| format!("\"{ip}\""))
                 .collect::<Vec<_>>()
                 .join(","),
-            cand_vec.len(),
+            total_candidates,
             round_tip_json
         );
         if !kept_previous {
@@ -757,7 +814,11 @@ pub(crate) async fn run_peerd(interval: u64) {
         } else {
             empty_live_streak = 0;
         }
-        let sleep_secs = empty_pool_sleep_secs(interval, empty_live_streak, empty_backoff_max);
+        let cycle_secs = cycle_start.elapsed().as_secs();
+        let target_sleep = empty_pool_sleep_secs(interval, empty_live_streak, empty_backoff_max);
+        // Discover+probe can itself take longer than `interval` once the candidate pool grows;
+        // only sleep the remainder so cadence stays close to configured instead of interval+work.
+        let sleep_secs = target_sleep.saturating_sub(cycle_secs);
 
         // UTC HH:MM:SS from the system clock (no `date` subprocess)
         let secs = std::time::SystemTime::now()
@@ -771,7 +832,8 @@ pub(crate) async fn run_peerd(interval: u64) {
             secs % 60
         );
         let line = format!(
-            "{now} candidates={} crawl_new={} live={} round_tip={:?} pruned={} kept_previous={} probe_concurrency={} empty_streak={} sleep={}s reasons={:?} samples={:?} candidate_fallback={} top={:?}\n",
+            "{now} candidates={} probed={} crawl_new={} live={} round_tip={:?} pruned={} kept_previous={} probe_concurrency={} probe_max_per_cycle={} empty_streak={} cycle={}s sleep={}s reasons={:?} samples={:?} candidate_fallback={} top={:?}\n",
+            total_candidates,
             cand_vec.len(),
             crawl_new,
             ranked.len(),
@@ -779,7 +841,9 @@ pub(crate) async fn run_peerd(interval: u64) {
             pruned,
             kept_previous,
             probe_concurrency,
+            probe_max_per_cycle,
             empty_live_streak,
+            cycle_secs,
             sleep_secs,
             reason_counts,
             failed_samples,
@@ -901,6 +965,35 @@ mod tests {
         assert_eq!(empty_pool_sleep_secs(300, 3, 1800), 1800);
         assert_eq!(empty_pool_sleep_secs(300, 9, 1800), 1800);
         assert_eq!(empty_pool_sleep_secs(300, 1, 100), 300);
+    }
+
+    #[test]
+    fn peerd_probe_selection_prioritizes_previous_live_then_rotates_candidates() {
+        let all = ["1.1.1.1", "2.2.2.2", "3.3.3.3", "4.4.4.4", "5.5.5.5"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let previous = ["4.4.4.4", "9.9.9.9", "2.2.2.2"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let mut cursor = 0usize;
+
+        let first = select_probe_candidates(&all, &previous, 4, &mut cursor);
+        assert_eq!(first, vec!["4.4.4.4", "2.2.2.2", "1.1.1.1", "3.3.3.3"]);
+        assert_eq!(cursor, 3);
+
+        let second = select_probe_candidates(&all, &previous, 4, &mut cursor);
+        assert_eq!(second, vec!["4.4.4.4", "2.2.2.2", "5.5.5.5", "1.1.1.1"]);
+        assert_eq!(cursor, 1);
+    }
+
+    #[test]
+    fn peerd_probe_selection_handles_empty_candidates() {
+        let mut cursor = 7usize;
+        let selected = select_probe_candidates(&[], &[String::from("1.1.1.1")], 32, &mut cursor);
+        assert!(selected.is_empty());
+        assert_eq!(cursor, 7);
     }
 
     #[test]
