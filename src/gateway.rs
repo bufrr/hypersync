@@ -443,46 +443,28 @@ async fn select_live_peer(
     None
 }
 
-// Run a 4001 push session with the node's active pin following in-session failovers: pin the
-// initial upstream, let serve_push repin through on_active_peer whenever it switches backbone
-// peers, then log the exit with the FINAL active and clear that pin. Shared by every push-serving
-// path (cache-live, live, fallback), which previously each duplicated this slot/callback dance.
+// Run a 4001 push session with the node's 4002 RPC pinned to the same upstream: pin the active
+// peer for the session's lifetime, run serve_push, log the exit, clear the pin. Shared by every
+// push-serving path (cache-live, live, fallback).
 async fn serve_push_repinned(
     down: TcpStream,
     upc: TcpStream,
     node: &Arc<NodeState>,
     mode: &str,
-    mut cfg: PushConfig,
+    cfg: PushConfig,
 ) {
-    let initial_ip = cfg.hosts[cfg.active_idx].clone();
-    let active_slot = Arc::new(Mutex::new(Some(node.pin_active(&initial_ip))));
-    cfg.on_active_peer = Some({
-        let node = node.clone();
-        let active_slot = active_slot.clone();
-        Arc::new(move |ip: &str| {
-            let peer = node.pin_active(ip);
-            *active_slot.lock().unwrap() = Some(peer);
-        })
-    });
+    let active_ip = cfg.hosts[cfg.active_idx].clone();
+    let active_peer = node.pin_active(&active_ip);
     let exit_reason = serve_push(down, upc, cfg).await;
-    let final_active = active_slot
-        .lock()
-        .unwrap()
-        .as_ref()
-        .map(|peer| peer.ip.clone())
-        .unwrap_or(initial_ip);
     eprintln!(
         "[gw] [{}] 4001 push session ended active_peer={} mode={} reason={}",
-        node.ip, final_active, mode, exit_reason
+        node.ip, active_ip, mode, exit_reason
     );
-    let active_to_clear = active_slot.lock().unwrap().take();
-    if let Some(peer) = active_to_clear {
-        node.clear_active_if_current(&peer);
-    }
+    node.clear_active_if_current(&active_peer);
 }
 
 // The push host set: the vetted live peer first (active backbone), padded with other pool peers
-// up to the live-upstream budget so in-session failover has somewhere to go.
+// up to the live-upstream budget for the (currently disabled) shadow block sources.
 fn build_push_hosts(live_ip: &str, peers: &[String], n_live: usize) -> Vec<String> {
     let mut hosts = vec![live_ip.to_string()];
     for p in peers {
@@ -531,13 +513,11 @@ async fn serve_push_4001_fallback(
                 hosts: Arc::new(vec![ip.clone()]),
                 active_idx: 0,
                 port: 4001,
-                node_greeting: greet,
                 prefetched_greeting: Some(greeting),
                 prefetched_frames: Vec::new(),
                 initial_last_forwarded,
                 live_floor: node.live_floor.clone(),
                 net_round_tip,
-                on_active_peer: None,
             },
         )
         .await;
@@ -1655,13 +1635,11 @@ async fn replay_cache_then_live(
                 hosts: Arc::new(hosts),
                 active_idx: 0,
                 port: 4001,
-                node_greeting: GREET_FALSE,
                 prefetched_greeting: Some(live.greeting),
                 prefetched_frames: live.prefetched_frames,
                 initial_last_forwarded: cache_floor,
                 live_floor: node.live_floor.clone(),
                 net_round_tip: ctx.net_round_tip.clone(),
-                on_active_peer: None,
             },
         )
         .await;
@@ -1806,13 +1784,11 @@ async fn handle_4001_live(
                     hosts: Arc::new(hosts),
                     active_idx: 0,
                     port: 4001,
-                    node_greeting: greet,
                     prefetched_greeting: Some(live.greeting),
                     prefetched_frames: live.prefetched_frames,
                     initial_last_forwarded: 0,
                     live_floor: node.live_floor.clone(),
                     net_round_tip: ctx.net_round_tip.clone(),
-                    on_active_peer: None,
                 },
             )
             .await;
@@ -1916,7 +1892,7 @@ pub(crate) async fn run_gateway(
             "transparent"
         },
         if push {
-            "block-push(transparent active backbone + shadow-disabled + active-failover)"
+            "block-push(transparent active backbone + shadow-disabled)"
         } else {
             "transparent splice"
         },

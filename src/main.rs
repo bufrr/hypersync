@@ -104,7 +104,8 @@ async fn main() {
         // full P2P gateway: reads the node's OWN peer file (path arg) for its upstream pool, then
         // relays bootstrap/live/RPC through an active peer, with optional bootstrap cache.
         let node_peer_file = args.get(2).cloned().unwrap_or_else(|| "/nodepeers".into());
-        // --push: use serve_push's active transparent backbone and active failover. Shadow
+        // --push: use serve_push's active transparent backbone; an active-stream stall/death
+        //   tears the session down so the node reconnects and a fresh active is pinned. Shadow
         //   multi-source injection is currently disabled, so --live N is only a future capacity knob.
         // --cache: additionally capture the bootstrap and replay it on a node cold-start, avoiding the
         //   per-IP abci_state rate-limit on node restart. Trade-off: a cache-cold-started node has no
