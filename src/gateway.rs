@@ -224,31 +224,95 @@ struct BootstrapPeerSelection {
     abci_len: usize,
 }
 
+// Stage-labels a timeout+io result so selection failures can be summarized by cause instead of
+// being swallowed ("no peer serving abci_state" alone hides whether peers declined, timed out,
+// or closed early).
+fn stage<T>(
+    r: Result<std::io::Result<T>, tokio::time::error::Elapsed>,
+    what: &str,
+) -> Result<T, String> {
+    match r {
+        Err(_) => Err(format!("{what} timeout")),
+        Ok(Err(e)) => Err(format!("{what}: {e}")),
+        Ok(Ok(v)) => Ok(v),
+    }
+}
+
+// Bucket a peer-attempt failure string for the selection summary logs.
+fn peer_error_class(e: &str) -> &'static str {
+    if e.contains("peer full") {
+        "peer_full"
+    } else if e.contains("not serving abci_state") {
+        "small_frame"
+    } else if e.contains("no live block") {
+        "no_block"
+    } else if e.contains("connect") {
+        "connect_fail"
+    } else if e.contains("state prefetch") {
+        "prefetch_fail"
+    } else if e.contains("failed to fill whole buffer") || e.contains("early eof") {
+        "eof"
+    } else if e.contains("timeout") || e.contains("deadline has elapsed") {
+        "timeout"
+    } else {
+        "other"
+    }
+}
+
+fn summarize_peer_errors(tried: usize, errs: &[String]) -> String {
+    let mut counts: Vec<(&'static str, usize)> = Vec::new();
+    for e in errs {
+        let class = peer_error_class(e);
+        match counts.iter_mut().find(|(c, _)| *c == class) {
+            Some((_, n)) => *n += 1,
+            None => counts.push((class, 1)),
+        }
+    }
+    counts.sort_by(|a, b| b.1.cmp(&a.1));
+    let mut out = format!("tried={tried}");
+    for (class, n) in counts {
+        out.push_str(&format!(" {class}={n}"));
+    }
+    out
+}
+
 async fn try_fast_bootstrap_peer(
     ip: String,
     greet: [u8; 8],
-) -> std::io::Result<BootstrapPeerSelection> {
-    let mut upc = timeout(
-        Duration::from_secs(5),
-        TcpStream::connect(format!("{ip}:4001")),
-    )
-    .await??;
+) -> Result<BootstrapPeerSelection, String> {
+    let mut upc = stage(
+        timeout(
+            Duration::from_secs(5),
+            TcpStream::connect(format!("{ip}:4001")),
+        )
+        .await,
+        "connect",
+    )?;
     upc.set_nodelay(true).ok();
-    timeout(Duration::from_secs(5), upc.write_all(&greet)).await??;
+    stage(
+        timeout(Duration::from_secs(5), upc.write_all(&greet)).await,
+        "greet write",
+    )?;
 
     let mut hdr = [0u8; 5];
-    timeout(Duration::from_secs(12), upc.read_exact(&mut hdr)).await??;
+    stage(
+        timeout(Duration::from_secs(12), upc.read_exact(&mut hdr)).await,
+        "greeting header",
+    )?;
     let len = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as usize;
     if len <= 4_000_000 {
-        return Err(std::io::Error::other("not serving abci_state"));
+        return Err(format!("not serving abci_state (len={len})"));
     }
     let prefetch_len = len.min(BOOTSTRAP_PREFETCH_BYTES);
     let mut payload_prefix = vec![0u8; prefetch_len];
-    timeout(
-        Duration::from_secs(BOOTSTRAP_PREFETCH_SECS),
-        upc.read_exact(&mut payload_prefix),
-    )
-    .await??;
+    stage(
+        timeout(
+            Duration::from_secs(BOOTSTRAP_PREFETCH_SECS),
+            upc.read_exact(&mut payload_prefix),
+        )
+        .await,
+        "state prefetch",
+    )?;
 
     Ok(BootstrapPeerSelection {
         upc,
@@ -269,10 +333,12 @@ async fn select_fast_bootstrap_peer(
         return None;
     }
     let limit = n.min(BOOTSTRAP_SELECT_MAX_PEERS);
-    let deadline = Instant::now() + Duration::from_secs(BOOTSTRAP_SELECT_DEADLINE_SECS);
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(BOOTSTRAP_SELECT_DEADLINE_SECS);
     let mut launched = 0usize;
     let mut in_flight = 0usize;
     let mut set = tokio::task::JoinSet::new();
+    let mut fails: Vec<String> = Vec::new();
 
     loop {
         while launched < limit && in_flight < BOOTSTRAP_SELECT_MAX_INFLIGHT {
@@ -291,9 +357,13 @@ async fn select_fast_bootstrap_peer(
         match timeout(remaining, set.join_next()).await {
             Ok(Some(joined)) => {
                 in_flight = in_flight.saturating_sub(1);
-                if let Ok(Ok(selected)) = joined {
-                    set.abort_all();
-                    return Some(selected);
+                match joined {
+                    Ok(Ok(selected)) => {
+                        set.abort_all();
+                        return Some(selected);
+                    }
+                    Ok(Err(e)) => fails.push(e),
+                    Err(e) => fails.push(format!("join: {e}")),
                 }
             }
             Ok(None) => break,
@@ -301,6 +371,11 @@ async fn select_fast_bootstrap_peer(
         }
     }
     set.abort_all();
+    eprintln!(
+        "[gw] bootstrap selection: no state-serving peer in {:.1}s ({})",
+        started.elapsed().as_secs_f64(),
+        summarize_peer_errors(launched, &fails)
+    );
     None
 }
 
@@ -400,6 +475,11 @@ async fn open_peer_relationship(ip: &str, wait: Duration) -> std::io::Result<Tcp
     Ok(connect_and_greet_4001(ip, GREET_FALSE, wait).await?.0)
 }
 
+// Bounded by ONE LIVE_SELECT_WAIT total: hl-node abandons a fresh 4001 connection ~5s after
+// sending its greeting, so the node is only saved by a greeting that arrives inside that window.
+// Scanning the whole pool in batches (up to ~70-90s on a bad pool) just burns the node's deadline
+// against an already-dead downstream — the first vetted peer wins, and on a dry scan the caller's
+// fallback still has time to greet the node.
 async fn select_live_peer(
     peers: &[String],
     start: usize,
@@ -410,36 +490,48 @@ async fn select_live_peer(
     if peers.is_empty() {
         return None;
     }
-    let batch_size = LIVE_SELECT_MAX_PARALLEL.min(peers.len());
-    let mut offset = 0usize;
-    while offset < peers.len() {
-        let mut set = tokio::task::JoinSet::new();
-        for k in 0..batch_size.min(peers.len() - offset) {
-            let ip = peers[(start + offset + k) % peers.len()].clone();
+    let started = Instant::now();
+    let deadline = started + LIVE_SELECT_WAIT;
+    let mut set = tokio::task::JoinSet::new();
+    let mut launched = 0usize;
+    let mut fails: Vec<String> = Vec::new();
+    loop {
+        while launched < peers.len() && set.len() < LIVE_SELECT_MAX_PARALLEL {
+            let wait = deadline.saturating_duration_since(Instant::now());
+            if wait.is_zero() {
+                break;
+            }
+            let ip = peers[(start + launched) % peers.len()].clone();
             set.spawn(open_live_peer_session_with_greet(
                 ip,
                 greet,
-                LIVE_SELECT_WAIT,
+                wait,
                 min_round_exclusive,
                 net_tip,
             ));
+            launched += 1;
         }
-        let mut best = None;
-        while let Some(joined) = set.join_next().await {
-            if let Ok(Ok(session)) = joined {
-                if best
-                    .as_ref()
-                    .is_none_or(|prev: &LivePeerSession| session.first_round > prev.first_round)
-                {
-                    best = Some(session);
-                }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if set.is_empty() || remaining.is_zero() {
+            break;
+        }
+        match timeout(remaining, set.join_next()).await {
+            Ok(Some(Ok(Ok(session)))) => {
+                set.abort_all();
+                return Some(session);
             }
+            Ok(Some(Ok(Err(e)))) => fails.push(e.to_string()),
+            Ok(Some(Err(e))) => fails.push(format!("join: {e}")),
+            Ok(None) => break,
+            Err(_) => break,
         }
-        if best.is_some() {
-            return best;
-        }
-        offset += batch_size;
     }
+    set.abort_all();
+    eprintln!(
+        "[gw] live selection: no vetted peer in {:.1}s ({})",
+        started.elapsed().as_secs_f64(),
+        summarize_peer_errors(launched, &fails)
+    );
     None
 }
 
@@ -496,7 +588,11 @@ async fn serve_push_4001_fallback(
 ) {
     for k in 0..peers.len() {
         let ip = peers[(start + k) % peers.len()].clone();
-        let Ok((upc, greeting)) = connect_and_greet_4001(&ip, greet, Duration::from_secs(5)).await
+        // Short per-peer budget: the node abandons the connection ~5s after greeting and the
+        // failed live selection already spent most of that; one dead candidate at 5s here would
+        // guarantee the node times out. Pool peers are live-probed, so 1.5s is plenty.
+        let Ok((upc, greeting)) =
+            connect_and_greet_4001(&ip, greet, Duration::from_millis(1500)).await
         else {
             continue;
         };
@@ -1508,9 +1604,36 @@ struct GatewayCtx {
     disk_cache_path: Option<PathBuf>,
     capture_tap: Arc<tokio::sync::Semaphore>,
     net_round_tip: Arc<AtomicU32>,
+    // IPs that recently served a full abci_state (most recent first, capped). Tried before the
+    // rotated pool window on the next bootstrap: when most of the pool declines to serve state
+    // (the common failure), a known server cuts recovery from minutes of rescanning to seconds.
+    state_servers: Arc<Mutex<Vec<String>>>,
     cache_coldstart: bool,
     push: bool,
     n_live: usize,
+}
+
+const STATE_SERVER_MEMORY: usize = 8;
+
+fn remember_state_server(list: &Mutex<Vec<String>>, ip: &str) {
+    let mut l = list.lock().unwrap();
+    l.retain(|x| x != ip);
+    l.insert(0, ip.to_string());
+    l.truncate(STATE_SERVER_MEMORY);
+}
+
+// Known state servers first, then the pool rotated from `start`, deduped. A remembered peer that
+// is now rate-limited answers with a tiny status frame and fails the attempt fast, so heading the
+// list costs little even when stale.
+fn bootstrap_candidates(remembered: Vec<String>, pool: &[String], start: usize) -> Vec<String> {
+    let mut out = remembered;
+    for k in 0..pool.len() {
+        let ip = &pool[(start + k) % pool.len()];
+        if !out.contains(ip) {
+            out.push(ip.clone());
+        }
+    }
+    out
 }
 
 // Decide whether THIS bootstrap greet gets the cached blob replayed (fresh cache + no active
@@ -1667,8 +1790,14 @@ async fn transparent_bootstrap(
     greet: [u8; 8],
     ctx: GatewayCtx,
 ) {
-    let start = ctx.rr.fetch_add(1, Ordering::Relaxed);
-    let Some(selected) = select_fast_bootstrap_peer(&peers, start, greet).await else {
+    // Advance rr by the whole scan window: retries during an incident sweep fresh pool peers
+    // instead of re-dialing the same ~32 decliners (and their rate limits) shifted by one.
+    let start = ctx
+        .rr
+        .fetch_add(BOOTSTRAP_SELECT_MAX_PEERS, Ordering::Relaxed);
+    let remembered = ctx.state_servers.lock().unwrap().clone();
+    let candidates = bootstrap_candidates(remembered, &peers, start);
+    let Some(selected) = select_fast_bootstrap_peer(&candidates, 0, greet).await else {
         eprintln!("[gw] [{}] no peer serving abci_state right now", node.ip);
         return;
     };
@@ -1685,6 +1814,7 @@ async fn transparent_bootstrap(
         abci_len,
         payload_prefix.len() / 1_000_000
     );
+    remember_state_server(&ctx.state_servers, &ip);
     let active_peer = node.pin_active(&ip);
     let _active_guard = ActivePinGuard {
         node: node.clone(),
@@ -2083,6 +2213,7 @@ pub(crate) async fn run_gateway(
         disk_cache_path,
         capture_tap,
         net_round_tip,
+        state_servers: Arc::new(Mutex::new(Vec::new())),
         cache_coldstart,
         push,
         n_live,
@@ -2459,5 +2590,63 @@ mod tests {
         assert!(!reg.nodes.lock().unwrap().contains_key(&ip_b));
         assert!(reg.nodes.lock().unwrap().contains_key(&ip_c));
         drop(a1_guard);
+    }
+
+    #[test]
+    fn bootstrap_candidates_prefer_remembered_state_servers() {
+        let pool: Vec<String> = ["1.1.1.1", "2.2.2.2", "3.3.3.3", "4.4.4.4"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        // remembered heads the list, pool rotates from start, remembered ip deduped from pool
+        let out =
+            bootstrap_candidates(vec!["3.3.3.3".to_string(), "9.9.9.9".to_string()], &pool, 1);
+        assert_eq!(out, ["3.3.3.3", "9.9.9.9", "2.2.2.2", "4.4.4.4", "1.1.1.1"]);
+        // no memory -> plain rotation
+        let out = bootstrap_candidates(Vec::new(), &pool, 2);
+        assert_eq!(out, ["3.3.3.3", "4.4.4.4", "1.1.1.1", "2.2.2.2"]);
+    }
+
+    #[test]
+    fn remember_state_server_dedups_most_recent_first_and_caps() {
+        let list = Mutex::new(Vec::new());
+        for i in 0..(STATE_SERVER_MEMORY + 3) {
+            remember_state_server(&list, &format!("10.0.0.{i}"));
+        }
+        remember_state_server(&list, "10.0.0.5"); // re-serve moves to front, no duplicate
+        let l = list.lock().unwrap();
+        assert_eq!(l.len(), STATE_SERVER_MEMORY);
+        assert_eq!(l[0], "10.0.0.5");
+        assert_eq!(l.iter().filter(|ip| *ip == "10.0.0.5").count(), 1);
+    }
+
+    #[test]
+    fn selection_failure_summary_buckets_by_cause() {
+        let errs: Vec<String> = [
+            "not serving abci_state (len=57)",
+            "not serving abci_state (len=13)",
+            "connect timeout",
+            "connect: Connection refused (os error 111)",
+            "greeting header: failed to fill whole buffer",
+            "greeting header timeout",
+            "peer full",
+            "no live block before deadline",
+            "deadline has elapsed",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let s = summarize_peer_errors(12, &errs);
+        assert!(s.starts_with("tried=12"), "{s}");
+        for part in [
+            "small_frame=2",
+            "connect_fail=2",
+            "eof=1",
+            "timeout=2",
+            "peer_full=1",
+            "no_block=1",
+        ] {
+            assert!(s.contains(part), "missing {part} in {s}");
+        }
     }
 }

@@ -84,3 +84,47 @@ Final state: hypersync-gw (172.28.0.10, static) + hypersync-peerd under compose 
 "hypersync" with colocated overlay; node dials 172.28.0.10 via bind-mounted
 override_gossip_config.json (survives recreation); main.rs split into 5 modules + dispatch;
 main @ 899b240.
+
+# Task: revert --push in-session active failover to session teardown (2026-07-10)
+
+Context: 10h no-cache soak (sample 420) — in-session hot swap of the active push peer fed the
+node a block from the replacement peer's tip; node saw `Client block invalid parent round`,
+disconnected anyway. README:15 always specified teardown; commit 7377800 diverged.
+
+- [x] serve_push: both failover arms (active pump death, node-outbound write failure) now break
+      → session teardown; node reconnects and gateway pins a fresh vetted active
+- [x] kept bounded 5s write timeout on node->active (detects half-broken peers that send blocks
+      but stop draining outbound); timeout now ends the session instead of failing over
+- [x] deleted hot-swap machinery: connect_next_active/connect_replacement_active,
+      ActiveWriteHalf generation swap, outbound_fail channel, PushConfig.node_greeting,
+      on_active_peer callback (+ serve_push_repinned slot dance); net -146 lines
+- [x] updated stale comments/log strings (main.rs --push, gateway startup banner, IDLE comment)
+- [x] regression test push_active_death_tears_session_down: active dies → exit reason
+      "active stream error", node sees EOF (no injected frames), standby pool peer never dialed
+- [x] verified: cargo build clean, clippy (1 pre-existing manual_clamp warning on main too),
+      53/53 tests pass
+
+# Task: fix 12-min recovery gap after teardown + node child restart (2026-07-12)
+
+Context: 2026-07-11 15:19-15:32 incident (no-cache soak follow-up). Teardown itself was fine;
+recovery stacked three amplifiers: (1) select_live_peer scanned the whole pool in 4-peer/3.5s
+batches (~70-90s) with no total budget while hl-node abandons a fresh 4001 connection ~5s after
+greeting; (2) hl-visor child restart forced a full abci_state bootstrap, and each retry re-dialed
+almost the same 32 decliners (rr advanced by 1) with no memory of who serves state; (3) failures
+were logged only as "no peer serving abci_state right now".
+
+- [x] select_live_peer: single LIVE_SELECT_WAIT (3.5s) total budget, rolling 4-wide dials,
+      first vetted peer wins; dry scan logs a failure summary and falls back fast
+- [x] serve_push_4001_fallback: per-peer connect_and_greet budget 5s -> 1.5s so one dead
+      candidate can't blow the node's remaining greeting window
+- [x] bootstrap: GatewayCtx.state_servers remembers last 8 IPs that served a full abci_state
+      (most recent first); tried before the rotated pool window on the next bootstrap
+- [x] bootstrap retries advance rr by the 32-peer scan window instead of 1 (sweep fresh peers,
+      stop hammering the same decliners/rate limits)
+- [x] selection failure summaries: try_fast_bootstrap_peer errors stage-labeled (connect /
+      greeting header / small_frame len / state prefetch), summarize_peer_errors buckets both
+      live+bootstrap scans, e.g. "tried=32 small_frame=20 connect_fail=8 timeout=3"
+- [x] README --cache bullet: recommended in production (child restart otherwise depends on
+      external state-server availability)
+- [x] tests: bootstrap_candidates ordering/dedup, remember_state_server LRU cap, summary
+      bucketing; 56/56 pass, clippy clean (1 pre-existing manual_clamp)
