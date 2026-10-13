@@ -7,8 +7,10 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
+use crate::priority::gwlog;
 use crate::protocol::{
-    block_round, is_plausible_mainnet_round, RoundDedup, RoundForwardGate, GREET_FALSE,
+    block_round, is_plausible_mainnet_round, round_lag_from_tip, RoundDedup, RoundForwardGate,
+    ACTIVE_ROUND_MAX_LAG, GREET_FALSE,
 };
 
 pub(crate) async fn serve(mut down: TcpStream, upstreams: Vec<String>) -> std::io::Result<()> {
@@ -114,14 +116,31 @@ async fn pump(
 }
 
 // Bidirectionally relay a node connection and its chosen upstream until either side closes.
-pub(crate) async fn splice(down: TcpStream, upc: TcpStream) {
+// Returns (bytes upstream->node, bytes node->upstream); the first count is best-effort when the
+// node side closes first.
+pub(crate) async fn splice(down: TcpStream, upc: TcpStream) -> (u64, u64) {
     let (mut dr, mut dw) = down.into_split();
     let (mut ur, mut uw) = upc.into_split();
-    let h = tokio::spawn(async move {
-        let _ = tokio::io::copy(&mut ur, &mut dw).await;
-    });
-    let _ = tokio::io::copy(&mut dr, &mut uw).await;
+    let to_node = Arc::new(AtomicU64::new(0));
+    let h = {
+        let to_node = to_node.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 256 * 1024];
+            loop {
+                let n = match ur.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
+                if dw.write_all(&buf[..n]).await.is_err() {
+                    break;
+                }
+                to_node.fetch_add(n as u64, Ordering::Relaxed);
+            }
+        })
+    };
+    let to_peer = tokio::io::copy(&mut dr, &mut uw).await.unwrap_or(0);
     h.abort();
+    (to_node.load(Ordering::Relaxed), to_peer)
 }
 
 // Pick the next non-bad upstream after `cur` (skips peers in cooldown). None => no healthy alternative.
@@ -138,9 +157,10 @@ fn pick_next(cur: usize, bad_until: &[AtomicU64], now_ms: u64, n: usize) -> Opti
 // Failover transparent proxy. Default (push=false): the local node dials the gateway (4000-4010,
 // outbound) and the gateway transparently proxies to the ACTIVE upstream peer; a health monitor
 // rotates to the next healthy peer on stall/dial-failure ("选择其他peer替代").
-// With push=true: on the heavy block channel (4001) the gateway ALSO connects to all other peers and
-// merge-pushes their live blocks (round-dedup, fastest-first) for lower block-reception latency; the
-// active peer connection stays transparent for the node's outbound + control/state/RPC frames.
+// With push=true: the heavy block channel (4001) runs serve_push — live blocks from the active peer
+// are round-gated (dedup + live floor) before reaching the node, while the active connection stays
+// transparent for the node's outbound + control/state/RPC frames. Shadow peers are compiled out
+// (ENABLE_SHADOW_PUSH), so this does not merge blocks from other peers.
 // (Inbound push to the node is not implemented — verified: HL nodes only ingest from peers they dial.)
 pub(crate) async fn run_proxy(upstreams: Vec<String>, push: bool) {
     let hosts: Vec<String> = upstreams
@@ -277,8 +297,8 @@ pub(crate) async fn run_proxy(upstreams: Vec<String>, push: bool) {
                             // state frame the peer sends first.
                             splice(down, upc).await;
                         } else {
-                            // live channel: merge blocks from active + all other peers (round-dedup,
-                            // fastest-first); active stays transparent for node->peer + control/RPC.
+                            // live channel: round-gated blocks from the active peer (shadows are
+                            // compiled out); active stays transparent for node->peer + control/RPC.
                             let active_peer = hosts[idx].clone();
                             let exit_reason = serve_push(
                                 down,
@@ -345,10 +365,12 @@ pub(crate) async fn run_proxy(upstreams: Vec<String>, push: bool) {
 
 // Block-push serving (push mode, heavy channel): the active peer connection is transparent for the
 // node's outbound and the active peer's control / abci_state / RPC frames. Shadow peer injection is
-// disabled by default: round-only dedup cannot prove proposer/fork correctness, and a wrong shadow
+// compiled out (ENABLE_SHADOW_PUSH = false, no runtime switch): round-only dedup cannot prove proposer/fork correctness, and a wrong shadow
 // block can poison the node even when the active transparent peer is healthy.
 const PUSH_MERGE_QUEUE_FRAMES: usize = 256;
 const ENABLE_SHADOW_PUSH: bool = false;
+// Generous: the node normally drains 4001 continuously; only a stuck/half-open node hits this.
+const NODE_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(crate) struct PushConfig {
     pub(crate) hosts: Arc<Vec<String>>,
@@ -363,15 +385,113 @@ pub(crate) struct PushConfig {
     pub(crate) net_round_tip: Arc<AtomicU32>,
 }
 
+// Per-session accounting of what the active stream forwarded and what the round gates dropped
+// (W2a). A healthy single-peer stream never repeats a block round, so in steady state every drop
+// is either a cache cold-start backlog frame (floor) or a frame block_round misreads as a block —
+// for example a split_client_blocks mempool piece. Those are the numbers to check on swap day
+// before trusting --push with QuickNode's mempool stream.
+#[derive(Default)]
+pub(crate) struct PushStats {
+    pub(crate) control_fwd: AtomicU64,
+    pub(crate) blocks_fwd: AtomicU64,
+    // type-1 frames with no decodable round: forwarded untouched; non-zero = non-block data
+    // (likely split mempool) is flowing
+    pub(crate) data_noround_fwd: AtomicU64,
+    pub(crate) bytes_fwd: AtomicU64,
+    pub(crate) drop_floor: AtomicU64,
+    pub(crate) drop_gate: AtomicU64,
+    drop_samples: AtomicU64,
+}
+
+const PUSH_DROP_SAMPLES: u64 = 5;
+
+impl PushStats {
+    pub(crate) fn summary(&self) -> String {
+        let blocks = self.blocks_fwd.load(Ordering::Relaxed);
+        let noround = self.data_noround_fwd.load(Ordering::Relaxed);
+        format!(
+            "ctl={} blocks={blocks} data_noround={noround} bytes={} drop_floor={} drop_dup={}{}",
+            self.control_fwd.load(Ordering::Relaxed),
+            self.bytes_fwd.load(Ordering::Relaxed),
+            self.drop_floor.load(Ordering::Relaxed),
+            self.drop_gate.load(Ordering::Relaxed),
+            no_block_rounds_alarm(blocks, noround),
+        )
+    }
+
+    fn forwarded(&self, frame: &[u8], kind: FrameKindSeen) {
+        let c = match kind {
+            FrameKindSeen::Control => &self.control_fwd,
+            FrameKindSeen::Block => &self.blocks_fwd,
+            FrameKindSeen::DataNoRound => &self.data_noround_fwd,
+        };
+        c.fetch_add(1, Ordering::Relaxed);
+        self.bytes_fwd
+            .fetch_add(frame.len() as u64, Ordering::Relaxed);
+    }
+
+    // Count a drop and log the first few per session with enough of the frame to classify it
+    // later (W2b): length, round, last forwarded/floor, and the first payload bytes.
+    fn dropped(&self, why: &str, frame: &[u8], round: u32, last: u32, floor: u32) {
+        match why {
+            "floor" => &self.drop_floor,
+            _ => &self.drop_gate,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+        if self.drop_samples.fetch_add(1, Ordering::Relaxed) < PUSH_DROP_SAMPLES {
+            let head: String = frame
+                .iter()
+                .skip(5)
+                .take(24)
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            gwlog!(
+                "[gw] push drop sample reason={why} len={} round={round} last_forwarded={last} floor={floor} payload_head={head}",
+                frame.len().saturating_sub(5)
+            );
+        }
+    }
+}
+
+// Plenty of data frames but not one decodable block round means block_round no longer matches
+// the wire format (it happened once: HL moved the round between 2026-07 and 2026-10). Every
+// round-based guard (vetting, lag, floor) is blind until the decoder is fixed.
+fn no_block_rounds_alarm(blocks: u64, noround: u64) -> &'static str {
+    if blocks == 0 && noround >= 100 {
+        " ALERT=no_block_rounds_decoded(wire format change?)"
+    } else {
+        ""
+    }
+}
+
+#[derive(Clone, Copy)]
+enum FrameKindSeen {
+    Control,
+    Block,
+    DataNoRound,
+}
+
 fn spawn_active_pump(
     act_r: OwnedReadHalf,
     tx: mpsc::Sender<Vec<u8>>,
     forward_gate: Arc<tokio::sync::Mutex<RoundForwardGate>>,
     live_floor: Arc<AtomicU32>,
     net_round_tip: Arc<AtomicU32>,
+    active_round: Arc<AtomicU32>,
+    stats: Arc<PushStats>,
 ) -> tokio::task::JoinHandle<std::io::Result<()>> {
     tokio::spawn(async move {
-        pump_merge(act_r, tx, forward_gate, live_floor, net_round_tip, true).await
+        pump_merge(
+            act_r,
+            tx,
+            forward_gate,
+            live_floor,
+            net_round_tip,
+            active_round,
+            true,
+            &stats,
+        )
+        .await
     })
 }
 
@@ -384,6 +504,8 @@ pub(crate) async fn serve_push(node: TcpStream, active_conn: TcpStream, cfg: Pus
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(PUSH_MERGE_QUEUE_FRAMES);
     let (node_r, mut node_w) = node.into_split();
     let (mut act_r, act_w) = active_conn.into_split();
+    let active_round = Arc::new(AtomicU32::new(cfg.initial_last_forwarded));
+    let stats = Arc::new(PushStats::default());
     // The node's first read on 4001 is the peer's greeting ("abci_stream recv greeting", max 1000
     // bytes). Forward the active peer's greeting frame to the node BEFORE starting the shadow
     // injectors: they all share node_w, so a shadow peer's first live block can otherwise reach the
@@ -442,7 +564,9 @@ pub(crate) async fn serve_push(node: TcpStream, active_conn: TcpStream, cfg: Pus
             &forward_gate,
             &cfg.live_floor,
             &cfg.net_round_tip,
+            &active_round,
             true,
+            &stats,
         )
         .await
         {
@@ -451,6 +575,31 @@ pub(crate) async fn serve_push(node: TcpStream, active_conn: TcpStream, cfg: Pus
             return format!("prefetched frame processing failed: {e}");
         }
     }
+    // Spawned only once the session is past every early return above: a detached JoinHandle keeps
+    // the task running, so an early exit here would leak a forever-logging task per failed session.
+    let mut lag_log = {
+        let active_peer = cfg
+            .hosts
+            .get(cfg.active_idx)
+            .cloned()
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let active_round = active_round.clone();
+        let net_round_tip = cfg.net_round_tip.clone();
+        let stats = stats.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                let local_round = active_round.load(Ordering::Acquire);
+                let peers_max_round = net_round_tip.load(Ordering::Acquire);
+                let delta = i64::from(peers_max_round) - i64::from(local_round);
+                let lag = delta.max(0);
+                gwlog!(
+                    "[gw] active peer round lag active_peer={active_peer} local_round={local_round} peers_max_round={peers_max_round} delta={delta} lag={lag} max_lag={ACTIVE_ROUND_MAX_LAG} {}",
+                    stats.summary()
+                );
+            }
+        })
+    };
     // active peer -> node: the transparent backbone (forwards non-block frames + blocks). If the
     // active stream stalls or dies the session is torn down so the node reconnects and a fresh
     // active is elected — a mid-session replacement peer would start at its own tip and hand the
@@ -462,6 +611,8 @@ pub(crate) async fn serve_push(node: TcpStream, active_conn: TcpStream, cfg: Pus
         forward_gate.clone(),
         cfg.live_floor.clone(),
         cfg.net_round_tip.clone(),
+        active_round.clone(),
+        stats.clone(),
     );
     // every other peer -> node: live blocks only, deduped. Keep this off until shadow blocks are
     // validated beyond round number.
@@ -493,7 +644,9 @@ pub(crate) async fn serve_push(node: TcpStream, active_conn: TcpStream, cfg: Pus
                                 forward_gate.clone(),
                                 live_floor.clone(),
                                 net_round_tip.clone(),
+                                Arc::new(AtomicU32::new(0)),
                                 false,
+                                &PushStats::default(),
                             )
                             .await;
                         }
@@ -516,12 +669,15 @@ pub(crate) async fn serve_push(node: TcpStream, active_conn: TcpStream, cfg: Pus
     let exit_reason = loop {
         tokio::select! {
             maybe = rx.recv() => match maybe {
-                Some(buf) => {
-                    if let Err(e) = node_w.write_all(&buf).await {
-                        break format!("node write failed: {e}");
-                    }
-                }
-                // Unreachable in practice: serve_push itself keeps a tx clone alive, so the
+                // Bounded like the node -> peer direction: a half-open node (no RST) would
+                // otherwise park write_all until the kernel gives up (~15 min), holding the
+                // active pin and the priority session the whole time.
+                Some(buf) => match timeout(NODE_WRITE_TIMEOUT, node_w.write_all(&buf)).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => break format!("node write failed: {e}"),
+                    Err(_) => break "node write timeout".to_string(),
+                },
+                // Unreachable in practice: serve_push itself keeps its own tx alive, so the
                 // channel never reports closed. Kept as a safe fallback that surfaces the
                 // active pump's real exit reason.
                 None => break active_exit_reason((&mut active_task).await),
@@ -531,25 +687,33 @@ pub(crate) async fn serve_push(node: TcpStream, active_conn: TcpStream, cfg: Pus
                 Err(e) => format!("node outbound task join error: {e}"),
             },
             joined = &mut active_task => break active_exit_reason(joined),
+            joined = &mut lag_log => break match joined {
+                Ok(()) => "active lag logger ended".to_string(),
+                Err(e) => format!("active lag logger task join error: {e}"),
+            },
         }
     };
     up.abort();
     active_task.abort();
+    lag_log.abort();
     for s in shadows {
         s.abort();
     }
-    exit_reason
+    format!("{exit_reason} stats=[{}]", stats.summary())
 }
 
 // Frame reader for serve_push: forward block frames (type=1 with a round) deduped; if forward_nonblock
 // (the active peer only) also forward control / abci_state / RPC frames as-is.
+#[allow(clippy::too_many_arguments)]
 async fn pump_merge(
     mut r: tokio::net::tcp::OwnedReadHalf,
     tx: mpsc::Sender<Vec<u8>>,
     forward_gate: Arc<tokio::sync::Mutex<RoundForwardGate>>,
     live_floor: Arc<AtomicU32>,
     net_round_tip: Arc<AtomicU32>,
+    active_round: Arc<AtomicU32>,
     forward_nonblock: bool,
+    stats: &PushStats,
 ) -> std::io::Result<()> {
     // Live blocks arrive continuously (~4-15/s on mainnet). Keep this below hl-node's own abci
     // read deadline so a stalled active tears the session down early and the node reconnects
@@ -596,7 +760,8 @@ async fn pump_merge(
         };
         if typ == 1 {
             if let Some(rnd) = block_round(&frame[5..]) {
-                if !is_plausible_mainnet_round(rnd, net_round_tip.load(Ordering::Acquire)) {
+                let net_tip = net_round_tip.load(Ordering::Acquire);
+                if !is_plausible_mainnet_round(rnd, net_tip) {
                     if forward_nonblock {
                         return Err(std::io::Error::other(format!(
                             "implausible active block round {rnd}"
@@ -604,33 +769,61 @@ async fn pump_merge(
                     }
                     continue;
                 }
-                if rnd <= live_floor.load(Ordering::Acquire) {
+                if forward_nonblock {
+                    active_round.fetch_max(rnd, Ordering::AcqRel);
+                    if let Some(lag) = round_lag_from_tip(rnd, net_tip, ACTIVE_ROUND_MAX_LAG) {
+                        return Err(std::io::Error::other(format!(
+                            "active block round lagged round={rnd} net_tip={net_tip} lag={lag} max_lag={ACTIVE_ROUND_MAX_LAG}"
+                        )));
+                    }
+                }
+                let floor = live_floor.load(Ordering::Acquire);
+                if rnd <= floor {
+                    if forward_nonblock {
+                        let last = active_round.load(Ordering::Acquire);
+                        stats.dropped("floor", &frame, rnd, last, floor);
+                    }
                     continue;
                 }
                 let mut gate = forward_gate.lock().await;
-                if gate.should_forward(rnd, forward_nonblock) && tx.send(frame).await.is_err() {
-                    return Ok(());
+                let last = gate.last_forwarded();
+                if gate.should_forward(rnd, forward_nonblock) {
+                    stats.forwarded(&frame, FrameKindSeen::Block);
+                    if tx.send(frame).await.is_err() {
+                        return Ok(());
+                    }
+                } else if forward_nonblock {
+                    stats.dropped("dup", &frame, rnd, last, floor);
                 }
                 continue;
             }
-            if forward_nonblock && tx.send(frame).await.is_err() {
-                return Ok(());
+            if forward_nonblock {
+                stats.forwarded(&frame, FrameKindSeen::DataNoRound);
+                if tx.send(frame).await.is_err() {
+                    return Ok(());
+                }
             }
             continue;
         }
-        if forward_nonblock && tx.send(frame).await.is_err() {
-            return Ok(());
+        if forward_nonblock {
+            stats.forwarded(&frame, FrameKindSeen::Control);
+            if tx.send(frame).await.is_err() {
+                return Ok(());
+            }
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn process_live_frame(
     frame: Vec<u8>,
     tx: &mpsc::Sender<Vec<u8>>,
     forward_gate: &Arc<tokio::sync::Mutex<RoundForwardGate>>,
     live_floor: &Arc<AtomicU32>,
     net_round_tip: &Arc<AtomicU32>,
+    active_round: &Arc<AtomicU32>,
     forward_nonblock: bool,
+    stats: &PushStats,
 ) -> std::io::Result<()> {
     if frame.len() < 5 {
         return Err(std::io::Error::other("short prefetched frame"));
@@ -643,7 +836,8 @@ async fn process_live_frame(
     let payload = &frame[5..];
     if typ == 1 {
         if let Some(rnd) = block_round(payload) {
-            if !is_plausible_mainnet_round(rnd, net_round_tip.load(Ordering::Acquire)) {
+            let net_tip = net_round_tip.load(Ordering::Acquire);
+            if !is_plausible_mainnet_round(rnd, net_tip) {
                 if forward_nonblock {
                     return Err(std::io::Error::other(format!(
                         "implausible active block round {rnd}"
@@ -651,18 +845,45 @@ async fn process_live_frame(
                 }
                 return Ok(());
             }
-            if rnd <= live_floor.load(Ordering::Acquire) {
+            if forward_nonblock {
+                active_round.fetch_max(rnd, Ordering::AcqRel);
+                if let Some(lag) = round_lag_from_tip(rnd, net_tip, ACTIVE_ROUND_MAX_LAG) {
+                    return Err(std::io::Error::other(format!(
+                        "active block round lagged round={rnd} net_tip={net_tip} lag={lag} max_lag={ACTIVE_ROUND_MAX_LAG}"
+                    )));
+                }
+            }
+            let floor = live_floor.load(Ordering::Acquire);
+            if rnd <= floor {
+                if forward_nonblock {
+                    stats.dropped(
+                        "floor",
+                        &frame,
+                        rnd,
+                        active_round.load(Ordering::Acquire),
+                        floor,
+                    );
+                }
                 return Ok(());
             }
             let mut gate = forward_gate.lock().await;
+            let last = gate.last_forwarded();
             if !gate.should_forward(rnd, forward_nonblock) {
+                if forward_nonblock {
+                    stats.dropped("dup", &frame, rnd, last, floor);
+                }
                 return Ok(());
             }
+            stats.forwarded(&frame, FrameKindSeen::Block);
         } else if !forward_nonblock {
             return Ok(());
+        } else {
+            stats.forwarded(&frame, FrameKindSeen::DataNoRound);
         }
     } else if !forward_nonblock {
         return Ok(());
+    } else {
+        stats.forwarded(&frame, FrameKindSeen::Control);
     }
     tx.send(frame)
         .await
@@ -743,6 +964,15 @@ pub(crate) async fn run_relay(upstream: String) {
 mod tests {
     use super::*;
 
+    fn make_live_block_frame(round: u32) -> Vec<u8> {
+        let payload = crate::protocol::test_block_payload(round, 2);
+        let mut frame = Vec::with_capacity(5 + payload.len());
+        frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        frame.push(1);
+        frame.extend_from_slice(&payload);
+        frame
+    }
+
     // Regression for the sample-420 soak alert: an active-peer death must tear the whole 4001
     // session down (node sees EOF and reconnects) — never hot-swap to another pool peer, whose
     // stream would start at its own tip and hand the node a block with an unseen parent round.
@@ -809,6 +1039,135 @@ mod tests {
         assert!(
             !standby.await.unwrap(),
             "standby pool peer must never be dialed"
+        );
+    }
+
+    // W2a: the session reports what it forwarded and what the round gates dropped, so a split
+    // mempool frame misread as a stale block shows up as drop_dup instead of vanishing silently.
+    #[test]
+    fn alarm_fires_only_when_frames_flow_without_block_rounds() {
+        assert!(no_block_rounds_alarm(0, 99).is_empty());
+        assert!(no_block_rounds_alarm(0, 100).contains("ALERT"));
+        assert!(no_block_rounds_alarm(1, 5000).is_empty());
+    }
+
+    #[tokio::test]
+    async fn push_session_counts_forwarded_and_dropped_frames() {
+        let node_l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let node_addr = node_l.local_addr().unwrap();
+        let fake_node = tokio::spawn(async move {
+            let mut c = TcpStream::connect(node_addr).await.unwrap();
+            let mut got = Vec::new();
+            let _ = c.read_to_end(&mut got).await;
+            got
+        });
+        let (node_conn, _) = node_l.accept().await.unwrap();
+
+        let round = 1_400_000_000;
+        let block = make_live_block_frame(round);
+        let noround = vec![0, 0, 0, 3, 1, 0xde, 0xad, 0xbf];
+        let control = vec![0, 0, 0, 2, 0, 9, 9];
+        let mut sent = vec![0, 0, 0, 1, 0, 7];
+        sent.extend_from_slice(&block);
+        sent.extend_from_slice(&noround);
+        sent.extend_from_slice(&block); // same round again: dropped by the gate
+        sent.extend_from_slice(&control);
+        let upstream = sent.clone();
+        let peer_l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer_l.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = peer_l.accept().await.unwrap();
+            s.write_all(&upstream).await.unwrap();
+            // stay open long enough for the queue to drain; serve_push does not flush queued
+            // frames once the active stream has ended (the session is over either way)
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        });
+        let active_conn = TcpStream::connect(peer_addr).await.unwrap();
+
+        let reason = serve_push(
+            node_conn,
+            active_conn,
+            PushConfig {
+                hosts: Arc::new(vec!["127.0.0.1".into()]),
+                active_idx: 0,
+                port: 4001,
+                prefetched_greeting: None,
+                prefetched_frames: Vec::new(),
+                initial_last_forwarded: 0,
+                live_floor: Arc::new(AtomicU32::new(0)),
+                net_round_tip: Arc::new(AtomicU32::new(0)),
+            },
+        )
+        .await;
+        assert!(
+            reason.contains("ctl=1 blocks=1 data_noround=1")
+                && reason.contains("drop_floor=0 drop_dup=1"),
+            "unexpected stats: {reason}"
+        );
+        let got = fake_node.await.unwrap();
+        let mut want = vec![0, 0, 0, 1, 0, 7];
+        want.extend_from_slice(&block);
+        want.extend_from_slice(&noround);
+        want.extend_from_slice(&control);
+        assert_eq!(
+            got, want,
+            "everything but the duplicate block must reach the node, in order"
+        );
+    }
+
+    #[tokio::test]
+    async fn push_lagged_active_peer_tears_session_down() {
+        let node_l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let node_addr = node_l.local_addr().unwrap();
+        let fake_node = tokio::spawn(async move {
+            let mut c = TcpStream::connect(node_addr).await.unwrap();
+            let mut hdr = [0u8; 5];
+            c.read_exact(&mut hdr).await.unwrap();
+            let len = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as usize;
+            let mut payload = vec![0u8; len];
+            c.read_exact(&mut payload).await.unwrap();
+            let mut b = [0u8; 1];
+            c.read(&mut b).await.unwrap()
+        });
+        let (node_conn, _) = node_l.accept().await.unwrap();
+
+        let lagged_round = 1_356_000_000;
+        let net_tip = lagged_round + ACTIVE_ROUND_MAX_LAG + 1;
+        let peer_l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer_l.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = peer_l.accept().await.unwrap();
+            s.write_all(&[0, 0, 0, 1, 0, 7]).await.unwrap();
+            s.write_all(&make_live_block_frame(lagged_round))
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        });
+        let active_conn = TcpStream::connect(peer_addr).await.unwrap();
+
+        let reason = serve_push(
+            node_conn,
+            active_conn,
+            PushConfig {
+                hosts: Arc::new(vec!["127.0.0.1".into()]),
+                active_idx: 0,
+                port: 4001,
+                prefetched_greeting: None,
+                prefetched_frames: Vec::new(),
+                initial_last_forwarded: 0,
+                live_floor: Arc::new(AtomicU32::new(0)),
+                net_round_tip: Arc::new(AtomicU32::new(net_tip)),
+            },
+        )
+        .await;
+        assert!(
+            reason.contains("active block round lagged"),
+            "unexpected exit reason: {reason}"
+        );
+        assert_eq!(
+            fake_node.await.unwrap(),
+            0,
+            "node must see EOF instead of a lagged block"
         );
     }
 }

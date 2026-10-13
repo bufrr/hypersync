@@ -2,7 +2,8 @@
 //
 // Each unique consensus round is forwarded to the local node exactly once, taken from whichever
 // upstream supplies it. A round missed by one peer is filled from another => gap-free / most complete.
-// Live block (decompressed) carries the round at offset 0x5e = [0xfc][u32 LE].
+// Live block (decompressed) carries its round as the first [0xfc R][0xfc R-1][0xfc R-2] varint
+// triple in its header (protocol::block_round).
 // frame = [u32 BE L][1 type byte][L payload]; type=1 data; payload = lz4_flex(prepend_size).
 //
 // Upstreams may be "ip" (=> :4001) or "ip:port" (for local mock peers / custom ports).
@@ -10,6 +11,7 @@
 
 mod gateway;
 mod peerd;
+mod priority;
 mod protocol;
 mod push;
 mod testing;
@@ -90,6 +92,8 @@ async fn main() {
         run_cache(port, upstream).await;
         return;
     }
+    // Priority (Tier P) IPs are redacted to prio-N in every gateway/peerd log line.
+    priority::init_redaction(&priority::priority_peers_from_env());
     if args.get(1).map(|s| s.as_str()) == Some("peerd") {
         // peer discovery + probing daemon. Env config:
         // HYPERSYNC_DATA (data dir, default ./data), HL_STATS_DIR (optional, comma-separated:

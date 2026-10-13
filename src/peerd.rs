@@ -274,6 +274,12 @@ async fn probe_live(ip: &str) -> LiveProbe {
 // "Peer-only request"), so peerd can crawl the peer graph standalone.
 const QUERY_PEERS_REQUEST: [u8; 6] = [0, 0, 0, 1, 0, 1];
 const MAX_QUERY_PEERS_RESP: usize = 65_536;
+// A 64KB response can list ~9k IPs and the crawl makes up to PEERD_CRAWL_MAX_QUERIES queries per
+// cycle, while probing retires at most a few hundred candidates per cycle. Bound what one peer can
+// inject and the persisted set, so a hostile/buggy peer cannot grow memory and peer_candidates.txt
+// without limit or dilute probe coverage of real peers (mainnet today: ~1.3k candidates).
+const MAX_PEERS_PER_QUERY_RESPONSE: usize = 512;
+const MAX_CANDIDATES: usize = 20_000;
 
 // HL compact varint (docs/hl-p2p-protocol.md §3): lead <0xfb is the value; 0xfb/0xfc/0xfd introduce
 // a u16/u32/u64 LE. Returns (value, bytes_consumed). 0xfe (u128) is not a plausible peer count.
@@ -420,7 +426,7 @@ where
         while let Some(r) = set.join_next().await {
             queries += 1;
             if let Ok(peers) = r {
-                for p in peers {
+                for p in peers.into_iter().take(MAX_PEERS_PER_QUERY_RESPONSE) {
                     if self_ips.contains(&p) {
                         continue;
                     }
@@ -504,14 +510,16 @@ pub(crate) fn extract_round_tip(contents: &str) -> Option<u32> {
     digits.parse().ok()
 }
 
+// Probe rounds are floor-only validated, so clustering is the only thing standing between a high
+// decode artifact and the published tip. Always require a second peer to corroborate: the gateway
+// raises its net tip monotonically and now also rejects peers that trail it, so one uncorroborated
+// artifact would pin the tip out of reach and permanently starve live serving. No tip (null) is
+// safe by comparison — the gateway keeps its previous value and both round guards stay permissive.
 fn clustered_probe_tip(probes: &[(String, LiveProbe)]) -> Option<u32> {
     let mut rounds: Vec<u32> = probes
         .iter()
         .filter_map(|(_, probe)| probe.max_round)
         .collect();
-    if rounds.len() == 1 {
-        return rounds.first().copied();
-    }
     max_clustered_round(&mut rounds, 2, MAX_LIVE_ROUND_LAG)
 }
 
@@ -621,16 +629,26 @@ pub(crate) async fn run_peerd(interval: u64) {
     let data_dir = std::env::var("HYPERSYNC_DATA").unwrap_or_else(|_| "./data".to_string());
     tokio::fs::create_dir_all(&data_dir).await.ok();
     // optional: comma-separated tcp_lz4_stats dirs, one per node (e.g. each node's hl-data volume
-    // mounted read-only). Unset => discovery relies on the gossipRootIps API + candidates
-    // persisted from previous cycles (the normal case when peerd runs on a different machine).
+    // mounted read-only). Unset => discovery relies on the gossipRootIps API, the query_peers crawl
+    // and candidates persisted from previous cycles (the normal case when peerd runs elsewhere).
     let stats_dirs: Vec<String> = std::env::var("HL_STATS_DIR")
         .map(|v| split_csv(&v))
         .unwrap_or_default();
     // optional: comma-separated public IPs of ALL our own nodes (legitimate routable addresses,
     // but never peers to dial — feeding our nodes from each other would relay in a circle)
-    let self_ips: HashSet<String> = std::env::var("HL_SELF_IP")
+    let mut self_ips: HashSet<String> = std::env::var("HL_SELF_IP")
         .map(|v| split_csv(&v).into_iter().collect())
         .unwrap_or_default();
+    // Priority peers (HYPERSYNC_PRIORITY_PEERS) are the gateway's own business: never probed,
+    // crawled, ranked or logged here, so they never reach peers.json or peerd.log.
+    let priority = crate::priority::priority_peers_from_env();
+    if !priority.is_empty() {
+        eprintln!(
+            "[peerd] excluding {} priority peer(s) from discovery and probing",
+            priority.len()
+        );
+    }
+    self_ips.extend(priority);
     let cand_path = format!("{data_dir}/peer_candidates.txt");
     let out_path = format!("{data_dir}/peers.json");
     let log_path = format!("{data_dir}/peerd.log");
@@ -646,6 +664,9 @@ pub(crate) async fn run_peerd(interval: u64) {
         .await
         .map(|s| s.lines().map(str::to_string).collect())
         .unwrap_or_default();
+    // the persisted file predates the current exclusions (a stand-in priority peer was usually a
+    // pool candidate first)
+    candidates.retain(|ip| !self_ips.contains(ip));
     // consecutive failed-probe count per candidate; prune after PRUNE_AFTER cycles so stale
     // harvested IPs don't get re-probed forever (a pruned peer still advertised by discovery is
     // simply re-added next cycle and gets a fresh count).
@@ -697,10 +718,17 @@ pub(crate) async fn run_peerd(interval: u64) {
         )
         .await;
         let mut crawl_new = 0usize;
+        let mut crawl_capped = 0usize;
         for ip in discovered {
-            if !self_ips.contains(&ip) && candidates.insert(ip) {
-                crawl_new += 1;
+            if self_ips.contains(&ip) || candidates.contains(&ip) {
+                continue;
             }
+            if candidates.len() >= MAX_CANDIDATES {
+                crawl_capped += 1;
+                continue;
+            }
+            candidates.insert(ip);
+            crawl_new += 1;
         }
         for dir in &stats_dirs {
             // read_node_peers handles a directory (every <date> file) and applies the same
@@ -832,10 +860,11 @@ pub(crate) async fn run_peerd(interval: u64) {
             secs % 60
         );
         let line = format!(
-            "{now} candidates={} probed={} crawl_new={} live={} round_tip={:?} pruned={} kept_previous={} probe_concurrency={} probe_max_per_cycle={} empty_streak={} cycle={}s sleep={}s reasons={:?} samples={:?} candidate_fallback={} top={:?}\n",
+            "{now} candidates={} probed={} crawl_new={} crawl_capped={} live={} round_tip={:?} pruned={} kept_previous={} probe_concurrency={} probe_max_per_cycle={} empty_streak={} cycle={}s sleep={}s reasons={:?} samples={:?} candidate_fallback={} top={:?}\n",
             total_candidates,
             cand_vec.len(),
             crawl_new,
+            crawl_capped,
             ranked.len(),
             round_tip,
             pruned,
@@ -1032,15 +1061,20 @@ mod tests {
         ];
         assert_eq!(clustered_probe_tip(&probes), Some(1_355_731_000));
 
+        // a lone probe cannot publish a tip: with nothing to corroborate it, a misparse would pin
+        // the gateway's monotonic tip above every honest peer and starve live serving for good
         let one = vec![(
             "1.1.1.1".to_string(),
             LiveProbe {
                 blocks: 2,
-                max_round: Some(1_355_730_000),
+                max_round: Some(2_818_597_137),
                 ..LiveProbe::default()
             },
         )];
-        assert_eq!(clustered_probe_tip(&one), Some(1_355_730_000));
+        assert_eq!(clustered_probe_tip(&one), None);
+        let (live, failed) = split_live_by_tip(one, None);
+        assert_eq!(live.len(), 1, "the lone peer still stays in the pool");
+        assert!(failed.is_empty());
     }
 
     #[test]
@@ -1345,6 +1379,25 @@ mod tests {
         )
         .await;
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn crawl_caps_what_one_response_can_inject() {
+        let flood: Vec<String> = (0..MAX_PEERS_PER_QUERY_RESPONSE + 100)
+            .map(|i| format!("8.{}.{}.1", i / 256, i % 256))
+            .collect();
+        let flood_refs: Vec<&str> = flood.iter().map(String::as_str).collect();
+        let (graph, calls) = stub_graph(&[("1.1.1.1", flood_refs.as_slice())]);
+        let got = crawl_peers_with(
+            vec!["1.1.1.1".to_string()],
+            &HashSet::new(),
+            1,
+            100,
+            4,
+            stub_query(graph, calls),
+        )
+        .await;
+        assert_eq!(got.len(), MAX_PEERS_PER_QUERY_RESPONSE);
     }
 
     #[tokio::test]

@@ -1,0 +1,1018 @@
+<meta charset="utf-8">
+<title>HyperSync QuickNode 升级方案</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Inter:wght@400;500;600&family=Noto+Sans+SC:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  /* Layout: single reading column (max 1080px) with a sticky phase index on wide screens.
+     Palette and faces follow docs/hypersync-architecture.html: dark ink ground,
+     amber = control / fallback, teal = data / QuickNode path, violet = probes, coral = risk. */
+  :root{
+    --ink:#0c121b; --ink-2:#101a26; --raised:#142031; --line:#26384e; --line-soft:#1c2c40;
+    --paper:#e9eff7; --muted:#9ab0c8; --faint:#6a829e;
+    --control:#e9a23c; --data:#43cabd; --alert:#e8705c; --violet:#a597f2; --ok:#7fcf8a;
+    --data-wash:rgba(67,202,189,.10); --control-wash:rgba(233,162,60,.11); --alert-wash:rgba(232,112,92,.11);
+    --violet-wash:rgba(165,151,242,.10);
+    --mono:'IBM Plex Mono','Noto Sans SC',ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    --sans:'Inter','Noto Sans SC',system-ui,-apple-system,'PingFang SC','Microsoft YaHei','Segoe UI',Roboto,sans-serif;
+    color-scheme:dark;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--ink);color:var(--paper);font-family:var(--sans);font-size:15.5px;line-height:1.65;-webkit-font-smoothing:antialiased}
+  .wrap{max-width:1080px;margin:0 auto;padding-inline:24px;padding-block:0 64px}
+  @media(max-width:520px){.wrap{padding-inline:16px}}
+  a{color:var(--data)}
+  a:focus-visible,summary:focus-visible{outline:2px solid var(--control);outline-offset:2px}
+  code{font-family:var(--mono);font-size:.86em;background:var(--data-wash);color:#bfeee8;padding:1px 5px;border-radius:4px;overflow-wrap:anywhere}
+  pre{font-family:var(--mono);font-size:12.5px;line-height:1.55;background:var(--ink-2);border:1px solid var(--line-soft);border-radius:8px;padding:14px 16px;overflow-x:auto;margin:12px 0;color:var(--muted)}
+  pre b{color:var(--paper);font-weight:500}
+  pre .c{color:var(--faint)}
+
+  header.hero{padding-block:56px 28px;border-bottom:1px solid var(--line-soft)}
+  .eyebrow{font-family:var(--mono);font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:var(--data);margin:0 0 16px}
+  h1{font-family:var(--mono);font-weight:600;font-size:clamp(30px,5.2vw,50px);line-height:1.06;letter-spacing:-.02em;margin:0 0 18px;text-wrap:balance}
+  h1 .x{color:var(--faint);font-weight:400}
+  h1 .qn{color:var(--data)}
+  .lede{font-size:17.5px;color:var(--muted);max-width:66ch;margin:0}
+  .lede b{color:var(--paper);font-weight:600}
+  .meta{display:flex;flex-wrap:wrap;gap:8px;margin-top:22px}
+  .chip{font-family:var(--mono);font-size:11.5px;border:1px solid var(--line);border-radius:999px;padding:3px 10px;color:var(--muted)}
+  .chip.draft{border-color:rgba(233,162,60,.5);color:var(--control)}
+
+  .layout{display:grid;grid-template-columns:200px minmax(0,1fr);gap:48px;align-items:start}
+  @media(max-width:920px){.layout{grid-template-columns:minmax(0,1fr);gap:0}}
+  nav.toc{position:sticky;top:calc(env(safe-area-inset-top,0px) + 24px);padding-top:40px;font-family:var(--mono);font-size:12.5px}
+  @media(max-width:920px){nav.toc{display:none}}
+  nav.toc .lbl{font-size:10.5px;letter-spacing:.16em;text-transform:uppercase;color:var(--faint);margin-bottom:10px}
+  nav.toc a{display:block;color:var(--muted);text-decoration:none;padding:6px 0 6px 14px;border-left:2px solid var(--line-soft)}
+  nav.toc a:hover{color:var(--paper);border-left-color:var(--data)}
+
+  section{padding-block:40px 8px}
+  h2{font-family:var(--mono);font-weight:600;font-size:clamp(20px,2.8vw,25px);letter-spacing:-.01em;margin:0 0 6px;text-wrap:balance}
+  h3{font-family:var(--mono);font-weight:600;font-size:16.5px;margin:0;text-wrap:balance}
+  .sub{color:var(--muted);max-width:72ch;margin:8px 0 18px}
+  p{max-width:72ch}
+  ul,ol{padding-left:22px;max-width:72ch}
+  li{margin:4px 0}
+  li::marker{color:var(--faint)}
+
+  .verdict{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-top:6px}
+  @media(max-width:760px){.verdict{grid-template-columns:minmax(0,1fr)}}
+  .vcell{border:1px solid var(--line-soft);border-radius:10px;padding:14px 16px;background:var(--ink-2);min-width:0}
+  .vcell .k{font-family:var(--mono);font-size:11px;letter-spacing:.12em;text-transform:uppercase;margin-bottom:6px}
+  .vcell.good .k{color:var(--ok)} .vcell.maybe .k{color:var(--control)} .vcell.unknown .k{color:var(--alert)}
+  .vcell p{margin:0;font-size:14.5px;color:var(--muted)}
+
+  .diagram{margin:18px 0 8px;border:1px solid var(--line);border-radius:12px;background:var(--ink-2);overflow-x:auto;padding:12px}
+  .diagram svg{display:block;min-width:820px;width:100%;height:auto}
+  .caption{font-size:13px;color:var(--faint);margin:6px 0 0}
+
+  .tbl{overflow-x:auto;margin:14px 0;border:1px solid var(--line-soft);border-radius:10px}
+  table{border-collapse:collapse;width:100%;font-size:14px;min-width:640px}
+  th,td{text-align:left;vertical-align:top;padding:10px 14px;border-bottom:1px solid var(--line-soft)}
+  th{font-family:var(--mono);font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--faint);font-weight:500;background:var(--ink-2)}
+  tr:last-child td{border-bottom:none}
+  td.ch{font-family:var(--mono);font-size:13px;color:var(--paper);white-space:nowrap}
+  .tag{display:inline-block;font-family:var(--mono);font-size:11px;padding:1px 7px;border-radius:5px;margin:1px 0;white-space:nowrap}
+  .tag.qn{background:var(--data-wash);color:var(--data)}
+  .tag.pub{background:var(--control-wash);color:var(--control)}
+  .tag.risk{background:var(--alert-wash);color:var(--alert)}
+  .tag.probe{background:var(--violet-wash);color:var(--violet)}
+
+  .ladder{display:grid;gap:10px;margin:16px 0}
+  .rung{display:grid;grid-template-columns:120px minmax(0,1fr);gap:16px;align-items:start;border:1px solid var(--line-soft);border-radius:10px;padding:12px 16px;background:var(--ink-2)}
+  @media(max-width:560px){.rung{grid-template-columns:minmax(0,1fr);gap:4px}}
+  .rung .when{font-family:var(--mono);font-size:12px;color:var(--faint)}
+  .rung .when b{display:block;font-size:14px;color:var(--paper);font-weight:600}
+  .rung p{margin:0;color:var(--muted);font-size:14.5px}
+
+  .work{border:1px solid var(--line);border-radius:12px;margin:18px 0;background:var(--raised);overflow:hidden}
+  .work > .wh{display:flex;flex-wrap:wrap;align-items:baseline;gap:10px 14px;padding:16px 18px 12px;border-bottom:1px solid var(--line-soft)}
+  .wid{font-family:var(--mono);font-size:12px;font-weight:600;color:var(--control);border:1px solid rgba(233,162,60,.4);border-radius:6px;padding:2px 8px}
+  .work .phase{margin-left:auto;font-family:var(--mono);font-size:11.5px;color:var(--faint)}
+  .wb{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:0}
+  @media(max-width:760px){.wb{grid-template-columns:minmax(0,1fr)}}
+  .wb > div{padding:14px 18px;min-width:0}
+  .wb > div + div{border-left:1px solid var(--line-soft)}
+  @media(max-width:760px){.wb > div + div{border-left:none;border-top:1px solid var(--line-soft)}}
+  .wb .lbl{font-family:var(--mono);font-size:10.5px;letter-spacing:.14em;text-transform:uppercase;color:var(--faint);margin:0 0 6px}
+  .wb p,.wb li{font-size:14.5px;color:var(--muted)}
+  .wb p{margin:0 0 8px}
+  .wb ul{margin:0 0 8px;padding-left:18px}
+  .wb b{color:var(--paper);font-weight:600}
+  .files{font-family:var(--mono);font-size:12px;color:var(--faint);padding:10px 18px;border-top:1px solid var(--line-soft);background:var(--ink-2);overflow-wrap:anywhere}
+
+  .phases{display:grid;gap:14px;margin:16px 0}
+  .ph{display:grid;grid-template-columns:150px minmax(0,1fr);gap:18px;border-top:1px solid var(--line-soft);padding-top:14px}
+  @media(max-width:620px){.ph{grid-template-columns:minmax(0,1fr);gap:6px}}
+  .ph .pn{font-family:var(--mono)}
+  .ph .pn b{display:block;font-size:15px;color:var(--paper)}
+  .ph .pn span{font-size:12px;color:var(--faint)}
+  .ph .pc p{margin:0 0 6px;color:var(--muted);font-size:14.5px}
+  .exit{font-size:14px;color:var(--paper);background:var(--data-wash);border-radius:8px;padding:8px 12px;margin-top:6px}
+  .exit b{font-family:var(--mono);font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--data);margin-right:6px}
+
+  .note{border-left:3px solid var(--control);background:var(--control-wash);padding:10px 14px;border-radius:0 8px 8px 0;color:var(--paper);font-size:14.5px;max-width:78ch;margin:14px 0}
+  .note.risk{border-left-color:var(--alert);background:var(--alert-wash)}
+  footer{margin-top:48px;padding-top:18px;border-top:1px solid var(--line-soft);font-size:13px;color:var(--faint)}
+  @media (prefers-reduced-motion: reduce){*{scroll-behavior:auto!important}}
+
+  /* port map + sequence diagrams */
+  .seq{margin:14px 0 6px;border:1px solid var(--line);border-radius:12px;background:var(--ink-2);overflow-x:auto;padding:8px}
+  .seq svg{display:block;width:100%;min-width:640px;height:auto}
+  svg .h1{font:600 13px var(--mono);fill:var(--paper)}
+  svg .h2{font:11px var(--mono);fill:var(--faint)}
+  svg .hd{font:600 11px var(--mono);fill:var(--faint);letter-spacing:.08em}
+  svg .tx{font:11.5px var(--mono);fill:var(--muted)}
+  svg .tf{font:10.5px var(--mono);fill:var(--faint)}
+  svg .lab{font:11px var(--mono)}
+  svg .num{fill:var(--faint)}
+  svg .life{stroke:var(--line);stroke-dasharray:3 5}
+  svg .cell{fill:var(--raised);stroke:var(--line)}
+  svg .notebox{fill:var(--raised);stroke:var(--line)}
+  svg .notebox.err{stroke:var(--alert)}
+  svg .pill{fill:var(--ink-2);stroke:var(--line)}
+  svg .k-node{stroke:var(--paper)} svg .t-node{fill:var(--paper)} .m-node{fill:var(--paper)}
+  svg .k-qn{stroke:var(--data)} svg .t-qn{fill:var(--data)} .m-qn{fill:var(--data)}
+  svg .k-pub{stroke:var(--control)} svg .t-pub{fill:var(--control)} .m-pub{fill:var(--control)}
+  svg .k-cache{stroke:var(--violet)} svg .t-cache{fill:var(--violet)} .m-cache{fill:var(--violet)}
+  svg .k-probe{stroke:var(--violet)} svg .t-probe{fill:var(--violet)} .m-probe{fill:var(--violet)}
+  svg .k-err{stroke:var(--alert)} svg .t-err{fill:var(--alert)} .m-err{fill:var(--alert)}
+  .scn{border-top:1px solid var(--line-soft);padding-top:18px;margin-top:22px}
+  .scn > p{margin:6px 0 0;color:var(--muted);font-size:14.5px}
+  .roles{display:flex;flex-wrap:wrap;gap:6px 14px;margin:8px 0 0;font-size:13.5px;color:var(--muted)}
+  .roles span b{font-family:var(--mono);font-size:12px;color:var(--paper);font-weight:500}
+  .keyrule{border:1px solid rgba(67,202,189,.45);background:var(--data-wash);border-radius:10px;padding:12px 16px;margin:14px 0;max-width:78ch}
+  .keyrule b{color:var(--data);font-family:var(--mono);font-size:12px;letter-spacing:.08em;text-transform:uppercase;display:block;margin-bottom:4px}
+</style>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+  <defs>
+    <marker id="m-node" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="m-node" d="M0,0 L10,5 L0,10 z"/></marker>
+    <marker id="m-qn" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="m-qn" d="M0,0 L10,5 L0,10 z"/></marker>
+    <marker id="m-pub" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="m-pub" d="M0,0 L10,5 L0,10 z"/></marker>
+    <marker id="m-cache" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="m-cache" d="M0,0 L10,5 L0,10 z"/></marker>
+    <marker id="m-probe" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="m-probe" d="M0,0 L10,5 L0,10 z"/></marker>
+    <marker id="m-err" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="m-err" d="M0,0 L10,5 L0,10 z"/></marker>
+  </defs>
+</svg>
+
+<div class="wrap">
+<header class="hero">
+  <p class="eyebrow">升级方案 &middot; 提案</p>
+  <h1>hypersync <span class="x">&times;</span> <span class="qn">QuickNode</span> peering</h1>
+  <p class="lede">用一份 QuickNode Hyperliquid Peering 订阅，作为多个核心 HL 节点的<b>首选上游</b>。公共 peer 池继续作为自动备份，bootstrap 缓存让节点重启不依赖 sentry。QuickNode 只允许一个白名单 IP，这个 IP 归 hypersync 所有：只有网关会连接 sentry。</p>
+  <div class="meta">
+    <span class="chip draft">评审草稿</span>
+    <span class="chip">基线：main @ 7dfb610 + 未提交的落后保护改动</span>
+    <span class="chip">更新于 2026-10-10</span>
+  </div>
+</header>
+
+<div class="layout">
+<nav class="toc" aria-label="目录">
+  <div class="lbl">目录</div>
+  <a href="#verdict">现状判断</a>
+  <a href="#standin">替身方案</a>
+  <a href="#findings">主网实测结果</a>
+  <a href="#arch">目标架构</a>
+  <a href="#ports">端口与监听方</a>
+  <a href="#roles">代理还是缓存</a>
+  <a href="#matrix">连接清单</a>
+  <a href="#scenarios">场景时序</a>
+  <a href="#routing">各通道的上游</a>
+  <a href="#select">Peer 选择流程</a>
+  <a href="#gates">检查项</a>
+  <a href="#work">工作项</a>
+  <a href="#rollout">上线阶段</a>
+  <a href="#validate">验证指标</a>
+  <a href="#config">配置参考</a>
+  <a href="#risks">风险与待确认问题</a>
+</nav>
+
+<main>
+<section id="verdict">
+  <h2>现状判断</h2>
+  <p class="sub">这次升级预期能带来什么，按目前掌握的证据分三类。</p>
+  <div class="keyrule"><b>范围（2026-10-13）</b>hypersync 只负责让节点同步区块，mempool 不在范围内：下游节点不再设置 <code>split_client_blocks</code>，问候里的广播组为 0，节点不写 <code>mempool_txs</code>（每小时省约 22 GB）。下文与 mempool 相关的内容（G4、W2b、mempool 一致性、mempool 风险）仅作参考，不在关键路径上。网关现在也不带 <code>--cache</code> 运行：缓存占用的 6&ndash;19 GB 加上约 35 GB 的 hl-node，把主机内存推过 hl-visor 约 95% 的阈值，19 小时内导致 hl-node 重启 5 次。</div>
+  <div class="verdict">
+    <div class="vcell good"><div class="k">预期可行</div><p>区块同步优先走 QuickNode，公共 peer 兜底。会话拆除和重新固定已在 soak 测试中验证过。bootstrap 从当前正在提供快照的 peer 转发，不依赖 sentry 的 abci_state。</p></div>
+    <div class="vcell maybe"><div class="k">已在公共 peer 上实测（现已不在范围内）</div><p>mempool（<code>split_client_blocks</code> = 广播组 1）经网关到达节点，<code>--push</code> 模式下逐字节一致、0 丢弃。仍需在 sentry 的数据流上确认。</p></div>
+    <div class="vcell unknown"><div class="k">只有 QuickNode 能回答</div><p>一个白名单 IP 能否供多个节点使用，以及每个 sentry 对单 IP 的连接数和带宽限制。这决定一份订阅能带多少节点。</p></div>
+  </div>
+</section>
+
+<section id="standin">
+  <h2>集成方案：先用替身节点开发，再切换到 QuickNode</h2>
+  <p class="sub">我们目前还没有 QuickNode peering。所有代码改动先针对三个公共 Hyperliquid 节点开发和测试，由它们临时充当 Tier P。到切换日再在配置中换成 sentry IP。</p>
+  <div class="keyrule"><b>结论</b>这个思路可行，但要做两点调整。分层代码从 <code>HYPERSYNC_PRIORITY_PEERS</code> 读取列表，所以对区块同步而言，从替身切到 sentry 只需改 <code>.env</code>，不需要改代码。两点调整是：挑选稳定的替身而不是随机挑；以及 mempool 在接入 QuickNode 之前无法测试，所以切换日先用 splice 模式跑一段验证，再开启 <code>--push</code>。</div>
+
+  <h3>如何挑选替身</h3>
+  <ul>
+    <li><b>挑稳定的，不要随机。</b>从 peerd 24 小时的周期日志中，选出在至少 90% 的周期里都出现在 <code>live_servers</code> 中、且与 <code>round_tip</code> 的差距始终在 <code>ACTIVE_ROUND_MAX_LAG</code> 以内的 IP。随机挑的节点可能频繁上下线，替身在测试中途消失会看起来像网关 bug。</li>
+    <li><b>确认能为我们服务。</b>每个替身在过去 24 小时内都给网关提供过 4001 实时流和 4002 client-block 应答。</li>
+    <li><b>分散部署。</b>三个替身在不同的 /24 网段，最好是不同的服务商，这样对其中一个做 iptables 演练不会误伤其他。选一个靠近东京的，延迟最接近 sentry。</li>
+    <li><b>按 sentry IP 的标准处理。</b>只放在 <code>.env</code> 里，日志中显示为 <code>prio-1..3</code>，这样在拿到任何 sentry IP 之前，W5 就已经过真实测试。</li>
+    <li><b>整个阶段固定不变。</b>只有替身消失超过一天才更换，并在 soak 日志中记录。</li>
+  </ul>
+
+  <h3>替身能验证什么，什么要等 QuickNode</h3>
+  <div class="tbl"><table>
+    <thead><tr><th>范围</th><th>用替身即可验证</th><th>需等 QuickNode</th></tr></thead>
+    <tbody>
+      <tr><td class="ch">W1 分层</td><td>层级顺序、负载最低优先、会话上限，以及用 iptables 封掉替身后 3.5 秒内从阶段 A 回退到阶段 B</td><td>&mdash;</td></tr>
+      <tr><td class="ch">W3 bootstrap 策略</td><td>公共池非空时，没有发往优先 peer 的 <code>send_abci:true</code>。公共节点确实提供 abci_state，所以这是真实测试。</td><td>sentry 的 abci_state 限额（G2）</td></tr>
+      <tr><td class="ch">W4 回切</td><td>断开再恢复的演练、<code>tier=</code> 日志、强制回切</td><td>&mdash;</td></tr>
+      <tr><td class="ch">W5 脱敏</td><td>对替身 IP 做 24 小时日志 grep，peers.json 权限 0600</td><td>&mdash;</td></tr>
+      <tr><td class="ch">W6 部署</td><td>SNAT 出口、node1 的 Docker DNAT 保留真实源 IP（公共 peer 会连入）、网关监听保持私有</td><td>白名单生效（G5）、sentry 连入（G6）、<code>reserved_peer_ips</code> 的行为</td></tr>
+      <tr><td class="ch">W2 转发</td><td>W2a：录制的公共流经过 <code>serve_push</code> 后逐字节一致，24 小时 push soak 无回归</td><td>split mempool 帧（G4）、W2b <code>frame_kind</code>、mempool 一致性</td></tr>
+      <tr><td class="ch">容量</td><td>用 fakenode 测网关自身的上限。公共 peer 返回 <code>peer_full</code> 会比 sentry 更早。</td><td>sentry 的单 IP 限制和每个 IP 可承载的节点数（G1、G2、阶段 4）</td></tr>
+    </tbody>
+  </table></div>
+  <div class="note">我们预计公共节点不会向未把我们设为 reserved 的 peer 发送 split mempool 帧，所以替身阶段 node1 不会写出 <code>mempool_txs</code>。这是预期行为，不是故障。如果某个替身确实发送了，就抓包并提前开始 G4。</div>
+
+  <h3>切换日：从替身换到 sentry</h3>
+  <ol>
+    <li>QuickNode 把 PUBLIC_IP 加入白名单。在 gw 网络中执行 G5，确认出口 IP。</li>
+    <li>在 <code>.env</code> 中把 <code>HYPERSYNC_PRIORITY_PEERS</code> 里的三个替身 IP 换成 sentry root。把 node1 的 <code>reserved_peer_ips</code> 设为同样三个。重启 peerd 和 gw，因为环境变量只在启动时读取。</li>
+    <li>按下方的切换日日志逐个查看 sentry，根据日志显示的连接上限设置 <code>HYPERSYNC_PRIORITY_MAX_SESSIONS</code>。</li>
+    <li>运行 24 小时，即 G3，期间记录 G4 和 G6。第一个小时用 splice 模式；当某个 sentry 上的 <code>--push</code> 会话在 60 秒统计行中显示 <code>data_noround</code> &gt; 0 且丢弃为 0 时，再切换到 <code>--push</code>。</li>
+    <li>关注每 60 秒统计行中的 <code>drop_dup</code>、<code>drop_floor</code> 和 <code>ALERT</code>。健康会话出现非零丢弃，说明 sentry 发送了解码器会误判的帧：上线 W2b（<code>protocol.rs</code> 改动及其回放测试），在此之前使用 splice。</li>
+    <li>根据 G2 的数字设置 <code>HYPERSYNC_PRIORITY_MAX_SESSIONS</code>，然后进入阶段 4。</li>
+  </ol>
+  <div class="exit"><b>结果</b>在 sentry 上做区块同步只是改配置。mempool 已不在范围内（2026-10-13），切换日不再需要 G4 和 W2b。</div>
+  <p class="sub" style="margin-top:14px">现在就把 G1 和 G2 的问题发给 QuickNode，在购买之前：G1 决定一个 IP 能否供给多个节点。写代码不必等答复，因为 W1&ndash;W6 对只有一个 QuickNode 节点、甚至没有 QuickNode 的情况也有帮助。</p>
+</section>
+
+<section id="findings">
+  <h2>主网实测结果（2026-10-12）</h2>
+  <p class="sub">在本机针对公共主网 peer 实测，使用临时探测、已部署的网关和一个真实节点。切换日网关会为每个 sentry 记录同样的信号（见下表），两者的差异就是 QuickNode 真正带来的变化。</p>
+  <div class="tbl"><table>
+    <thead><tr><th>发现</th><th>实测</th><th>带来的变化</th></tr></thead>
+    <tbody>
+      <tr><td class="ch">本机 IP 必须应答 4001/4002</td><td>本机没有节点监听时，所有 peer 都在不发问候的情况下关闭实时（<code>send_abci=0</code>）连接，peerd 排出的在线 peer 为 0。node1 发布 4001/4002 之后，同样的 peer 恢复服务。</td><td>白名单 IP 上的 node1 是必需的，不是可选的：它一旦宕机，网关也会失去上游。QuickNode 教程同样要求开放入站 4001/4002。node1 要和网关一样被监控。</td></tr>
+      <tr><td class="ch">区块格式已变</td><td>轮次从固定偏移（0x5e）移到了可变的头部位置（0x71&ndash;0xd1）。旧解码器解出 0 个轮次，导致实时 peer 审核、落后检查、缓存 floor 和 peerd 排序全部失效。</td><td>已修复：轮次取第一个 <code>0xfc R 0xfc R&minus;1 0xfc R&minus;2</code> 三元组，并用一个抓取的主网区块验证。统计行新增 <code>ALERT=no_block_rounds_decoded</code>，下次格式变化会立即报警。</td></tr>
+      <tr><td class="ch">mempool = 广播组 1</td><td><code>split_client_blocks:true</code> 让 hl-node 的问候第 6 字节为 1。65 个在线公共 peer 中只有 8 个在该组上转发交易（每秒约 20 个数据帧和 4 个控制帧：<code>cancelByCloid</code>、<code>evmRawTx</code> 等），其余只发区块。</td><td>选哪个上游决定了节点能否拿到 mempool。替身从转发交易的 peer 中挑选。QuickNode 的价值体现为 mempool 数据量。</td></tr>
+      <tr><td class="ch"><code>--push</code> 对 mempool 透明</td><td>56 MB 的广播组 1 录制流经 <code>serve_push</code> 回放后逐字节一致，0 丢弃。经网关实时运行：转发 3,568 个区块、5,393 个数据帧和 952 个控制帧，0 丢弃。</td><td>W2 的 mempool 风险已实测，而非假设。同时修复了一个相关 bug：缓存冷启动路径用广播组 0 重新问候上游，使节点悄悄降级为只收区块。</td></tr>
+      <tr><td class="ch">每个源 IP 2 条实时连接</td><td>测试的 3 个 peer 都允许本机 IP 同时建立 2 条实时流，第 3 条在问候前被关闭。</td><td>替身阶段设 <code>HYPERSYNC_PRIORITY_MAX_SESSIONS=2</code>。sentry 的上限由切换日的 <code>conns</code> 测试得出。</td></tr>
+      <tr><td class="ch">4002 规则</td><td>没有 4001 关系时请求 client-block 区间，3 个 peer 中 2 个返回 <code>Peer-only request</code>。有关系时：每 100 个区块 8&ndash;10 MB，耗时 1.3&ndash;3 秒。超出 tip 的区间：<code>client block round too large: X &gt; tip</code>。</td><td>印证了网关为每次 4002 建立关系的设计。</td></tr>
+      <tr><td class="ch">只开放 4001/4002</td><td>所有测试的 peer 上，4000 和 4003&ndash;4010 都被拒绝或超时。</td><td>转发其他端口目前没有实际流量，保留但不要依赖。</td></tr>
+      <tr><td class="ch">快照 5.8 GB；实时约 1.3 MB/s</td><td>bootstrap 从 7 月的 4.5 GB 增长到 5.8 GB。一条实时流约 1.3 MB/s（约 110 GB/天），含 mempool 约 1.4 MB/s。</td><td>抓取上限从 6 GB 提到 9 GB。按节点规划带宽。</td></tr>
+      <tr><td class="ch">经替身的 mempool 量</td><td>node1 写出 4.6 MB/s（约 395 GB/天）的 <code>mempool_txs</code>。QuickNode 给出的数字约 1.1 TB/天。</td><td>2026-10-13 起不在范围内：节点不再请求 mempool。</td></tr>
+      <tr><td class="ch">快照缓存与节点内存</td><td>开启 <code>--cache</code> 时网关占用 6&ndash;19 GB（一份缓存的快照，加上每约 5 分钟一次、1&ndash;3 个并行的刷新下载）。hl-node 稳定在约 34 GB。两者合计超过 hl-visor 约 95% 的主机内存检查（<code>child_low_memory</code>），19 小时内 hl-node 被重启 5 次。关闭缓存后网关只用约 10&ndash;260 MB，没有再重启。</td><td>网关不带 <code>--cache</code> 运行。节点重启后从公共 peer 重新下载快照，约 15 分钟追平。</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>切换日要看的网关日志</h3>
+  <p class="sub">不需要单独的测试工具：网关在服务真实节点时会记录同样的信号。把 sentry 写入 <code>HYPERSYNC_PRIORITY_PEERS</code> 后，每行都显示 <code>prio-N</code>，不会出现 IP。</p>
+  <div class="tbl"><table>
+    <thead><tr><th>问题</th><th>日志行</th><th>解读</th></tr></thead>
+    <tbody>
+      <tr><td class="ch">节点是否请求 mempool？</td><td><code>4001 node greeting 0000000300000100</code></td><td>第 6 字节为 1 即广播组 1（<code>split_client_blocks</code>）。mempool 已不在范围内，现在应看到 <code>0000000300000000</code>（广播组 0）。</td></tr>
+      <tr><td class="ch">sentry 是否接受？</td><td><code>selected live peer prio-N tier=prio &hellip; greeting=0000000103</code></td><td>问候以 <code>03</code> 结尾表示接受，其他值是拒绝码。</td></tr>
+      <tr><td class="ch">连接上限</td><td><code>priority prio-N live attempt failed after &hellip;ms (our sessions there=K): &hellip;</code></td><td>在同一个 K 值反复被拒，K 就是单 IP 上限。把 <code>HYPERSYNC_PRIORITY_MAX_SESSIONS</code> 设为 K。</td></tr>
+      <tr><td class="ch">mempool 是否到达、有无丢弃</td><td>每 60 秒一行 <code>active peer round lag &hellip; ctl= blocks= data_noround= drop_floor= drop_dup=</code></td><td><code>data_noround</code> &gt; 0 表示 mempool 在到达。丢弃数必须保持 0。出现 <code>ALERT=no_block_rounds_decoded</code> 表示线格式变了。</td></tr>
+      <tr><td class="ch">4002 延迟和 sentry 的 tip</td><td><code>4002 client blocks via prio-N tier=prio stage=active bytes= ms=</code>；<code>stage=terminal text=&hellip;round too large: X &gt; tip</code></td><td>每 100 个区块的大小和耗时；终止错误里带有 sentry 自己的 tip。</td></tr>
+      <tr><td class="ch">abci_state 限制</td><td><code>not serving abci_state type=0 len=1 code=&hellip; text=&hellip;</code></td><td>拒绝码或限速文字。只有 bootstrap 策略用到 sentry 时才会出现。</td></tr>
+      <tr><td class="ch">回退到公共池</td><td><code>priority stage expired after &hellip;ms &hellip; opening the pool</code>，以及 <code>tier=pool</code> 的会话</td><td>sentry 太慢、已满或不可用。</td></tr>
+      <tr><td class="ch">24 小时汇总</td><td><code>soak-test.sh</code> 的 <code>tier= starts{prio pool} prio_fail mp_mb drops alert</code> 列</td><td>Tier P 驻留率、每次采样的 mempool MB、丢弃和告警。</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="arch">
+  <h2>目标架构</h2>
+  <p class="sub">QuickNode 只把一个公网 IPv4 加入白名单，但允许这个 IP 建立多条 TCP 连接。这个 IP 归 hypersync 所有：只有网关会主动连接 sentry。同一 IP 上的边缘节点 node1 占用公网 4001/4002，sentry 作为 reserved peer 连入时能连到真实节点；但 node1 和其他节点一样通过网关同步。所有节点的 <code>root_node_ips</code> 里都只填网关。</p>
+  <div class="keyrule"><b>唯一规则</b>只有 hypersync 主动连接 QuickNode。任何节点（包括 node1）在任何阶段都不会主动连接 sentry。</div>
+  <div class="diagram" role="img" aria-label="架构图：白名单主机上只有 hypersync 网关连接三个 QuickNode sentry；sentry 入站连接边缘节点 node1，node1 通过网关同步；公共 peer 池以虚线作为网关的回退；peerd 只探测公共池；网关通过私网服务 node2 到 nodeN。">
+  <svg viewBox="0 0 1000 560" xmlns="http://www.w3.org/2000/svg" font-family="IBM Plex Mono, Noto Sans SC, ui-monospace, monospace">
+    <defs>
+      <marker id="aT" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#43cabd"/></marker>
+      <marker id="aA" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#e9a23c"/></marker>
+      <marker id="aV" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#a597f2"/></marker>
+    </defs>
+
+    <rect x="20" y="40" width="210" height="216" rx="10" fill="#0f2a2c" stroke="#43cabd" stroke-opacity=".6"/>
+    <text x="36" y="66" fill="#43cabd" font-size="13" font-weight="600">QuickNode sentry</text>
+    <text x="36" y="84" fill="#6a829e" font-size="11">东京 &middot; IP 白名单</text>
+    <rect x="36" y="98" width="178" height="40" rx="7" fill="#101a26" stroke="#26384e"/>
+    <text x="50" y="123" fill="#e9eff7" font-size="12.5">qn-1  root + reserved</text>
+    <rect x="36" y="146" width="178" height="40" rx="7" fill="#101a26" stroke="#26384e"/>
+    <text x="50" y="171" fill="#e9eff7" font-size="12.5">qn-2  root + reserved</text>
+    <rect x="36" y="194" width="178" height="40" rx="7" fill="#101a26" stroke="#26384e"/>
+    <text x="50" y="219" fill="#e9eff7" font-size="12.5">qn-3  root + reserved</text>
+
+    <rect x="20" y="330" width="210" height="150" rx="10" fill="#1d1a12" stroke="#e9a23c" stroke-opacity=".7" stroke-dasharray="6 5"/>
+    <text x="36" y="356" fill="#e9a23c" font-size="13" font-weight="600">公共 peer 池</text>
+    <text x="36" y="378" fill="#9ab0c8" font-size="11.5">约 90 个在线，peerd 排序</text>
+    <text x="36" y="398" fill="#9ab0c8" font-size="11.5">gossipRootIps + query_peers</text>
+    <text x="36" y="426" fill="#6a829e" font-size="11.5">用途：live 回退、</text>
+    <text x="36" y="444" fill="#6a829e" font-size="11.5">bootstrap 抓取、</text>
+    <text x="36" y="462" fill="#6a829e" font-size="11.5">QN 不可用时的 4002</text>
+
+    <rect x="320" y="16" width="392" height="528" rx="12" fill="#0e1722" stroke="#9ab0c8" stroke-opacity=".45"/>
+    <text x="338" y="40" fill="#9ab0c8" font-size="12" font-weight="600">白名单主机 &middot; 单个公网 IPv4</text>
+
+    <rect x="338" y="56" width="356" height="104" rx="9" fill="#142031" stroke="#26384e"/>
+    <text x="354" y="80" fill="#e9eff7" font-size="13.5" font-weight="600">node1 &middot; 边缘 hl-node</text>
+    <text x="354" y="100" fill="#9ab0c8" font-size="11.5">占用公网 4001/4002 &middot; 为 sentry 入站服务</text>
+    <text x="354" y="118" fill="#9ab0c8" font-size="11.5">roots = 网关 &middot; reserved = qn-1..3</text>
+    <text x="354" y="136" fill="#9ab0c8" font-size="11.5">try_new_peers=false &middot; 不 split（仅区块）</text>
+    <text x="354" y="152" fill="#6a829e" font-size="11">经网关同步，从不主动连接 QuickNode</text>
+    <line x1="640" y1="161" x2="640" y2="176" stroke="#43cabd" stroke-width="2" marker-end="url(#aT)"/>
+    <text x="632" y="173" text-anchor="end" fill="#43cabd" font-size="10.5">经网关同步</text>
+
+    <rect x="338" y="178" width="356" height="208" rx="9" fill="#142031" stroke="#43cabd" stroke-opacity=".55"/>
+    <text x="354" y="202" fill="#43cabd" font-size="13.5" font-weight="600">hypersync 网关</text>
+    <text x="580" y="202" fill="#6a829e" font-size="11">172.28.0.10</text>
+    <rect x="354" y="214" width="324" height="30" rx="6" fill="#0f2a2c"/>
+    <text x="366" y="234" fill="#e9eff7" font-size="11.5">Tier P  qn-1..3   实时 4001 + 4002 RPC</text>
+    <rect x="354" y="250" width="324" height="30" rx="6" fill="#1d1a12"/>
+    <text x="366" y="270" fill="#e9eff7" font-size="11.5">Tier O  公共池     回退 + bootstrap</text>
+    <rect x="354" y="286" width="324" height="30" rx="6" fill="#101a26"/>
+    <text x="366" y="306" fill="#e9eff7" font-size="11.5">bootstrap 缓存  约 4.5 GB，8 分钟有效</text>
+    <text x="354" y="336" fill="#9ab0c8" font-size="11.5">每个节点的会话固定到一个 active peer</text>
+    <text x="354" y="354" fill="#9ab0c8" font-size="11.5">日志只显示别名 (qn-2)，不含 IP</text>
+    <text x="354" y="374" fill="#6a829e" font-size="11">qn-1..3 的唯一连接方 &middot; 出口 SNAT 到 PUBLIC_IP</text>
+
+    <rect x="338" y="404" width="356" height="122" rx="9" fill="#142031" stroke="#a597f2" stroke-opacity=".5"/>
+    <text x="354" y="428" fill="#a597f2" font-size="13.5" font-weight="600">peerd</text>
+    <text x="354" y="450" fill="#9ab0c8" font-size="11.5">从不连接 qn-1..3（与自有节点一样被排除）</text>
+    <text x="354" y="468" fill="#9ab0c8" font-size="11.5">轮换探测公共候选</text>
+    <text x="354" y="486" fill="#9ab0c8" font-size="11.5">写入 peers.json：</text>
+    <text x="354" y="504" fill="#6a829e" font-size="11">live_servers、round_tip（不含优先 IP）</text>
+
+    <text x="770" y="140" fill="#6a829e" font-size="11.5">私网 / VPN</text>
+    <rect x="770" y="152" width="200" height="54" rx="9" fill="#142031" stroke="#26384e"/>
+    <text x="786" y="176" fill="#e9eff7" font-size="13">node2</text>
+    <text x="786" y="194" fill="#6a829e" font-size="11">active: qn-1</text>
+    <rect x="770" y="222" width="200" height="54" rx="9" fill="#142031" stroke="#26384e"/>
+    <text x="786" y="246" fill="#e9eff7" font-size="13">node3</text>
+    <text x="786" y="264" fill="#6a829e" font-size="11">active: qn-2</text>
+    <rect x="770" y="292" width="200" height="54" rx="9" fill="#142031" stroke="#26384e" stroke-dasharray="4 4"/>
+    <text x="786" y="316" fill="#e9eff7" font-size="13">nodeN</text>
+    <text x="786" y="334" fill="#6a829e" font-size="11">active: qn-3（分散）</text>
+    <text x="770" y="374" fill="#6a829e" font-size="11">root_node_ips = 网关</text>
+
+    <line x1="232" y1="104" x2="334" y2="104" stroke="#43cabd" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#aT)"/>
+    <text x="238" y="96" fill="#43cabd" font-size="10.5">sentry 连入</text>
+    <text x="238" y="122" fill="#6a829e" font-size="10.5">node1 只应答</text>
+    <line x1="232" y1="226" x2="334" y2="240" stroke="#43cabd" stroke-width="2" marker-end="url(#aT)"/>
+    <text x="244" y="216" fill="#43cabd" font-size="10.5">live + 4002</text>
+    <line x1="232" y1="372" x2="334" y2="272" stroke="#e9a23c" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#aA)"/>
+    <text x="246" y="338" fill="#e9a23c" font-size="10.5">回退</text>
+    <line x1="336" y1="470" x2="234" y2="452" stroke="#a597f2" stroke-width="1.5" stroke-dasharray="2 4" marker-end="url(#aV)"/>
+    <text x="244" y="500" fill="#a597f2" font-size="10.5">探测</text>
+    <line x1="696" y1="282" x2="766" y2="182" stroke="#43cabd" stroke-width="2" marker-end="url(#aT)"/>
+    <line x1="696" y1="282" x2="766" y2="250" stroke="#43cabd" stroke-width="2" marker-end="url(#aT)"/>
+    <line x1="696" y1="282" x2="766" y2="318" stroke="#43cabd" stroke-width="2" marker-end="url(#aT)"/>
+  </svg>
+  </div>
+  <p class="caption">青色：QuickNode 路径。只有网关主动连接 sentry；虚线表示 sentry 连入 node1，node1 只应答。琥珀色虚线：公共回退。紫色点线：peerd 探测公共池。它从不连接 sentry，sentry 的健康状况由网关在选择时自行判断。</p>
+
+  <h3 style="margin-top:22px">为什么白名单 IP 上仍要有一个节点</h3>
+  <ul>
+    <li><b>sentry 会连入。</b><code>reserved_peer_ips</code> 的含义是“始终接受来自这些 IP 的入站连接”，而 QuickNode 要求白名单 IP 开放入站 4001/4002。网关从不对公网监听，所以必须由真实节点应答。这也符合 README 现有规则：公网 4001/4002 应属于真实 HL 节点。</li>
+    <li><b>未开放 4001/4002 的 IP 会被 peer 降级。</b>有 node1 应答，网关的出站会话就来自一个行为正常的 peer IP。</li>
+    <li><b>node1 不主动连接 QuickNode。</b>它通过网关同步，所以 QuickNode 流量只有一个出口，监控、会话上限和故障切换都集中在一处。节点只从自己主动连接的 peer 接收数据，因此 sentry 入站连接 node1 并不会给它喂数据。</li>
+    <li><b>从第一天起只有 hypersync 对外连接。</b>即使是切换日的基线测量（G3、G4），node1 也接在网关后面以纯 splice 模式运行，因此没有任何其他组件会连接 QuickNode。</li>
+  </ul>
+  <div class="note">QuickNode 允许白名单 IP 建立多条 TCP 连接，所以 node1 技术上也可以直连 sentry。我们不这样做，是为了让每个 QuickNode 会话都经过 hypersync 的分层、会话上限和日志。QuickNode 的 <code>verify.sh</code> 和 <code>verify-peer-isolation.py</code> 假定使用其官方 compose 部署并直连 peer，因此我们改用网关日志以及 node1 的高度和 mempool 检查。</div>
+
+  <h3 style="margin-top:26px">由谁应答入站 4001/4002</h3>
+  <p class="sub">结论：<b>方案 A</b>。node1 通过 PUBLIC_IP 上的 Docker 端口映射应答。G6 用于确认 sentry 的实际行为；无论结果如何都保留 A，因为公共 peer 也会根据 PUBLIC_IP 的 4001/4002 是否应答来评价它。</p>
+  <div class="tbl"><table>
+    <thead><tr><th>方案</th><th>含义</th><th>结论</th></tr></thead>
+    <tbody>
+      <tr><td class="ch">A. node1 端口映射</td><td>Docker 把 node1 的 4001/4002 发布在 PUBLIC_IP 上。这是内核 DNAT，sentry 和其他 peer 的真实源 IP 得以保留，<code>reserved_peer_ips</code> 和按 IP 的限额都能正常工作。不需要改 hypersync 代码。</td><td><span class="tag qn">采用</span></td></tr>
+      <tr><td class="ch">B. hypersync 转发到 node1</td><td>新增一个公网监听，把入站连接透传给 node1。这样 node1 看到的所有入站连接都来自网关 IP，<code>reserved_peer_ips</code> 无法匹配，所有入站 peer 共用一个限速额度。</td><td><span class="tag risk">否决</span> 全面不如 A</td></tr>
+      <tr><td class="ch">C. hypersync 直接拒绝</td><td>接受连接，回复 1 字节的“拒绝”状态帧后关闭。公网端口上不需要节点，但从不提供服务的 IP 会被 peer 降级，影响 Tier O 回退和 bootstrap。</td><td><span class="tag risk">否决</span> 即使 sentry 从不连入，也会损害 Tier O</td></tr>
+      <tr><td class="ch">D. hypersync 模拟节点</td><td>提供 4001 数据流，并应答高度、<code>query_peers</code> 和 client-block 请求。高度和 <code>query_peers</code> 的格式尚未逆向，出错会直接影响 QuickNode。</td><td><span class="tag risk">否决</span> 工作量和风险最高</td></tr>
+    </tbody>
+  </table></div>
+  <div class="note risk">无论哪种方案，网关自身的 4000&ndash;4010 监听都保持私有。如果放到公网，网关会把 sentry 当作下游节点并为它连接上游，可能把它转回给它自己，而且任何人都能通过它拉取 4.5 GB 的 bootstrap。</div>
+</section>
+
+<section id="ports">
+  <h2>端口与监听方</h2>
+  <p class="sub">HL P2P 是 4000&ndash;4010 端口上的明文 TCP。帧格式为 <code>[u32 BE 长度][类型字节][负载]</code>：类型 0 是控制帧（问候、状态、RPC 请求），类型 1 是数据帧（状态、区块、RPC 响应）。非验证节点主要用两个端口。<b>4001</b> 承载 abci 流：先是 bootstrap 状态，然后是实时区块。<b>4002</b> 承载 gossip RPC：高度查询、<code>query_peers</code> 和 client-block 区间查询。</p>
+
+  <div class="keyrule"><b>方向规则</b>节点只从自己主动连接的 peer 接收区块。对于入站连接，节点只为对方提供服务，对方推送的内容会被忽略。所以下文所有箭头都从发起方指向监听方。下游节点必须主动连接网关，因为网关就是它的 <code>root_node_ips</code>。网关则总是自己向上游发起连接，任何时候都不会有连接接入节点的监听端口来给它喂数据。</div>
+
+  <div class="tbl"><table>
+    <thead><tr><th>端点</th><th>监听</th><th>谁会连接它</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td class="ch">qn-1..3</td><td>公网 :4001、:4002</td><td>只有白名单 IP（PUBLIC_IP）。实际上只有网关。</td><td>QuickNode 允许这个 IP 建立多条 TCP 连接。</td></tr>
+      <tr><td class="ch">公共 peer</td><td>公网 :4001、:4002</td><td>任何人。abci_state 按源 IP 限速。</td><td>Tier O。用于 bootstrap 抓取和回退。</td></tr>
+      <tr><td class="ch">node1（边缘节点）</td><td>PUBLIC_IP :4001、:4002，由 Docker 端口映射发布（内核 DNAT）</td><td>sentry（reserved peer）和其他 HL peer</td><td>必须可达，否则 peer 会降级 PUBLIC_IP。任何连回 PUBLIC_IP 的连接都落在这里，不会到 node2..N。node1 自身通过网关同步。</td></tr>
+      <tr><td class="ch">网关</td><td>172.28.0.10 :4000&ndash;4010（私网）</td><td>只有下游节点</td><td>绝不对外发布。开放的网关就是 4.5 GB 的带宽放大器。</td></tr>
+      <tr><td class="ch">node2..N</td><td>自身 :4001、:4002（不使用）</td><td>没有人。<code>try_new_peers=false</code>，且位于私网。</td><td>它们只向外连接网关。不要发布这些端口。</td></tr>
+      <tr><td class="ch">peerd</td><td>不监听</td><td>&ndash;</td><td>只做出站探测和爬取。</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="seq" role="img" aria-label="端口图：每个下游端口对应的网关处理函数、代理角色以及它连接的上游。">
+  <svg viewBox="0 0 1000 545" xmlns="http://www.w3.org/2000/svg">
+    <text class="hd" x="20" y="32">下游节点发起连接</text>
+    <text class="hd" x="290" y="32">网关 172.28.0.10 &middot; 处理函数与角色</text>
+    <text class="hd" x="750" y="32">网关连接上游</text>
+
+    <rect class="cell" x="20" y="50" width="190" height="88" rx="8"/>
+    <text class="h1" x="32" y="76">4001 &middot; send_abci=1</text>
+    <text class="tx" x="32" y="96">冷启动</text>
+    <text class="tf" x="32" y="118">00 00 00 03 00 01 00 00</text>
+    <rect class="cell" x="290" y="50" width="380" height="88" rx="8"/>
+    <text class="h1" x="306" y="74">handle_4001_bootstrap</text>
+    <rect class="pill" x="306" y="86" width="96" height="22" rx="5"/><text class="lab t-cache" x="316" y="101">缓存 &middot; 命中</text>
+    <rect class="pill" x="410" y="86" width="236" height="22" rx="5"/><text class="lab t-node" x="420" y="101">L4 反向代理 + 写缓存 &middot; 未命中</text>
+    <text class="tf" x="306" y="128">先探首帧；未命中时边转发边写入缓存</text>
+    <rect class="cell" x="750" y="50" width="230" height="88" rx="8"/>
+    <text class="h1 t-pub" x="762" y="76">public:4001</text>
+    <text class="tx" x="762" y="96">Tier O，仅缓存未命中时</text>
+    <text class="tf" x="762" y="118">全部失败才用 Tier P</text>
+    <line class="k-node" x1="212" y1="94" x2="284" y2="94" stroke-width="2" marker-end="url(#m-node)"/>
+    <line class="k-pub" x1="672" y1="94" x2="744" y2="94" stroke-width="2" stroke-dasharray="6 4" marker-end="url(#m-pub)"/>
+
+    <rect class="cell" x="20" y="152" width="190" height="88" rx="8"/>
+    <text class="h1" x="32" y="178">4001 &middot; send_abci=0</text>
+    <text class="tx" x="32" y="198">续传 / 实时</text>
+    <text class="tf" x="32" y="220">00 00 00 03 00 00 00 00</text>
+    <rect class="cell" x="290" y="152" width="380" height="88" rx="8"/>
+    <text class="h1" x="306" y="176">handle_4001_live &#8594; serve_push</text>
+    <rect class="pill" x="306" y="188" width="140" height="22" rx="5"/><text class="lab t-qn" x="316" y="203">L7 代理 &middot; --push</text>
+    <rect class="pill" x="454" y="188" width="170" height="22" rx="5"/><text class="lab t-node" x="464" y="203">L4 透传 &middot; 无 --push</text>
+    <text class="tf" x="306" y="230">10 秒无数据或落后 &gt; 1500 轮 &#8594; 拆除会话</text>
+    <rect class="cell" x="750" y="152" width="230" height="88" rx="8"/>
+    <text class="h1 t-qn" x="762" y="178">qn-k:4001</text>
+    <text class="tx" x="762" y="198">Tier P，负载最低者优先</text>
+    <text class="tf" x="762" y="220">全部宕机才用公共池</text>
+    <line class="k-node" x1="212" y1="196" x2="284" y2="196" stroke-width="2" marker-end="url(#m-node)"/>
+    <line class="k-qn" x1="672" y1="196" x2="744" y2="196" stroke-width="2" marker-end="url(#m-qn)"/>
+
+    <rect class="cell" x="20" y="254" width="190" height="88" rx="8"/>
+    <text class="h1" x="32" y="280">4002 &middot; RPC</text>
+    <text class="tx" x="32" y="300">高度、peers、区间查询</text>
+    <text class="tf" x="32" y="322">每个连接一次请求响应</text>
+    <rect class="cell" x="290" y="254" width="380" height="88" rx="8"/>
+    <text class="h1" x="306" y="278">serve_client_blocks</text>
+    <rect class="pill" x="306" y="290" width="112" height="22" rx="5"/><text class="lab t-qn" x="316" y="305">L7 RPC 代理</text>
+    <rect class="pill" x="426" y="290" width="116" height="22" rx="5"/><text class="lab t-node" x="436" y="305">重试 + 对冲</text>
+    <text class="tf" x="306" y="332">active 独占 2 秒，之后最多 8 个候选</text>
+    <rect class="cell" x="750" y="254" width="230" height="88" rx="8"/>
+    <text class="h1 t-qn" x="762" y="280">active:4002</text>
+    <text class="tx" x="762" y="300">其次 Tier P，再次 Tier O</text>
+    <text class="tf" x="762" y="322">临时 4001 规避 Peer-only</text>
+    <line class="k-node" x1="212" y1="298" x2="284" y2="298" stroke-width="2" marker-end="url(#m-node)"/>
+    <line class="k-qn" x1="672" y1="298" x2="744" y2="298" stroke-width="2" marker-end="url(#m-qn)"/>
+
+    <rect class="cell" x="20" y="356" width="190" height="76" rx="8"/>
+    <text class="h1" x="32" y="382">4000, 4003&ndash;4010</text>
+    <text class="tx" x="32" y="402">其他 gossip</text>
+    <text class="tf" x="32" y="420">按节点发送的字节原样转发</text>
+    <rect class="cell" x="290" y="356" width="380" height="76" rx="8"/>
+    <text class="h1" x="306" y="380">dial_active &#8594; splice</text>
+    <rect class="pill" x="306" y="392" width="88" height="22" rx="5"/><text class="lab t-node" x="316" y="407">L4 透传</text>
+    <text class="tf" x="404" y="407">跟随该节点的 active 固定</text>
+    <rect class="cell" x="750" y="356" width="230" height="76" rx="8"/>
+    <text class="h1 t-qn" x="762" y="382">active:同端口</text>
+    <text class="tx" x="762" y="402">与 4001 同一个 peer</text>
+    <line class="k-node" x1="212" y1="394" x2="284" y2="394" stroke-width="2" marker-end="url(#m-node)"/>
+    <line class="k-qn" x1="672" y1="394" x2="744" y2="394" stroke-width="2" marker-end="url(#m-qn)"/>
+
+    <text class="hd" x="20" y="466">不经过网关的路径</text>
+    <rect class="cell" x="20" y="478" width="470" height="56" rx="8"/>
+    <text class="h1 t-qn" x="32" y="501">qn-1..3 &#8594; node1 &middot; :4001 / :4002</text>
+    <text class="tx" x="32" y="522">PUBLIC_IP 上的 Docker DNAT，不经 hypersync &middot; node1 只提供服务</text>
+    <rect class="cell" x="510" y="478" width="470" height="56" rx="8"/>
+    <text class="h1 t-probe" x="522" y="501">peerd &#8594; peers &middot; :4001 探测，:4002 爬取</text>
+    <text class="tx" x="522" y="522">仅作客户端 &middot; 写 peers.json，不为节点服务</text>
+  </svg>
+  </div>
+  <p class="caption">箭头从发起方指向监听方。每条连接上的数据都是双向流动的。</p>
+</section>
+
+<section id="roles">
+  <h2>代理、反向代理还是缓存</h2>
+  <p class="sub">节点并不知道自己实际连的是哪个上游。它把网关当作自己的 peer 去连接，所以网关的每个监听端口都是<b>反向代理</b>。各通道的区别在于网关解析多少协议内容，以及是否需要连接上游。</p>
+  <div class="tbl"><table>
+    <thead><tr><th>角色</th><th>位置</th><th>网关做什么</th><th>为什么这样设计</th></tr></thead>
+    <tbody>
+      <tr><td><span class="tag probe">缓存</span></td><td>4001 send_abci=1，缓存新鲜（&le; 8 分钟）</td><td>作为源站。按 8 MB 分块写出已抓取的约 4.5 GB 数据，这次请求不建立任何上游连接。</td><td>abci_state 按源 IP 限速，而网关后面的所有节点共用 PUBLIC_IP。每 4 分钟抓取一次，就能服务任意多次重启。</td></tr>
+      <tr><td><span class="tag pub">L4 反向代理 + 写缓存</span></td><td>4001 send_abci=1，缓存未命中</td><td>先探上游的第一帧来选上游（&gt; 4 MB 说明对方正在提供状态），然后双向复制字节。开启 <code>--cache</code> 时同时把流写入缓存。</td><td>状态、EVM KV 和实时区块之间的边界在线路上看不出来，只能由节点自己解析。</td></tr>
+      <tr><td><span class="tag qn">L4 反向代理</span></td><td>不带 <code>--push</code> 的 4001 实时流；4000、4003&ndash;4010 端口</td><td><code>splice()</code>：两个 <code>tokio::io::copy</code> 循环，不做任何解析。</td><td>逐字节一致，所以 <code>split_client_blocks</code> 的 mempool 帧原样通过。这是阶段 1 的安全模式。</td></tr>
+      <tr><td><span class="tag qn">L7 反向代理</span></td><td>带 <code>--push</code> 的 4001 实时流</td><td>读取每一帧，解码区块轮次，对照网络 tip 检查合理性和落后程度，10 秒无数据就拆除会话。</td><td>比 hl-node 自身的读超时更快完成故障切换。W2 会让转发变为逐字节一致。</td></tr>
+      <tr><td><span class="tag qn">L7 RPC 反向代理</span></td><td>4002</td><td>读取一个请求帧，发给固定的 active。对回复分类（<code>Peer-only request</code>、轮次过小或过大、无 client blocks），必要时重试和对冲，最后返回一个响应。</td><td>peer 只回答与自己有 4001 关系的 IP 的 4002 请求。从缓存启动的节点没有这种关系，所以由网关代为建立。</td></tr>
+      <tr><td><span class="tag">客户端</span></td><td>缓存刷新、4002 对冲、peerd</td><td>网关或 peerd 以自己的身份发起连接：抓取用 <code>GREET_TRUE</code>，临时关系和探测用 <code>GREET_FALSE</code>。</td><td>不代理任何人，但这些连接同样计入 PUBLIC_IP 的限额。</td></tr>
+      <tr><td><span class="tag">内核 DNAT</span></td><td>qn-1..3 &#8594; PUBLIC_IP &#8594; node1</td><td>不参与。由 Docker 端口映射转发，保留 sentry 的源 IP。</td><td>sentry 作为 reserved peer 连入 node1。node1 为其服务，但只通过网关同步。</td></tr>
+    </tbody>
+  </table></div>
+  <div class="note">整个设计里没有正向代理。节点从不指定目的地，由网关选择。上游从不连接网关，任何连接 PUBLIC_IP 的流量都会到达 node1。</div>
+</section>
+
+<section id="matrix">
+  <h2>连接清单</h2>
+  <p class="sub">目标设计中的每一条 TCP 连接。只有 C9 和 C10 与 hypersync 无关。</p>
+  <div class="tbl"><table>
+    <thead><tr><th>#</th><th>发起方 &#8594; 监听方</th><th>首批字节</th><th>传输内容</th><th>网关角色</th><th>代码</th></tr></thead>
+    <tbody>
+      <tr><td class="ch">C1</td><td>node &#8594; gw:4001</td><td>节点问候，send_abci=1</td><td>约 950 MB abci_state、约 3.6 GB EVM KV，然后是实时区块</td><td>命中时为缓存；未命中时为 L4 + 探首帧 + 写缓存</td><td><code>handle_4001_bootstrap</code>、<code>replay_cache_then_live</code>、<code>transparent_bootstrap</code></td></tr>
+      <tr><td class="ch">C2</td><td>gw &#8594; public:4001</td><td>节点问候，原样转发</td><td>先探第一帧，之后与 C1 是同一条流</td><td>C1 未命中时的上游段；最多 32 个候选，优先记住的状态服务方</td><td><code>select_fast_bootstrap_peer</code></td></tr>
+      <tr><td class="ch">C3</td><td>gw &#8594; public:4001</td><td><code>GREET_TRUE</code>（网关自己的）</td><td>完整 bootstrap；当批量速率降到实时区块的涓流时停止抓取</td><td>客户端；每 4 分钟通过对冲竞速刷新缓存</td><td><code>capture_bootstrap_raced</code></td></tr>
+      <tr><td class="ch">C4</td><td>node &#8594; gw:4001</td><td>节点问候，send_abci=0</td><td>peer 问候、实时区块、split mempool 帧</td><td>L7（<code>--push</code>）或 L4 透传</td><td><code>handle_4001_live</code>、<code>serve_push</code></td></tr>
+      <tr><td class="ch">C5</td><td>gw &#8594; qn-k:4001</td><td>节点问候（实时），缓存回放之后则用 <code>GREET_FALSE</code></td><td>预读 peer 问候和第一个区块来审核 peer，之后持续转发</td><td>C4 的上游段；在 Tier P 中进行阶段 A 竞速</td><td><code>select_live_peer</code></td></tr>
+      <tr><td class="ch">C6</td><td>node &#8594; gw:4002</td><td>一个带帧头的请求，无问候</td><td>一次请求、一次响应，然后关闭</td><td>L7 RPC 代理：最多等 1.5 秒固定 active，active 独占 2 秒，之后最多 8 路对冲</td><td><code>serve_client_blocks</code>、<code>fetch_client_blocks_raced</code></td></tr>
+      <tr><td class="ch">C7</td><td>gw &#8594; peer:4002（+ 临时 :4001）</td><td>请求字节原样转发；临时 4001 上用 <code>GREET_FALSE</code></td><td>与 C6 相同的一次交换</td><td>C6 的上游段；临时 4001 让对冲 peer 认得 PUBLIC_IP</td><td><code>fetch_client_blocks_from_peer</code></td></tr>
+      <tr><td class="ch">C8</td><td>node &#8594; gw:4000、4003&ndash;4010</td><td>节点发送的原始内容</td><td>其他 gossip</td><td>L4 透传到 active；最多等 3 秒固定，否则按轮询惰性固定</td><td><code>dial_active</code>、<code>splice</code></td></tr>
+      <tr><td class="ch">C9</td><td>qn-k &#8594; PUBLIC_IP:4001/4002 &#8594; node1（DNAT）</td><td>sentry 的问候</td><td>node1 为 sentry 提供服务。node1 自己的同步走网关（C1、C4、C6），与 node2..N 相同。</td><td>无</td><td>hl-node 默认行为</td></tr>
+      <tr><td class="ch">C10</td><td>peerd &#8594; peers:4001 / :4002</td><td><code>GREET_FALSE</code> / <code>query_peers</code> 请求</td><td>几个实时区块后关闭 / peer 表</td><td>无（peerd 是独立进程）</td><td><code>peerd.rs</code> 探测、爬取</td></tr>
+    </tbody>
+  </table></div>
+  <div class="note risk">网关和 peerd 的每条连接（C2、C3、C5、C7、C10）都从 PUBLIC_IP 这个唯一的白名单地址出去。在 sentry 看来，网关后面的每个节点都只是同一客户的又一条连接。单 IP 的 abci_state 配额、连接数上限和 <code>Peer-only</code> 检查都是共享的，所以 W1 要限制每个 sentry 的会话数，W3 要让 C3 避开 sentry。</div>
+</section>
+
+<section id="scenarios">
+  <h2>场景时序</h2>
+  <p class="sub">每张图跟踪一种情况在网关中的完整过程。实线箭头是发送方发起的请求或数据流，虚线箭头是回复。颜色与架构图一致：青色 QuickNode，琥珀色公共，紫色缓存与探测，珊瑚色故障。</p>
+
+  <article class="scn">
+    <h3>S1 &middot; 冷启动，缓存命中</h3>
+    <p>node2 没有本地状态。网关从自己的缓存提供快照，然后把 node2 接到一个 sentry 上接收实时区块和追块。</p>
+    <div class="seq" data-seq="s1" role="img" aria-label="时序：从缓存冷启动，然后从 QuickNode sentry 接收实时区块并通过 4002 追块。"></div>
+    <div class="roles"><span><b>1&ndash;4</b> 缓存：没有任何上游看到这次 bootstrap</span><span><b>5&ndash;7</b> L7 反向代理</span><span><b>8&ndash;11</b> RPC 反向代理</span></div>
+  </article>
+
+  <article class="scn">
+    <h3>S2 &middot; 冷启动，缓存未命中</h3>
+    <p>缓存过期或为空。网关找到一个此刻正在提供状态的公共 peer，逐字节转发，同时写入缓存。</p>
+    <div class="seq" data-seq="s2" role="img" aria-label="时序：从公共 peer 转发冷启动数据并写入缓存。"></div>
+    <div class="roles"><span><b>1&ndash;4</b> 带首帧探测的 L4 反向代理</span><span><b>5</b> 写入缓存</span><span><b>6&ndash;9</b> RPC 反向代理，固定在同一个公共 peer</span></div>
+    <div class="note">bootstrap 连接会在同一个 socket 上直接变成实时流，所以 node2 会一直停在这个公共 peer 上，收不到 mempool，直到下一次 4001 重连。W4 的自动回切才能把它带回 Tier P。这是保持缓存新鲜的主要理由。</div>
+  </article>
+
+  <article class="scn">
+    <h3>S3 &middot; 在 QuickNode 上稳定运行</h3>
+    <p>node2 已有状态，用 send_abci=0 重连。网关让多个 sentry 竞速并固定胜者，node2 的所有端口都跟随这个固定。</p>
+    <div class="seq" data-seq="s3" role="img" aria-label="时序：sentry 之间的实时选择竞速，然后 4001 实时流、4002 RPC 和其他端口都固定到胜者。"></div>
+    <div class="roles"><span><b>1&ndash;5</b> L7 或 L4 反向代理</span><span><b>6&ndash;9</b> RPC 反向代理</span><span><b>10&ndash;11</b> L4 透传</span></div>
+  </article>
+
+  <article class="scn">
+    <h3>S4 &middot; active 变慢或拒绝时的 4002 对冲</h3>
+    <p>固定的 sentry 在 2 秒宽限期内没有响应，或者回复 <code>Peer-only request</code>。网关转向其他 peer 对冲，并先为每个 peer 建立临时 4001 关系。</p>
+    <div class="seq" data-seq="s4" role="img" aria-label="时序：4002 请求从 active sentry 对冲到另一个 sentry 和一个公共 peer。"></div>
+    <div class="roles"><span><b>终止性错误</b>（如 <code>round too large</code>）只在全部失败时才转给节点</span><span><b>全部失败</b>则关闭 socket，由节点重试</span></div>
+  </article>
+
+  <article class="scn">
+    <h3>S5 &middot; sentry 故障、回退与回切</h3>
+    <p>active sentry 停滞或落后。网关结束会话，node2 重连，选择流程从 Tier P 重新开始。</p>
+    <div class="seq" data-seq="s5" role="img" aria-label="时序：active sentry 停滞，会话被拆除，节点重连到另一个 sentry 或公共回退。"></div>
+    <div class="roles"><span><b>拆除而非热切换</b>：新 peer 从它自己的 tip 开始发送，所以 node2 必须重新握手（commit eb52e65）</span></div>
+  </article>
+
+  <article class="scn">
+    <h3>S6 &middot; 边缘节点与 peerd</h3>
+    <p>node1 和其他节点一样经网关同步，同时在公网 4001/4002 上接受 sentry 的入站连接。peerd 按自己的周期探测公共池，从不连接 sentry。</p>
+    <div class="seq" data-seq="s6" role="img" aria-label="时序：node1 经网关同步，sentry 入站连接 node1；peerd 从不连接 sentry。"></div>
+    <div class="roles"><span><b>1&ndash;2</b> 与 S3 相同</span><span><b>3</b> 经 Docker DNAT 入站，node1 只提供服务</span><span><b>4</b> peerd 不接触 sentry</span></div>
+  </article>
+</section>
+
+<section id="routing">
+  <h2>各通道的上游选择</h2>
+  <p class="sub">每个 HL P2P 通道由哪个上游服务，现状与升级后对比。</p>
+  <div class="tbl"><table>
+    <thead><tr><th>通道</th><th>现状</th><th>升级后</th><th>原因</th></tr></thead>
+    <tbody>
+      <tr><td class="ch">4001 send_abci:true</td><td>缓存回放，否则先试记住的状态服务方，再轮询 peer 池</td><td>先 <span class="tag pub">Tier O</span>，所有公共 peer 都失败才用 <span class="tag qn">Tier P</span></td><td>abci_state 按源 IP 限速，而我们只有一个白名单 IP。把它的配额花在缓存刷新上，可能导致公共池故障时 sentry 恰好拒绝提供状态。</td></tr>
+      <tr><td class="ch">4001 live</td><td>4 个池 peer 竞速，第一个通过审核的区块胜出</td><td>先 <span class="tag qn">Tier P</span> 竞速（负载最低的 sentry 优先），再 <span class="tag pub">Tier O</span></td><td>QuickNode 提供 mempool 且有 SLA。公共 peer 只用于故障兜底。</td></tr>
+      <tr><td class="ch">4002 client blocks</td><td>固定的 active，再对冲到池中候选</td><td>固定的 active，然后 <span class="tag qn">Tier P</span>，然后 <span class="tag pub">Tier O</span></td><td><code>Peer-only request</code> 规则要求与 4001 是同一个 peer。其次 sentry 是最好的对冲对象。</td></tr>
+      <tr><td class="ch">其他 gossip 端口</td><td>透传到节点的 active</td><td>不变</td><td>它们跟随 active 固定，因此自动跟随层级。</td></tr>
+      <tr><td class="ch">peerd 探测</td><td>轮换的公共集合，上一轮的头部 peer 保持探测</td><td>相同；排除 Tier P 的 IP</td><td>sentry 的健康状况由网关自行判断：选择失败的 sentry 进入 30 秒冷却。这样连接 QuickNode 的次数更少，sentry IP 也不会进入 peers.json 或 peerd.log。</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="select">
+  <h2>实时 peer 选择流程</h2>
+  <p class="sub">新的 <code>select_live_peer</code> 流程。总预算仍为 3.5 秒（<code>LIVE_SELECT_WAIT</code>），所以节点的重连行为不变。</p>
+  <div class="ladder">
+    <div class="rung"><div class="when"><b>阶段 A</b>0 &ndash; 1.5 秒</div><p>并行竞速所有健康的 Tier P sentry，按当前会话数从少到多排序。跳过已达会话上限或处于冷却期的 sentry。第一个通过审核的区块（轮次合理，且与 tip 的差距在 <code>ACTIVE_ROUND_MAX_LAG</code> 内）胜出。</p></div>
+    <div class="rung"><div class="when"><b>阶段 B</b>1.5 &ndash; 3.5 秒</div><p>沿用现有的 Tier O 竞速：在排序后的公共池上使用 4 个并行名额。会话标记为 <span class="tag pub">fallback</span>，节点继续同步区块，但收不到 mempool。</p></div>
+    <div class="rung"><div class="when"><b>无可用 peer</b>3.5 秒后</div><p>与现在相同：走 <code>serve_push_4001_fallback</code> 或关闭连接，由节点重试。</p></div>
+    <div class="rung"><div class="when"><b>回切</b>重连时</div><p>回退会话在下一次自然重连时回到 Tier P。可选的强制回切（默认关闭）会在某个 sentry 连续两轮 peerd 检查通过后拆除会话。</p></div>
+  </div>
+</section>
+
+<section id="gates">
+  <h2>检查项</h2>
+  <p class="sub">G1 和 G2 是要问 QuickNode 的问题，在阶段 0 发出。G3&ndash;G6 需要真实的 sentry，在切换日（阶段 3）执行。在此之前，替身阶段负责验证代码。</p>
+  <div class="tbl"><table>
+    <thead><tr><th>检查项</th><th>行动</th><th>通过标准</th><th>未通过时</th></tr></thead>
+    <tbody>
+      <tr><td class="ch">G1 条款</td><td>询问 QuickNode：一个白名单 IP 能否通过我们的网关供多个下游节点使用</td><td>书面同意，以及节点数上限（如有）</td><td>每个节点一份订阅。hypersync 只用于故障切换和缓存，放弃扇出相关工作。</td></tr>
+      <tr><td class="ch">G2 限额</td><td>询问每个 sentry 对单 IP 的连接数、带宽和 abci_state 限制</td><td>拿到可以据此设计的具体数字</td><td>改为在阶段 4 的 soak 测试中实测</td></tr>
+      <tr><td class="ch">G3 基线</td><td>切换日 G5 通过后，让 node1 接在网关后面（不带 <code>--push</code>），以 qn-1..3 作为优先 peer，运行 24 小时，记录 mempool 速率和区块时序作为参照</td><td>node1 高度持续增长，<code>mempool_txs</code> 持续更新，基线已记录</td><td>先与 QuickNode 支持确认白名单和出口，再继续</td></tr>
+      <tr><td class="ch">G4 抓包</td><td><b>不在范围内（不需要 mempool）。</b>在 G3 运行期间，于网关主机上抓取网关连往 sentry 的 30 分钟 4001/4002 流量（node1 已开启 split）。分类帧类型、大小，以及 split 片段能否解出轮次。</td><td>识别出 split 帧，并确认接收方是否需要主动请求</td><td>如果节点需要主动请求 split 模式，在开启 <code>--push</code> 前确认 splice 会透传该请求</td></tr>
+      <tr><td class="ch">G5 出口</td><td>确认网关容器从 PUBLIC_IP 出去（在 gw 网络中执行 <code>curl ifconfig.me</code>）</td><td>即白名单 IP</td><td>添加配置参考中的 SNAT 规则</td></tr>
+      <tr><td class="ch">G6 入站</td><td>在 G3 期间记录 sentry IP 连往 PUBLIC_IP:4001/4002 的连接（在网关主机上用 <code>tcpdump</code> 或 conntrack）</td><td>弄清 sentry 是否连入、频率和端口，且 node1 能正常应答</td><td>即使从不连入，也保持 node1 端口开放：公共 peer 会降级未开放 4001/4002 的 IP，而 Tier O 依赖公共 peer</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="work">
+  <h2>工作项</h2>
+  <p class="sub">每项列出改动内容、涉及代码和完成标准。工作量为粗略的人日估计。</p>
+
+  <article class="work">
+    <div class="wh"><span class="wid">W1</span><h3>上游分层（优先 peer）</h3><span class="phase">阶段 1 &middot; 已于 2026-10-12 实现</span></div>
+    <div class="wb">
+      <div>
+        <p class="lbl">改动</p>
+        <ul>
+          <li>新模块 <code>priority.rs</code>。网关和 peerd 都读取 <code>HYPERSYNC_PRIORITY_PEERS</code>。peerd 像对待 <code>HL_SELF_IP</code> 一样，把这些 IP 排除在发现、探测和 peers.json 之外。网关从读取的池中剔除它们，所以 Tier O 中永远不会出现。</li>
+          <li>Tier P 的健康状况由网关自行判断：一次失败的尝试（拒绝、peer full、落后、没有区块）会让该 peer 进入 30 秒冷却。按 peer 统计会话数，负载最低的优先尝试。</li>
+          <li><code>select_live_peer</code> 改为上面的两阶段流程。在 <code>GatewayCtx</code> 中维护每个 sentry 的会话计数（<code>HashMap&lt;String, AtomicUsize&gt;</code>），固定时加一，<code>clear_active_if_current</code> 时减一。</li>
+          <li><code>handle_4001_live</code> 中的非 push 透传循环和 <code>client_block_peer_candidates</code> 都先遍历 Tier P，再遍历池。</li>
+        </ul>
+      </div>
+      <div>
+        <p class="lbl">完成标准</p>
+        <ul>
+          <li>单元测试：层级顺序、负载最低优先、超出会话上限跳过、优先列表为空时行为与现在一致。</li>
+          <li>3 个替身配 3 个 fakenode：每个落在不同的替身上。</li>
+          <li>用 iptables 封掉一个替身：它的节点在一次重连内转到另一个。封掉全部三个：节点在 3.5 秒内转到 Tier O。</li>
+          <li>不设置 <code>HYPERSYNC_PRIORITY_PEERS</code> 时，现有测试和 soak 行为与之前一致。</li>
+        </ul>
+      </div>
+    </div>
+    <div class="files">src/peerd.rs（探测选择、剔除、JSON 写入）&middot; src/gateway.rs:497 select_live_peer，:740 client_block_peer_candidates，:1897 handle_4001_live，GatewayCtx，NodeState</div>
+  </article>
+
+  <article class="work">
+    <div class="wh"><span class="wid">W2</span><h3>保证 mempool 安全的 active 转发</h3><span class="phase">W2a 阶段 2 &middot; 约 2 天 &middot; W2b 在切换日 G4 之后</span></div>
+    <div class="wb">
+      <div>
+        <p class="lbl">问题</p>
+        <p>在 active 流上，<code>pump_merge</code> 和 <code>process_live_frame</code> 会让每个能解出轮次的类型 1 帧经过 <code>RoundForwardGate</code>。轮次小于等于 <code>last_forwarded</code> 的帧会被丢弃（<code>src/protocol.rs:348</code>），小于等于 <code>live_floor</code> 的也会被丢弃。</p>
+        <p>如果 split 片段带有类似区块的头部，mempool 片段就会丢失。如果片段先于所属区块到达，区块本身也可能被丢掉。新的落后保护还可能因为误解析 split 帧而拆掉健康的会话。</p>
+        <p class="lbl" style="margin-top:12px">改动</p>
+        <ul>
+          <li><b>W2a（已实现）：</b>按会话统计转发的帧（控制帧、区块、无轮次数据帧）和轮次门控的丢弃数，每 60 秒及会话结束时记录，并记录前 5 次丢弃的载荷开头。转发规则不变，因为 live floor 保护着缓存冷启动路径。公共 peer 上的实测：mempool 流经 <code>serve_push</code> 回放后逐字节一致，实时会话转发 mempool 时 0 丢弃。</li>
+          <li>轮次门控和 floor 只用于影子注入，而影子注入保持关闭。</li>
+          <li><b>W2b，G4 之后：</b>根据抓包结果在 protocol.rs 中新增 <code>frame_kind(payload)</code>（<code>Block</code>、<code>SplitPiece</code> 或 <code>Other</code>），让健康检查只从 <code>Block</code> 帧读取轮次。</li>
+        </ul>
+      </div>
+      <div>
+        <p class="lbl">过渡规则</p>
+        <p>在 W2a 上线且 G4 在真实 sentry 上确认之前，<b>QuickNode 层的会话不使用 <code>--push</code></b>。纯 splice 是逐字节透传的。网关已有这条路径，W1 为它加上层级排序。</p>
+        <p class="lbl" style="margin-top:12px">完成标准</p>
+        <ul>
+          <li>W2a：把录制的替身流送入 <code>serve_push</code>，输出逐字节一致（新增类似 <code>mock</code> 的测试夹具）。切换日再用 sentry 的录制重复一次。</li>
+          <li>切换日：各节点的 <code>mempool_txs</code> 彼此一致且速率达到 G3 基线：6 小时窗口内节点间交易哈希重合度不低于 99.9%。该阈值为提议值，首次基线测量后再定。</li>
+          <li>切换日：24 小时 soak 中没有因 split 帧导致的 <code>lagged</code> 拆除。</li>
+        </ul>
+      </div>
+    </div>
+    <div class="files">src/push.rs pump_merge、process_live_frame、serve_push &middot; src/protocol.rs block_round、should_forward_block_round、新增 frame_kind</div>
+  </article>
+
+  <article class="work">
+    <div class="wh"><span class="wid">W3</span><h3>bootstrap 来源策略</h3><span class="phase">阶段 1 &middot; 约 1 天</span></div>
+    <div class="wb">
+      <div>
+        <p class="lbl">改动</p>
+        <ul>
+          <li>新增环境变量 <code>HYPERSYNC_PRIORITY_BOOTSTRAP=fallback|never|prefer</code>，默认 <code>fallback</code>。</li>
+          <li><code>bootstrap_capture_peers</code>、<code>bootstrap_candidates</code> 和透明 bootstrap 路径排除 Tier P，除非所有 Tier O 候选都失败。</li>
+          <li>无论如何设置，4 分钟一次的缓存刷新都不使用 Tier P。</li>
+        </ul>
+      </div>
+      <div>
+        <p class="lbl">完成标准</p>
+        <ul>
+          <li>单元测试：各模式下候选列表都正确排除优先 peer。</li>
+          <li>24 小时日志检查：公共池非空时，没有任何发往优先 peer 的 <code>send_abci:true</code> 连接。</li>
+          <li>切换日：网关日志中没有任何 sentry 返回 <code>abci state request rate limited</code>。</li>
+        </ul>
+      </div>
+    </div>
+    <div class="files">src/gateway.rs:24 bootstrap_capture_peers，:1642 bootstrap_candidates，:1800 transparent_bootstrap，:1368 capture_bootstrap_raced</div>
+  </article>
+
+  <article class="work">
+    <div class="wh"><span class="wid">W4</span><h3>层级可见性与回切</h3><span class="phase">阶段 2 &middot; 约 2 天</span></div>
+    <div class="wb">
+      <div>
+        <p class="lbl">改动</p>
+        <ul>
+          <li>每条会话日志都带 <code>tier=qn|public</code>，并每 60 秒输出每个节点的摘要（扩展 serve_push 中的落后日志任务）。</li>
+          <li><code>HYPERSYNC_FAILBACK_SECS</code>（默认 0 即关闭）：回退会话运行超过该时长，且某个 sentry 连续两轮 peerd 检查通过时，干净地结束会话，让节点重新选择 Tier P。</li>
+          <li><code>soak-test.sh</code> 增加 mempool 新鲜度一列：每个节点 <code>data/mempool_txs</code> 下最新文件的年龄。</li>
+        </ul>
+      </div>
+      <div>
+        <p class="lbl">完成标准</p>
+        <ul>
+          <li>断开全部 sentry 10 分钟后恢复。日志显示先回退、再回到 Tier P，且 mempool 新鲜度恢复。</li>
+          <li>每次强制回切，每个节点最多只付出一次重连。</li>
+        </ul>
+      </div>
+    </div>
+    <div class="files">src/push.rs lag_log 任务 &middot; src/gateway.rs serve_push_repinned、NodeState &middot; soak-test.sh</div>
+  </article>
+
+  <article class="work">
+    <div class="wh"><span class="wid">W5</span><h3>sentry IP 保密</h3><span class="phase">阶段 1 &middot; 约 1 天</span></div>
+    <div class="wb">
+      <div>
+        <p class="lbl">改动</p>
+        <ul>
+          <li><code>peer_label(ip)</code> 对优先 peer 返回 <code>prio-1..3</code>（先是替身，之后是本文称为 qn-1..3 的 sentry），其他 peer 返回 IP。所有打印 peer 的 <code>eprintln!</code> 都改用它：选择、错误、落后日志、peerd 周期摘要和 <code>summarize_peer_errors</code>。</li>
+          <li>peers.json 的临时文件在 rename 之前以 0600 权限创建。<code>data/</code> 目录已在 gitignore 中。</li>
+          <li>sentry IP 通过 <code>.env</code> 传入（已 gitignore），绝不写在 compose 文件里。</li>
+        </ul>
+      </div>
+      <div>
+        <p class="lbl">完成标准</p>
+        <ul>
+          <li>有测试断言格式化后的日志行不包含任何优先 IP。</li>
+          <li>对 gw 和 peerd 的 24 小时日志逐个 grep 优先 IP，结果为零：先查替身，切换日后查 sentry。</li>
+        </ul>
+      </div>
+    </div>
+    <div class="files">src/gateway.rs、src/push.rs、src/peerd.rs（所有打印 peer 的位置）&middot; docker-compose.yml</div>
+  </article>
+
+  <article class="work">
+    <div class="wh"><span class="wid">W6</span><h3>部署与出口</h3><span class="phase">阶段 1 &middot; 约 1 天</span></div>
+    <div class="wb">
+      <div>
+        <p class="lbl">改动</p>
+        <ul>
+          <li>Compose：把 <code>HYPERSYNC_PRIORITY_PEERS</code> 和 <code>HYPERSYNC_PRIORITY_BOOTSTRAP</code> 传给 gw 和 peerd。把 PUBLIC_IP 加入 <code>HL_SELF_IP</code>，确保 node1 不进入上游池。</li>
+          <li>主机 SNAT，让 <code>hypersync_gwnet</code> 从 PUBLIC_IP 出去（规则见配置参考）。</li>
+          <li>node1 从一开始就在 <code>gwnet</code> 上，<code>root_node_ips</code> 为网关，<code>reserved_peer_ips</code> 为优先 peer（切换日前为替身），并开放公网 4001/4002。</li>
+          <li>node1 的 4001/4002 通过 Docker 端口映射发布在 PUBLIC_IP 上。这是内核 DNAT，会保留 sentry 的源 IP。网关的监听端口保持私有。</li>
+          <li>README 增加“QuickNode 层”部署章节。</li>
+        </ul>
+      </div>
+      <div>
+        <p class="lbl">完成标准</p>
+        <ul>
+          <li>主机重启后 G5 仍然通过。</li>
+          <li>网关日志中只出现 prio-* 和 Tier O 上游，node1 唯一的出站 peer 是网关。</li>
+          <li>node1 日志中的入站 peer 显示真实 IP，而不是 172.28.0.x，因此 <code>reserved_peer_ips</code> 能匹配。</li>
+        </ul>
+      </div>
+    </div>
+    <div class="files">docker-compose.yml &middot; .env.example &middot; README.md &middot; 主机防火墙</div>
+  </article>
+
+  <article class="work">
+    <div class="wh"><span class="wid">W7</span><h3>按 sentry 扇出（有条件）</h3><span class="phase">阶段 4 &middot; 约 1&ndash;2 周 &middot; 仅当 soak 触及 sentry 限制时</span></div>
+    <div class="wb">
+      <div>
+        <p class="lbl">思路</p>
+        <p>每个 sentry 只开一条上游 4001 流，把它的帧复制给分配到该 sentry 的所有节点。sentry 的负载从随节点数 N 增长变为常数。</p>
+        <p>这不是已关闭的多源合并。它是单一来源的逐字节复制，所以不存在 proposer 与分叉正确性的问题。</p>
+        <ul>
+          <li>每个 sentry 一个广播器：缓存问候帧，通过 <code>tokio::sync::broadcast</code> 通道发送 <code>Arc&lt;[u8]&gt;</code> 帧。</li>
+          <li>节点在缓存的问候之后、从帧边界接入，缺口通过现有的 4002 代取路径补齐。</li>
+          <li>慢消费者（接收端落后）会被结束会话，由节点重连。</li>
+        </ul>
+      </div>
+      <div>
+        <p class="lbl">待解决的风险</p>
+        <ul>
+          <li>hl-node 是否接受问候之后从流中间开始的数据？真实的新流也是从 peer 的 tip 开始，所以大概率可行，但必须测试。</li>
+          <li>只有广播器持有 peer 关系时，4002 的 <code>Peer-only</code> 检查是否仍能通过？所有连接共用一个 IP，这可能有帮助。</li>
+          <li>多个慢节点落后时 mempool 占用的内存。</li>
+        </ul>
+        <p class="lbl" style="margin-top:12px">完成标准</p>
+        <ul><li>N 个 fakenode 加 2 个真实节点共用 1 条 sentry 流：各节点的区块和 mempool 结果一致，且 sentry 只看到 1 条流。</li></ul>
+      </div>
+    </div>
+    <div class="files">新增 src/fanout.rs &middot; src/gateway.rs handle_4001_live &middot; src/testing.rs fakenode</div>
+  </article>
+</section>
+
+<section id="rollout">
+  <h2>上线阶段</h2>
+  <p class="sub">每个阶段都以可度量的退出检查结束。任何阶段都可以单独停下，不会让系统比现在更差。</p>
+  <div class="phases">
+    <div class="ph"><div class="pn"><b>阶段 0</b><span>现在 &middot; 约 2 天</span></div><div class="pc"><p>提交当前的落后保护改动。把 G1 和 G2 发给 QuickNode。选出三个替身，并对现有网关做 24 小时参照运行，记录区块时序和重启耗时。</p><div class="exit"><b>退出</b>替身已选定，问题已发出，参照数据已记录。</div></div></div>
+    <div class="ph"><div class="pn"><b>阶段 1</b><span>替身，仅 splice &middot; 约 1 周</span></div><div class="pc"><p>针对替身完成 W1、W3、W5、W6。网关不带 <code>--push</code> 运行，保留 <code>--cache</code>。在 node1 之外再接入一个真实节点。</p><div class="exit"><b>退出</b>24 小时 soak：节点在 Tier P 上的时间 &ge; 99%，iptables 演练在 3.5 秒内回退，没有发往替身的 <code>send_abci</code>，日志中没有替身 IP。</div></div></div>
+    <div class="ph"><div class="pn"><b>阶段 2</b><span>替身，push + 回切 &middot; 约 1 周</span></div><div class="pc"><p>W2a 和 W4。重新开启 <code>--push</code>，以获得它的停滞拆除能力。对替身进行断开再恢复的演练。</p><div class="exit"><b>退出</b>逐字节回放测试通过。演练中回退 &le; 3.5 秒且回切正常。24 小时 push soak 无异常。</div></div></div>
+    <div class="ph"><div class="pn"><b>阶段 3</b><span>切换日 &middot; 约 2&ndash;3 天</span></div><div class="pc"><p>按切换日清单执行：G5、替换 IP，然后在 splice 模式下做 G3、G4 和 G6。如果 G4 需要就上线 W2b，然后开启 <code>--push</code>。</p><div class="exit"><b>退出</b>每个节点的 mempool 达到 G3 速率，一致性 &ge; 99.9%，Tier P 驻留 &ge; 99%，日志中没有 sentry IP。</div></div></div>
+    <div class="ph"><div class="pn"><b>阶段 4</b><span>容量 &middot; 3 天到 2 周</span></div><div class="pc"><p>在真实节点之上逐步增加 fakenode（2、4、8、16），直到出现 <code>peer_full</code>、吞吐瓶颈或 mempool 缺口。只有当这个上限低于所需节点数时才做 W7。</p><div class="exit"><b>退出</b>记录下每个 IP 可承载的节点数上限（有无扇出两种情况）。</div></div></div>
+  </div>
+</section>
+
+<section id="validate">
+  <h2>验证与指标</h2>
+  <div class="tbl"><table>
+    <thead><tr><th>指标</th><th>测量方式</th><th>目标</th></tr></thead>
+    <tbody>
+      <tr><td class="ch">Tier P 停留率</td><td>W4 中每个节点的 <code>tier=</code> 日志摘要</td><td>&ge; 99% 的会话时间</td></tr>
+      <tr><td class="ch">mempool 一致性</td><td>每小时对比各节点 <code>mempool_txs</code> 中的交易哈希，并与 G3 基线速率比较</td><td>重合度 &ge; 99.9%（提议值）</td></tr>
+      <tr><td class="ch">区块到达时差</td><td>网关收到第 N 轮与各节点应用该轮的时间差，p50/p99，先与阶段 0 的参照比较，再与 G3 比较</td><td>先记录基线，暂不设硬目标</td></tr>
+      <tr><td class="ch">回退耗时</td><td>iptables 丢弃所有 sentry 流量，到第一个公共区块被转发</td><td>&le; 3.5 秒选择时间加上节点重连</td></tr>
+      <tr><td class="ch">sentry abci 拉取</td><td>统计发往优先 peer 的 <code>send_abci:true</code> 会话</td><td>Tier O 非空时为 0</td></tr>
+      <tr><td class="ch">重启耗时</td><td>节点重启到第一个应用区块，缓存命中</td><td>不差于当前 soak 结果</td></tr>
+      <tr><td class="ch">现有测试</td><td><code>cargo test</code>、<code>clippy -D warnings</code>、fakenode 冒烟测试</td><td>每个阶段都全绿</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="config">
+  <h2>配置参考</h2>
+  <p class="sub">新增配置，名称为提议；现有变量不变。</p>
+  <div class="tbl"><table>
+    <thead><tr><th>变量</th><th>读取方</th><th>默认值</th><th>含义</th></tr></thead>
+    <tbody>
+      <tr><td class="ch">HYPERSYNC_PRIORITY_PEERS</td><td>peerd</td><td>空</td><td>优先 IP，逗号分隔：切换日前为替身，之后为 sentry。为空时行为与现在一致。</td></tr>
+      <tr><td class="ch">HYPERSYNC_PRIORITY_STAGE_MS</td><td>网关</td><td>1500</td><td>3.5 秒实时选择中阶段 A 的预算</td></tr>
+      <tr><td class="ch">HYPERSYNC_PRIORITY_MAX_SESSIONS</td><td>网关</td><td>0（不限）</td><td>每个 sentry 的会话上限，根据 G2 或阶段 4 结果设定</td></tr>
+      <tr><td class="ch">HYPERSYNC_PRIORITY_BOOTSTRAP</td><td>网关</td><td>fallback</td><td>是否允许 sentry 提供 abci_state</td></tr>
+      <tr><td class="ch">HYPERSYNC_FAILBACK_SECS</td><td>网关</td><td>0（关闭）</td><td>回退持续超过该秒数后强制回到 Tier P</td></tr>
+    </tbody>
+  </table></div>
+<pre><span class="c"># .env（已 gitignore；chmod 600）</span>
+<b>HL_SELF_IP</b>=&lt;PUBLIC_IP&gt;,&lt;其他节点公网 IP&gt;
+<span class="c"># 阶段 1&ndash;2：从 peerd 的 live_servers 中选出的三个稳定公共节点</span>
+<b>HYPERSYNC_PRIORITY_PEERS</b>=&lt;stand-in 1&gt;,&lt;stand-in 2&gt;,&lt;stand-in 3&gt;
+<span class="c"># 切换日：换成 QuickNode root，本文件其他内容不变</span>
+<span class="c"># HYPERSYNC_PRIORITY_PEERS=&lt;qn root 1&gt;,&lt;qn root 2&gt;,&lt;qn root 3&gt;</span>
+<b>HYPERSYNC_PRIORITY_BOOTSTRAP</b>=fallback
+
+<span class="c"># 主机：让网关网络从白名单 IP 出去</span>
+iptables -t nat -I POSTROUTING -s 172.28.0.0/24 ! -d 172.28.0.0/24 -j SNAT --to-source &lt;PUBLIC_IP&gt;
+
+<span class="c"># node1 compose：在白名单 IP 上发布其 gossip 端口（Docker DNAT 保留源 IP）</span>
+ports: ["&lt;PUBLIC_IP&gt;:4001:4001", "&lt;PUBLIC_IP&gt;:4002:4002"]
+
+<span class="c"># 下游节点 override_gossip_config.json（不设 split_client_blocks：只同步区块）</span>
+{"root_node_ips":[{"Ip":"172.28.0.10"}],"try_new_peers":false,"chain":"Mainnet"}
+
+<span class="c"># node1（边缘节点）：同上，另加 sentry 作为 reserved peer；override_public_ip_address = PUBLIC_IP</span>
+{"root_node_ips":[{"Ip":"172.28.0.10"}],"try_new_peers":false,"chain":"Mainnet",
+ "reserved_peer_ips":["&lt;qn 1&gt;","&lt;qn 2&gt;","&lt;qn 3&gt;"]}</pre>
+  <p class="caption">节点不设置 <code>split_client_blocks</code>：设置后 hl-node 会以广播组 1 问候并写出 <code>mempool_txs</code>（主网每小时约 22 GB），我们不需要。QuickNode 指南里设为 true 是为了他们自己的 mempool 产品。</p>
+</section>
+
+<section id="risks">
+  <h2>风险与待确认问题</h2>
+  <div class="tbl"><table>
+    <thead><tr><th>风险</th><th>影响</th><th>缓解措施</th></tr></thead>
+    <tbody>
+      <tr><td><span class="tag risk">条款</span> QuickNode 不允许共用一个 IP</td><td>多节点收益消失</td><td>写代码前先完成 G1。退回到每个节点一份订阅，hypersync 只负责缓存和故障切换。</td></tr>
+      <tr><td><span class="tag risk">容量</span> sentry 的单 IP 限制</td><td><code>peer_full</code>、会话被挤到 Tier O、mempool 缺口</td><td>W1 的会话上限、阶段 4 实测、W7 扇出</td></tr>
+      <tr><td><span class="tag risk">mempool</span> 网关改动了 split 帧</td><td>下游悄无声息地丢失 mempool</td><td>W2 之前只用 splice。逐字节回放测试。一致性指标。</td></tr>
+      <tr><td><span class="tag risk">回退</span> 在公共 peer 上悄悄失去 mempool</td><td>下游消费方读到过期或空的 mempool</td><td>W4 层级日志、新鲜度告警，消费方检查当前层级</td></tr>
+      <tr><td><span class="tag risk">限速</span> 网关向 sentry 拉取 abci_state</td><td>在最需要时被 sentry 拒绝提供状态</td><td>W3 策略，且缓存刷新永不使用 Tier P</td></tr>
+      <tr><td><span class="tag risk">延迟</span> 多一跳</td><td>节点比直连更晚看到区块和 mempool</td><td>测量网关收到区块与节点应用区块的时间差。延迟敏感的节点部署在网关主机上。</td></tr>
+      <tr><td><span class="tag risk">单点</span> 所有下游节点共用一个网关</td><td>网关宕机则包括 node1 在内的所有节点停滞</td><td>与现在相同，但现在还会切断所有 QuickNode 流量。第二个网关需要自己的白名单 IP，或在同一主机上做热备。</td></tr>
+      <tr><td><span class="tag risk">node1</span> 白名单 IP 上的 node1 宕机</td><td>peer 会拒绝来自 4001/4002 不应答的 IP 的实时流，网关因此失去上游</td><td>node1 的重启策略和监控与网关同级；已于 2026-10-12 实测</td></tr>
+      <tr><td><span class="tag risk">线格式</span> Hyperliquid 再次改变帧布局</td><td>轮次解码失效；审核、落后检查和排序全部失效</td><td>统计行中的 <code>ALERT=no_block_rounds_decoded</code>；每次 hl-node 升级后检查 60 秒统计行（blocks &gt; 0、丢弃为 0）</td></tr>
+      <tr><td><span class="tag risk">替身</span> 公共替身与 sentry 行为不同</td><td>代码在替身上通过，切换日却出现新问题：<code>peer_full</code>、限速、split 帧</td><td>切换日先只用 splice，执行 G3、G4 和 G6。<code>--push</code> 和会话上限等拿到真实数字再定。</td></tr>
+      <tr><td><span class="tag risk">泄露</span> sentry IP 通过日志或文件泄露</td><td>违反 QuickNode 的保密要求</td><td>W5 别名、文件权限，每次 soak 都 grep 日志</td></tr>
+    </tbody>
+  </table></div>
+  <div class="note risk">本方案尚未针对 QuickNode 实际运行过。架构依据是 QuickNode 公开的部署教程、Hyperliquid 节点 README 和 hypersync 逆向得到的协议笔记。替身现在负责验证代码路径；切换日的检查项则在开启 <code>--push</code> 之前验证与 QuickNode 相关的假设。</div>
+</section>
+
+<footer>
+  资料来源：hypersync README、docs/hl-p2p-protocol.md、src/gateway.rs、src/push.rs、src/protocol.rs、src/peerd.rs &middot;
+  <a href="https://www.quicknode.com/guides/hyperliquid/run-non-validating-node-with-quicknode-peering">QuickNode peering 教程</a> &middot;
+  <a href="https://github.com/quicknode/hyperliquid-peering-node">quicknode/hyperliquid-peering-node</a> &middot;
+  <a href="https://github.com/hyperliquid-dex/node">hyperliquid-dex/node</a> &middot;
+  英文版：hypersync-quicknode-upgrade-plan.html
+</footer>
+<script>
+(function () {
+  // 时序图。消息：[发起泳道, 目标泳道, 标签（'\n' 换行）, 类型, 是否虚线]。
+  // 注释：{n: 文本, a: 泳道, b: 末泳道, k: 'err'}。类型：node qn pub cache probe err。
+  var G = '网关', GIP = '172.28.0.10';
+  var SEQ = {
+    s1: { lanes: [['node2', '下游节点'], [G, GIP], ['缓存', '内存 + 磁盘'], ['qn-k', 'QuickNode sentry']], steps: [
+      [0, 1, 'gw:4001 · send_abci=1', 'node'],
+      [1, 2, '缓存新鲜？(≤ 8 分钟)', 'cache'],
+      [2, 1, '约 4.5 GB 数据', 'cache', 1],
+      [1, 0, '回放状态 + EVM KV\n按 8 MB 分块', 'cache'],
+      { n: 'live floor = 缓存中最后一轮', a: 1 },
+      [1, 3, 'qn-k:4001 · GREET_FALSE（网关自己的）', 'qn'],
+      [3, 1, '问候 + 第一个实时区块', 'qn', 1],
+      { n: '审核：轮次合理、落后 ≤ 1500、高于 floor', a: 1, b: 3 },
+      [1, 0, '问候 + 实时流', 'qn'],
+      [0, 1, 'gw:4002 · 区间 [X,Y]', 'node'],
+      [1, 3, '原样字节 → qn-k:4002（固定的 active）', 'qn'],
+      [3, 1, 'client-block 批量响应', 'qn', 1],
+      [1, 0, '批量响应，原样', 'qn', 1]
+    ] },
+    s2: { lanes: [['node2', '下游节点'], [G, GIP], ['pub-x', '公共 peer'], ['缓存', '内存 + 磁盘']], steps: [
+      [0, 1, 'gw:4001 · send_abci=1', 'node'],
+      [1, 2, 'pub:4001 · 节点问候\n≤ 32 个候选竞速', 'pub'],
+      [2, 1, '帧 > 4 MB：在提供\n1 字节状态：拒绝', 'pub', 1],
+      { n: '固定 active = pub-x · 记住状态服务方', a: 1, b: 2 },
+      [1, 0, '预读数据，然后透传', 'pub'],
+      [1, 3, '旁路写入（同时仅一路）', 'cache', 1],
+      { n: '同一 socket 继续变为 pub-x 的实时区块', a: 0, b: 2 },
+      [0, 1, 'gw:4002 · 区间 [X,Y]', 'node'],
+      [1, 2, 'pub-x:4002（固定）', 'pub'],
+      [2, 1, '批量响应', 'pub', 1],
+      [1, 0, '批量响应，原样', 'pub', 1]
+    ] },
+    s3: { lanes: [['node2', '下游节点'], [G, GIP], ['qn-1', 'sentry'], ['qn-2', 'sentry']], steps: [
+      [0, 1, 'gw:4001 · send_abci=0', 'node'],
+      [1, 2, '节点问候 → qn-1', 'qn'],
+      [1, 3, '节点问候 → qn-2（阶段 A 竞速）', 'qn'],
+      [2, 1, '首个审核通过的区块胜出', 'qn', 1],
+      { n: 'qn-2 的尝试中止 · active = qn-1', a: 1, b: 3 },
+      [1, 0, '问候 + 实时流', 'qn'],
+      { n: '--push：轮次只用于健康检查，帧原样转发（W2）', a: 0, b: 2 },
+      [0, 1, 'gw:4002 · 高度/区间', 'node'],
+      [1, 2, 'qn-1:4002，独占 2 秒', 'qn'],
+      [2, 1, '响应', 'qn', 1],
+      [1, 0, '响应，原样', 'qn', 1],
+      [0, 1, 'gw:4003 … 4010', 'node'],
+      [1, 2, '透传到 qn-1', 'qn']
+    ] },
+    s4: { lanes: [['node2', '下游节点'], [G, GIP], ['qn-1', 'active sentry'], ['qn-2', 'sentry'], ['pub-x', '公共 peer']], steps: [
+      [0, 1, 'gw:4002 · 区间 [X,Y]', 'node'],
+      [1, 2, 'qn-1:4002（独占）', 'qn'],
+      { n: '2 秒宽限到期，或回复 Peer-only', a: 1, b: 2, k: 'err' },
+      [1, 3, '临时 qn-2:4001 · GREET_FALSE', 'qn'],
+      [1, 3, 'qn-2:4002 · 同一请求', 'qn'],
+      [1, 4, '临时 pub-x:4001，再 :4002（Tier O，W1 之后）', 'pub'],
+      [3, 1, '批量响应（首个有效者胜出）', 'qn', 1],
+      { n: '其他尝试中止 · qn-1 的 Peer-only 会解除其固定', a: 1, b: 4 },
+      [1, 0, '批量响应，原样', 'qn', 1]
+    ] },
+    s5: { lanes: [['node2', '下游节点'], [G, GIP], ['qn-1', '故障 sentry'], ['qn-2', 'sentry'], ['pub-x', '公共 peer']], steps: [
+      { n: 'qn-1 10 秒无数据，或落后 > 1500 轮', a: 1, b: 2, k: 'err' },
+      [1, 2, '关闭上游', 'err'],
+      [1, 0, '关闭 4001 · 解除固定', 'err'],
+      [0, 1, '重连 · send_abci=0', 'node'],
+      [1, 3, '阶段 A：qn-2 / qn-3 竞速', 'qn'],
+      [3, 1, '审核通过 → active = qn-2', 'qn', 1],
+      [1, 0, '实时流恢复', 'qn'],
+      { n: '若所有 sentry 都失败：阶段 B，tier = public，无 mempool', a: 1, b: 4, k: 'err' },
+      [1, 4, 'pub-x:4001（仅作回退）', 'pub'],
+      { n: '下次重连时回切，或超过 HYPERSYNC_FAILBACK_SECS 后回切（W4）', a: 0, b: 4 }
+    ] },
+    s6: { lanes: [['node1', '边缘节点'], [G, GIP], ['qn-k', 'QuickNode sentry'], ['peerd', '探测进程']], steps: [
+      [0, 1, 'gw:4001 / gw:4002', 'node'],
+      [1, 2, 'qn-k:4001/:4002（同 S3）', 'qn'],
+      [2, 0, 'PUBLIC_IP :4001 / :4002\nDNAT；node1 提供服务', 'qn'],
+      { n: 'node1 不从入站 peer 接收数据，只通过网关同步', a: 0, b: 2 },
+      { n: 'peerd 从不连接 qn-k：优先 IP 与自有节点一样被排除', a: 2, b: 3 },
+      { n: 'peerd 写入 peers.json · 网关每 30 秒重读', a: 1, b: 3 }
+    ] }
+  };
+  var LW = 170, PAD = 20;
+  function tw(s) { var w = 0; for (var i = 0; i < s.length; i++) w += s.charCodeAt(i) > 0x2e7f ? 11.2 : 6.6; return w; }
+  function esc(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+  function cx(i) { return PAD + LW * i + LW / 2; }
+  function draw(el) {
+    var spec = SEQ[el.getAttribute('data-seq')];
+    if (!spec) return;
+    var W = PAD * 2 + LW * spec.lanes.length, y = 70, body = [], num = 0;
+    spec.steps.forEach(function (s) {
+      if (!Array.isArray(s)) {
+        var a = cx(s.a), b = cx(s.b === undefined ? s.a : s.b);
+        var w = Math.max(Math.abs(b - a) + 60, tw(s.n) + 24);
+        var x = Math.min(Math.max(4, (a + b) / 2 - w / 2), W - 4 - w);
+        body.push('<rect class="notebox' + (s.k === 'err' ? ' err' : '') + '" x="' + x + '" y="' + y + '" width="' + w + '" height="26" rx="6"/>');
+        body.push('<text class="lab ' + (s.k === 'err' ? 't-err' : 'tx') + '" x="' + (x + w / 2) + '" y="' + (y + 17) + '" text-anchor="middle">' + esc(s.n) + '</text>');
+        y += 38;
+        return;
+      }
+      num += 1;
+      var from = s[0], to = s[1], lines = s[2].split('\n'), k = s[3], dashed = s[4];
+      var dir = to > from ? 1 : -1, x1 = cx(from) + 3 * dir, x2 = cx(to) - 5 * dir, mid = (cx(from) + cx(to)) / 2;
+      lines.forEach(function (t, i) {
+        body.push('<text class="lab t-' + k + '" x="' + mid + '" y="' + (y + 11 + 13 * i) + '" text-anchor="middle">' +
+          (i === 0 ? '<tspan class="num">' + num + '  </tspan>' : '') + esc(t) + '</text>');
+      });
+      var ly = y + 13 * lines.length + 6;
+      body.push('<line class="k-' + k + '" x1="' + x1 + '" y1="' + ly + '" x2="' + x2 + '" y2="' + ly + '" stroke-width="1.8"' +
+        (dashed ? ' stroke-dasharray="6 4"' : '') + ' marker-end="url(#m-' + k + ')"/>');
+      y = ly + 16;
+    });
+    var H = y + 8, head = [];
+    spec.lanes.forEach(function (l, i) {
+      var c = cx(i);
+      head.push('<line class="life" x1="' + c + '" y1="50" x2="' + c + '" y2="' + (H - 4) + '"/>');
+      head.push('<rect class="cell" x="' + (c - LW / 2 + 10) + '" y="8" width="' + (LW - 20) + '" height="42" rx="7"/>');
+      head.push('<text class="h1" x="' + c + '" y="26" text-anchor="middle">' + esc(l[0]) + '</text>');
+      head.push('<text class="h2" x="' + c + '" y="42" text-anchor="middle">' + esc(l[1]) + '</text>');
+    });
+    el.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ' + W + ' ' + H + '">' + head.join('') + body.join('') + '</svg>';
+  }
+  var els = document.querySelectorAll('.seq[data-seq]');
+  for (var i = 0; i < els.length; i++) draw(els[i]);
+})();
+</script>
+</main>
+</div>
+</div>

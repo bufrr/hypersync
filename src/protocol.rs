@@ -8,6 +8,15 @@ use crate::gateway::{MIN_COMPLETE_BOOTSTRAP_BYTES, MIN_COMPLETE_BOOTSTRAP_FRAMES
 pub(crate) const GREET_FALSE: [u8; 8] = [0, 0, 0, 3, 0, 0, 0, 0]; // send_abci:false (live blocks; no rate-limited state)
 pub(crate) const GREET_TRUE: [u8; 8] = [0, 0, 0, 3, 0, 1, 0, 0]; // send_abci:true (full bootstrap stream)
 pub(crate) const MIN_PLAUSIBLE_MAINNET_ROUND: u32 = 1_000_000_000;
+// Active-session freshness guard. peerd keeps a wider pool-level lag window so it does not churn the
+// whole candidate set, but a peer actively serving one node should not trail the multi-peer clustered
+// tip by minutes. 1500 rounds is ~100 seconds at the current mainnet rate, but the reference tip is
+// itself stale — peerd rewrites peers.json every cycle (`peerd [interval]`, 120s in compose) and the gateway re-reads it every
+// 30s — so the effective threshold is 1500 rounds plus however far the tip has aged, in practice
+// ~100-255s at a 120s peerd cycle. Treat this as a floor on how bad a peer must be, not a deadline.
+// If peerd stops publishing entirely the frozen tip falls behind every live round and the guard
+// simply stops firing, which is the direction we want it to fail.
+pub(crate) const ACTIVE_ROUND_MAX_LAG: u32 = 1_500;
 // Ceiling slack above the observed network round tip (~4h of rounds at ~14.5/s). The ceiling is
 // tip-relative rather than a constant so it keeps rejecting high decode artifacts (e.g. the
 // observed 2_818_597_137 misparse) without ever turning into a wall-clock time bomb as the real
@@ -17,29 +26,65 @@ pub(crate) const NET_TIP_SLACK_ROUNDS: u32 = 200_000;
 // `net_tip` is the best-known network round tip (peerd's clustered probe tip via peers.json,
 // raised by bootstrap-cache scans); 0 = unknown, which disables the ceiling and falls back to the
 // floor-only check (clustering downstream still rejects isolated artifacts). A too-high tip only
-// widens the ceiling — it can never block legitimate rounds.
+// widens *this* ceiling, but it does tighten round_lag_from_tip below, so the tip must never be
+// raised from an uncorroborated sample.
 pub(crate) fn is_plausible_mainnet_round(round: u32, net_tip: u32) -> bool {
     round >= MIN_PLAUSIBLE_MAINNET_ROUND
         && (net_tip == 0 || round <= net_tip.saturating_add(NET_TIP_SLACK_ROUNDS))
 }
 
-// Reference / correctness oracle + fallback: full lz4 decompress, read round @0x5e.
-// Round parsing assumes the `0xfc + u32 LE` varint form. Mainnet rounds (~1.35B, +~14.5/s) stay
-// under u32::MAX for roughly 6 more years; past that the wire varint becomes `0xfd + u64`, these
-// parsers return None, and dedup gracefully degrades to forward-everything (the node de-dups).
-pub(crate) fn block_round_full(payload: &[u8]) -> Option<u32> {
-    let dec = lz4_flex::block::decompress_size_prepended(payload).ok()?;
-    if dec.len() >= 0x63 && dec[0x5e] == 0xfc {
-        Some(u32::from_le_bytes([
-            dec[0x5f], dec[0x60], dec[0x61], dec[0x62],
-        ]))
-    } else {
-        None
+pub(crate) fn round_lag_from_tip(round: u32, net_tip: u32, max_lag: u32) -> Option<u32> {
+    if net_tip == 0 || round >= net_tip {
+        return None;
     }
+    let lag = net_tip - round;
+    (lag > max_lag).then_some(lag)
 }
 
-// Bounded LZ4 block decode: produce only the first `out.len()` bytes (round lives at 0x5e, so we
-// never decompress the full ~200KB block). Standard LZ4 block format; returns bytes produced, or
+// Live block round (wire format as of 2026-10 mainnet). The decompressed block opens with a
+// variable-length header (8 x [0xfd + u64] entries, then a run of 32-byte entries whose count
+// varies per block), so the round no longer sits at a fixed offset (it was 0x5e until mid-2026;
+// it is now seen anywhere in 0x71..0xd1). It is the first `0xfc R 0xfc R1 0xfc R2` varint triple
+// where R1 and R2 are the preceding rounds (the parent / QC chain): R1 < R, R2 < R1, each within
+// MAX_PARENT_ROUND_GAP. The parent check rejects look-alike triples inside hashes (one sits right
+// before the real round in captured blocks). A frame that doesn't match yields None, which every
+// caller treats as "not a block": forwarded untouched, never dropped.
+//
+// Round parsing assumes the `0xfc + u32 LE` varint form. Mainnet rounds (~1.48B, +~14.5/s) stay
+// under u32::MAX for roughly 6 more years; past that the wire varint becomes `0xfd + u64`, these
+// parsers return None, and dedup gracefully degrades to forward-everything (the node de-dups).
+const ROUND_SCAN_BYTES: usize = 0x400;
+// Timed-out rounds leave gaps in the parent chain; keep the tolerance well above anything seen.
+const MAX_PARENT_ROUND_GAP: u32 = 256;
+
+fn find_block_round(dec: &[u8]) -> Option<u32> {
+    let rd = |o: usize| u32::from_le_bytes([dec[o + 1], dec[o + 2], dec[o + 3], dec[o + 4]]);
+    let end = dec.len().min(ROUND_SCAN_BYTES);
+    let mut o = 0usize;
+    while o + 15 <= end {
+        if dec[o] == 0xfc && dec[o + 5] == 0xfc && dec[o + 10] == 0xfc {
+            let (r, r1, r2) = (rd(o), rd(o + 5), rd(o + 10));
+            if r1 < r
+                && r - r1 <= MAX_PARENT_ROUND_GAP
+                && r2 < r1
+                && r1 - r2 <= MAX_PARENT_ROUND_GAP
+            {
+                return Some(r);
+            }
+        }
+        o += 1;
+    }
+    None
+}
+
+// Reference / correctness oracle + fallback: full lz4 decompress, then the same header scan.
+pub(crate) fn block_round_full(payload: &[u8]) -> Option<u32> {
+    let dec = lz4_flex::block::decompress_size_prepended(payload).ok()?;
+    find_block_round(&dec)
+}
+
+// Bounded LZ4 block decode: produce only the first `out.len()` bytes (the round lives in the
+// first ROUND_SCAN_BYTES, so we never decompress the full ~250KB block). Standard LZ4 block format; returns bytes produced, or
 // None if it can't safely reach the requested length (caller falls back to full decompress).
 fn lz4_first_n(input: &[u8], out: &mut [u8]) -> Option<usize> {
     let n = out.len();
@@ -118,50 +163,12 @@ pub(crate) fn block_round(payload: &[u8]) -> Option<u32> {
     if payload.len() < 5 {
         return block_round_full(payload);
     }
-    let lz = &payload[4..]; // skip the u32-LE uncompressed-size prefix
-                            // fast path: the first 0x63 decompressed bytes of an lz4 block are always raw literals (nothing
-                            // to back-reference at the start). If the first token's literal run covers them, read the round
-                            // straight from the literal bytes — no decode buffer, no copy.
-    let token = lz[0];
-    let mut lit = (token >> 4) as usize;
-    let mut p = 1usize;
-    if lit == 15 {
-        while p < lz.len() {
-            let b = lz[p];
-            p += 1;
-            lit += b as usize;
-            if b != 255 {
-                break;
-            }
-        }
-    }
-    if lit >= 0x63 && p + 0x63 <= lz.len() {
-        // SAFETY: p + 0x63 <= lz.len() is checked on the line above.
-        unsafe {
-            return if *lz.get_unchecked(p + 0x5e) == 0xfc {
-                Some(u32::from_le_bytes([
-                    *lz.get_unchecked(p + 0x5f),
-                    *lz.get_unchecked(p + 0x60),
-                    *lz.get_unchecked(p + 0x61),
-                    *lz.get_unchecked(p + 0x62),
-                ]))
-            } else {
-                None
-            };
-        }
-    }
-    let mut buf = [0u8; 0x63];
-    match lz4_first_n(lz, &mut buf) {
-        Some(n) if n >= 0x63 => {
-            if buf[0x5e] == 0xfc {
-                Some(u32::from_le_bytes([
-                    buf[0x5f], buf[0x60], buf[0x61], buf[0x62],
-                ]))
-            } else {
-                None
-            }
-        }
-        _ => block_round_full(payload),
+    // skip the u32-LE uncompressed-size prefix; decode only the header we scan (blocks run to
+    // ~250KB decompressed)
+    let mut buf = [0u8; ROUND_SCAN_BYTES];
+    match lz4_first_n(&payload[4..], &mut buf) {
+        Some(n) => find_block_round(&buf[..n]),
+        None => block_round_full(payload),
     }
 }
 
@@ -361,6 +368,10 @@ impl RoundForwardGate {
         }
     }
 
+    pub(crate) fn last_forwarded(&self) -> u32 {
+        self.last_forwarded
+    }
+
     pub(crate) fn should_forward(&mut self, round: u32, from_active: bool) -> bool {
         should_forward_block_round(round, from_active, &mut self.last_forwarded, &self.dedup)
     }
@@ -373,18 +384,33 @@ pub(crate) fn unix_secs() -> u64 {
         .unwrap_or(0)
 }
 
+// A live-block payload in the 2026-10 wire layout: 0x00, 8 x [0xfd + u64], a count byte,
+// `pad32` 32-byte entries, then `0xfc R 0xfc R-1 0xfc R-2` and filler. lz4 size-prepended.
+#[cfg(test)]
+pub(crate) fn test_block_payload(round: u32, pad32: usize) -> Vec<u8> {
+    let mut dec = vec![0x00u8];
+    for i in 0..8u8 {
+        dec.push(0xfd);
+        dec.extend_from_slice(&[i.wrapping_mul(37).wrapping_add(1); 8]);
+    }
+    dec.push(0x1c);
+    for i in 0..pad32 {
+        dec.extend((0..32).map(|j| (i * 32 + j) as u8 ^ 0x5a));
+    }
+    for r in [round, round.wrapping_sub(1), round.wrapping_sub(2)] {
+        dec.push(0xfc);
+        dec.extend_from_slice(&r.to_le_bytes());
+    }
+    dec.extend((0..0x200).map(|i| (i % 251) as u8));
+    lz4_flex::block::compress_prepend_size(&dec)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // A decompressed block whose first bytes are unique (ramp), so lz4 emits a leading literal run
-    // >= 0x63 and block_round's fast path engages; the consensus round sits at offset 0x5e
-    // (varint 0xfc + u32 LE), matching the real wire format.
     fn make_block(round: u32) -> Vec<u8> {
-        let mut dec: Vec<u8> = (0..0x100).map(|i| i as u8).collect();
-        dec[0x5e] = 0xfc;
-        dec[0x5f..0x63].copy_from_slice(&round.to_le_bytes());
-        lz4_flex::block::compress_prepend_size(&dec)
+        test_block_payload(round, 2)
     }
 
     fn make_frame(typ: u8, payload: &[u8]) -> Vec<u8> {
@@ -396,11 +422,54 @@ mod tests {
 
     #[test]
     fn block_round_matches_full_decompress() {
-        for round in [0u32, 1, 1000, 1_055_000_000, u32::MAX] {
-            let payload = make_block(round);
-            assert_eq!(block_round_full(&payload), Some(round), "full @ {round}");
-            assert_eq!(block_round(&payload), Some(round), "fast @ {round}");
+        for round in [2u32, 1000, 1_055_000_000, 1_483_968_338, u32::MAX] {
+            for pad32 in [0, 2, 3, 5, 20] {
+                let payload = test_block_payload(round, pad32);
+                assert_eq!(
+                    block_round_full(&payload),
+                    Some(round),
+                    "full @ {round}/{pad32}"
+                );
+                assert_eq!(
+                    block_round(&payload),
+                    Some(round),
+                    "bounded @ {round}/{pad32}"
+                );
+            }
         }
+    }
+
+    // A real 2026-10 mainnet live block (smallest frame of a 20s capture). Its header has a
+    // look-alike varint triple at 0x6b that fails the parent check; the round is at 0x70.
+    #[test]
+    fn block_round_decodes_captured_mainnet_block() {
+        let payload = include_bytes!("testdata/block-2026-10.lz4");
+        assert_eq!(block_round_full(payload), Some(1_483_968_338));
+        assert_eq!(block_round(payload), Some(1_483_968_338));
+    }
+
+    #[test]
+    fn block_round_rejects_triples_without_a_parent_chain() {
+        let mut dec = vec![0x11u8; 0x200];
+        for (o, r) in [
+            (0x80usize, 1_400_000_000u32),
+            (0x85, 1_500_000_000),
+            (0x8a, 1_399_999_999),
+        ] {
+            dec[o] = 0xfc;
+            dec[o + 1..o + 5].copy_from_slice(&r.to_le_bytes());
+        }
+        let payload = lz4_flex::block::compress_prepend_size(&dec);
+        assert_eq!(block_round_full(&payload), None);
+        assert_eq!(block_round(&payload), None);
+        // old-format blocks (round alone at 0x5e) are no longer recognised
+        let mut old = vec![0x22u8; 0x100];
+        old[0x5e] = 0xfc;
+        old[0x5f..0x63].copy_from_slice(&1_400_000_000u32.to_le_bytes());
+        assert_eq!(
+            block_round(&lz4_flex::block::compress_prepend_size(&old)),
+            None
+        );
     }
 
     #[test]
@@ -454,6 +523,23 @@ mod tests {
         // unknown tip disables the ceiling (never blocks legitimate growth), keeps the floor
         assert!(is_plausible_mainnet_round(2_818_597_137, 0));
         assert!(is_plausible_mainnet_round(u32::MAX, 0));
+    }
+
+    #[test]
+    fn round_lag_from_tip_ignores_unknown_or_close_tip() {
+        assert_eq!(round_lag_from_tip(1_356_000_000, 0, 5_000), None);
+        assert_eq!(
+            round_lag_from_tip(1_356_000_000, 1_356_005_000, 5_000),
+            None
+        );
+        assert_eq!(
+            round_lag_from_tip(1_356_000_000, 1_356_005_001, 5_000),
+            Some(5_001)
+        );
+        assert_eq!(
+            round_lag_from_tip(1_356_010_000, 1_356_005_000, 5_000),
+            None
+        );
     }
 
     #[test]
@@ -511,13 +597,15 @@ mod tests {
 
     #[test]
     fn block_round_bounded_decode_path() {
-        // A repetitive prefix compresses to a short literal run + back-references, so the
-        // literal fast path (needs >=0x63 leading literals) is skipped and the bounded decoder
-        // lz4_first_n — including its overlapping match-copy loop — does the work.
-        for round in [1u32, 123_456_789, u32::MAX] {
-            let mut dec = vec![0xAAu8; 0x100];
-            dec[0x5e] = 0xfc;
-            dec[0x5f..0x63].copy_from_slice(&round.to_le_bytes());
+        // A repetitive header compresses to back-references, so the bounded decoder
+        // lz4_first_n -- including its overlapping match-copy loop -- does the work.
+        for round in [2u32, 123_456_789, u32::MAX] {
+            let mut dec = vec![0xAAu8; 0x300];
+            let o = 0xb1;
+            for (k, r) in [round, round - 1, round - 2].into_iter().enumerate() {
+                dec[o + 5 * k] = 0xfc;
+                dec[o + 5 * k + 1..o + 5 * k + 5].copy_from_slice(&r.to_le_bytes());
+            }
             let payload = lz4_flex::block::compress_prepend_size(&dec);
             assert_eq!(block_round_full(&payload), Some(round), "oracle @ {round}");
             assert_eq!(block_round(&payload), Some(round), "bounded @ {round}");

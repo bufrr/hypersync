@@ -15,9 +15,14 @@
 # Applied height is sampled only from the current window; stale docker-log tail fallback would make a
 # restarted node appear to move backwards.
 #
+# Tier/mempool columns (QuickNode upgrade plan): tier = the node's current upstream tier from the
+# gateway's latest 60s stats line (prio = Tier P, pool = Tier O); starts = session starts per tier
+# in the window; mp_mb = mempool_txs bytes the node wrote in the window; drops/alert = --push
+# round-gate drops (sampled) and the wire-format alarm.
+#
 # Usage: soak-test.sh [restart-node-at-start:0|1] [samples] [interval-seconds] [log-file]
 NODE="${HL_NODE:-hyperliquid-node-1}"
-GW="${HL_GW:-hl-gw}"
+GW="${HL_GW:-hypersync-gw}"
 RESTART="${1:-0}"
 N="${2:-20}"
 INTERVAL="${3:-180}"
@@ -30,7 +35,9 @@ fi
 
 GWIP=$(sudo docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$GW" 2>/dev/null)
 echo "=== soak start $(date '+%F %T') node=$NODE gw=$GW($GWIP) samples=$N interval=${INTERVAL}s ===" >> "$LOG"
+mp_bytes() { sudo docker exec "$NODE" sh -c 'du -sb /home/hluser/hl/data/mempool_txs 2>/dev/null | cut -f1' 2>/dev/null; }
 prev=
+mp_prev=$(mp_bytes)
 SINCE_TS=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 for i in $(seq 1 "$N"); do
   UNTIL_TS=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
@@ -51,13 +58,31 @@ for i in $(seq 1 "$N"); do
   NRC=$(sudo docker inspect -f '{{.RestartCount}}' "$NODE" 2>/dev/null)
   GWMEM=$(sudo docker stats --no-stream --format '{{.MemUsage}}' "$GW" 2>/dev/null | awk '{print $1}')
   NMEM=$(sudo docker stats --no-stream --format '{{.MemUsage}}' "$NODE" 2>/dev/null | awk '{print $1}')
+  LAST_STATS=$(printf '%s\n' "$GLOG" | grep -a 'active peer round lag' | tail -1)
+  case "$LAST_STATS" in
+    *active_peer=prio-*) TIER=prio ;;
+    "") TIER=none ;;
+    *) TIER=pool ;;
+  esac
+  ST_PRIO=$(printf '%s\n' "$GLOG" | grep -ac 'session start.*tier=prio')
+  ST_POOL=$(printf '%s\n' "$GLOG" | grep -ac 'session start.*tier=pool')
+  DROPS=$(printf '%s\n' "$GLOG" | grep -ac 'push drop sample')
+  ALERT=$(printf '%s\n' "$GLOG" | grep -ac 'ALERT=')
+  PRIOFAIL=$(printf '%s\n' "$GLOG" | grep -ac 'live attempt failed')
+  mp_now=$(mp_bytes)
+  if [ -n "$mp_now" ] && [ -n "$mp_prev" ]; then
+    MPMB=$(( (mp_now - mp_prev) / 1000000 ))
+  else
+    MPMB=NA
+  fi
+  mp_prev="$mp_now"
   if [ -n "$A" ] && [ -n "$prev" ]; then
     delta=$(( A - prev ))
   else
     delta=NA
   fi
-  printf '%s s%02d/%d applied=%s d/%ds=%s src=[%s] realerr=%s boot_timeout=%s behind=%s child=%s catchup=%s gwerr=%s gw{rc=%s st=%s oom=%s mem=%s} node{rc=%s mem=%s}\n' \
-    "$(date '+%T')" "$i" "$N" "${A:-?}" "$INTERVAL" "$delta" "$SRC" "$REAL" "$BOOTTO" "$BEHIND" "$CHILD" "$CATCHUP" "$GWERR" "${GWRC:-?}" "${GWST:-?}" "${GWOOM:-?}" "${GWMEM:-?}" "${NRC:-?}" "${NMEM:-?}" >> "$LOG"
+  printf '%s s%02d/%d applied=%s d/%ds=%s src=[%s] realerr=%s boot_timeout=%s behind=%s child=%s catchup=%s gwerr=%s tier=%s starts{prio=%s pool=%s} prio_fail=%s mp_mb=%s drops=%s alert=%s gw{rc=%s st=%s oom=%s mem=%s} node{rc=%s mem=%s}\n' \
+    "$(date '+%T')" "$i" "$N" "${A:-?}" "$INTERVAL" "$delta" "$SRC" "$REAL" "$BOOTTO" "$BEHIND" "$CHILD" "$CATCHUP" "$GWERR" "$TIER" "$ST_PRIO" "$ST_POOL" "$PRIOFAIL" "$MPMB" "$DROPS" "$ALERT" "${GWRC:-?}" "${GWST:-?}" "${GWOOM:-?}" "${GWMEM:-?}" "${NRC:-?}" "${NMEM:-?}" >> "$LOG"
   prev="$A"
   SINCE_TS="$UNTIL_TS"
   [ "$i" -lt "$N" ] && sleep "$INTERVAL"
