@@ -24,9 +24,30 @@ use crate::peerd::{run_peerd, split_csv};
 use crate::push::{run_proxy, run_relay, serve};
 use crate::testing::{run_bench, run_cache, run_fakenode, run_mock};
 
+// glibc raises its mmap threshold (up to 32MB) each time a large mmapped chunk is freed, after
+// which multi-MB buffers (4002 client-block responses, up to ~57MB) are carved from per-thread
+// arenas instead and stay resident after free. That grew the gateway ~100-300MB per node catch-up
+// (243MB -> 849MB over 6 node restarts, 15 near-full 64MB arenas). Pinning the threshold keeps
+// every buffer >= 1MiB in its own mapping, returned to the OS on free. Live blocks (~100KB) are
+// unaffected. An explicit MALLOC_MMAP_THRESHOLD_ in the environment wins.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn pin_malloc_mmap_threshold() -> bool {
+    extern "C" {
+        fn mallopt(param: i32, value: i32) -> i32;
+    }
+    const M_MMAP_THRESHOLD: i32 = -3;
+    if env::var_os("MALLOC_MMAP_THRESHOLD_").is_some() {
+        return true;
+    }
+    // SAFETY: mallopt only adjusts allocator tuning; any int is a valid argument.
+    unsafe { mallopt(M_MMAP_THRESHOLD, 1 << 20) == 1 }
+}
+
 #[tokio::main(flavor = "multi_thread")]
 #[cfg_attr(feature = "hotpath", hotpath::main)]
 async fn main() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    pin_malloc_mmap_threshold();
     let args: Vec<String> = env::args().collect();
     if args.get(1).map(|s| s.as_str()) == Some("bench") {
         let dir = args.get(2).cloned().unwrap_or_else(|| ".".into());
@@ -152,5 +173,14 @@ async fn main() {
             }
             eprintln!("[gw] {addr} done");
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn malloc_mmap_threshold_is_accepted() {
+        assert!(super::pin_malloc_mmap_threshold());
     }
 }
