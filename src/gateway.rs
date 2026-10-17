@@ -562,6 +562,7 @@ async fn select_live_peer(
     let mut pool_in_flight = 0usize;
     let mut launched = 0usize;
     let mut fails: Vec<String> = Vec::new();
+    let mut prio_pending: Vec<String> = prio.clone();
     for ip in prio.iter().cloned() {
         set.spawn(live_attempt(
             ip,
@@ -613,6 +614,7 @@ async fn select_live_peer(
             Ok(Some(Ok((ip, is_priority, Err(e))))) => {
                 if is_priority {
                     prio_in_flight = prio_in_flight.saturating_sub(1);
+                    prio_pending.retain(|p| p != &ip);
                     priority.mark_failed(&ip);
                     gwlog!(
                         "[gw] priority {ip} live attempt failed after {}ms (our sessions there={}): {e}",
@@ -638,10 +640,19 @@ async fn select_live_peer(
         }
     }
     set.abort_all();
+    // A priority peer that neither errored nor delivered a vetted block in the whole window is as
+    // good as failed. Cool it down too, or the caller's fallback (which has only what is left of
+    // the node's ~5s) re-dials it first and spends the node's deadline on it (2026-10-16: three
+    // hung priority peers x 1.5s each ran the node's live connect out after both low-memory
+    // restarts).
+    for ip in &prio_pending {
+        priority.mark_failed(ip);
+    }
     gwlog!(
-        "[gw] live selection: no vetted peer in {:.1}s (prio_tried={} {})",
+        "[gw] live selection: no vetted peer in {:.1}s (prio_tried={} prio_hung={} {})",
         started.elapsed().as_secs_f64(),
         prio.len(),
+        prio_pending.len(),
         summarize_peer_errors(launched + prio.len(), &fails)
     );
     None
@@ -704,9 +715,58 @@ fn build_push_hosts(live_ip: &str, peers: &[String], n_live: usize) -> Vec<Strin
     hosts
 }
 
-// 4001 fallback when live-peer selection fails: first reachable pool peer, served through
-// serve_push so the node's live floor / forward gate / round plausibility still apply (a raw
-// splice here would forward ungated frames right after a cache replay — the one moment that
+// hl-node abandons a fresh 4001 connection this long after sending its greeting ("connecting to
+// peer" -> "abci_stream ... timed out" is 5.0s in the node log).
+const NODE_LIVE_CONNECT_DEADLINE: Duration = Duration::from_secs(5);
+// What a failed LIVE_SELECT_WAIT leaves the 4001 fallback, less a margin for relaying the greeting.
+const FALLBACK_WAIT: Duration = NODE_LIVE_CONNECT_DEADLINE
+    .saturating_sub(LIVE_SELECT_WAIT)
+    .saturating_sub(Duration::from_millis(200));
+const FALLBACK_MAX_PARALLEL: usize = 8;
+
+// Race connect+greet against the first FALLBACK_MAX_PARALLEL candidates (priority first) and keep
+// the first that answers. Sequential dials can't fit the node's remaining budget: one hung peer
+// alone would take all of it. Priority peers that error are cooled down.
+async fn race_fallback_upstream(
+    priority: &PriorityTier,
+    candidates: Vec<String>,
+    greet: [u8; 8],
+    wait: Duration,
+) -> Option<(String, TcpStream, Vec<u8>)> {
+    let deadline = Instant::now() + wait;
+    let mut set = tokio::task::JoinSet::new();
+    for ip in candidates.into_iter().take(FALLBACK_MAX_PARALLEL) {
+        set.spawn(async move {
+            let r = connect_and_greet_4001(&ip, greet, wait).await;
+            (ip, r)
+        });
+    }
+    let mut won = None;
+    while let Ok(Some(joined)) = timeout(
+        deadline.saturating_duration_since(Instant::now()),
+        set.join_next(),
+    )
+    .await
+    {
+        match joined {
+            Ok((ip, Ok((upc, greeting)))) => {
+                won = Some((ip, upc, greeting));
+                break;
+            }
+            Ok((ip, Err(e))) if priority.contains(&ip) => {
+                priority.mark_failed(&ip);
+                gwlog!("[gw] 4001 fallback priority {ip} failed: {e}");
+            }
+            _ => {}
+        }
+    }
+    set.abort_all();
+    won
+}
+
+// 4001 fallback when live-peer selection fails: first pool peer to answer the greeting, served
+// through serve_push so the node's live floor / forward gate / round plausibility still apply (a
+// raw splice here would forward ungated frames right after a cache replay — the one moment that
 // matters most). Selection failing usually means no peer passed the first-block vetting, so
 // this trades vetting for availability but keeps the per-frame gates.
 #[allow(clippy::too_many_arguments)]
@@ -720,52 +780,41 @@ async fn serve_push_4001_fallback(
     ctx: &GatewayCtx,
     reason: &str,
 ) {
-    let net_round_tip = ctx.net_round_tip.clone();
-    for ip in tiered_peers(&ctx.priority, peers, start) {
-        // Short per-peer budget: the node abandons the connection ~5s after greeting and the
-        // failed live selection already spent most of that; one dead candidate at 5s here would
-        // guarantee the node times out. Pool peers are live-probed, so 1.5s is plenty.
-        let (upc, greeting) =
-            match connect_and_greet_4001(&ip, greet, Duration::from_millis(1500)).await {
-                Ok(x) => x,
-                Err(e) => {
-                    if ctx.priority.contains(&ip) {
-                        ctx.priority.mark_failed(&ip);
-                        gwlog!(
-                            "[gw] [{}] 4001 fallback priority {} failed: {e}",
-                            node.ip,
-                            ip
-                        );
-                    }
-                    continue;
-                }
-            };
+    let candidates = tiered_peers(&ctx.priority, peers, start);
+    let tried = candidates.len().min(FALLBACK_MAX_PARALLEL);
+    let Some((ip, upc, greeting)) =
+        race_fallback_upstream(&ctx.priority, candidates, greet, FALLBACK_WAIT).await
+    else {
         gwlog!(
-            "[gw] [{}] 4001 push fallback via {} ({reason})",
+            "[gw] [{}] 4001 push fallback failed ({reason}; tried={tried} in {}ms)",
             node.ip,
-            ip
+            FALLBACK_WAIT.as_millis()
         );
-        serve_push_repinned(
-            down,
-            upc,
-            &node,
-            &ctx.priority,
-            "fallback",
-            PushConfig {
-                hosts: Arc::new(vec![ip.clone()]),
-                active_idx: 0,
-                port: 4001,
-                prefetched_greeting: Some(greeting),
-                prefetched_frames: Vec::new(),
-                initial_last_forwarded,
-                live_floor: node.live_floor.clone(),
-                net_round_tip,
-            },
-        )
-        .await;
         return;
-    }
-    gwlog!("[gw] [{}] 4001 push fallback failed ({reason})", node.ip);
+    };
+    gwlog!(
+        "[gw] [{}] 4001 push fallback via {} ({reason})",
+        node.ip,
+        ip
+    );
+    serve_push_repinned(
+        down,
+        upc,
+        &node,
+        &ctx.priority,
+        "fallback",
+        PushConfig {
+            hosts: Arc::new(vec![ip.clone()]),
+            active_idx: 0,
+            port: 4001,
+            prefetched_greeting: Some(greeting),
+            prefetched_frames: Vec::new(),
+            initial_last_forwarded,
+            live_floor: node.live_floor.clone(),
+            net_round_tip: ctx.net_round_tip.clone(),
+        },
+    )
+    .await;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3125,6 +3174,76 @@ mod tests {
             .unwrap();
         assert_eq!(s.ip, "127.0.0.32");
         for h in [p1, o1, slow] {
+            h.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_live_selection_cools_down_hung_priority_peers() {
+        let Some(silent) = fake_live_peer("127.0.0.35", false).await else {
+            eprintln!("skipping: cannot bind 127.0.0.35:4001 on this host");
+            return;
+        };
+        // a priority peer that accepts and greets nothing never errors; when the window runs out
+        // it must still be cooled down so the fallback doesn't re-dial it first
+        let tier = test_tier(&["127.0.0.35"], 300);
+        assert!(select_live_peer(&tier, &[], 0, GREET_FALSE, 0, 0)
+            .await
+            .is_none());
+        assert!(
+            tier.candidates().is_empty(),
+            "hung priority peer must cool down"
+        );
+        silent.abort();
+    }
+
+    #[tokio::test]
+    async fn fallback_race_is_not_held_up_by_a_hung_peer() {
+        let (Some(silent), Some(ok)) = (
+            fake_live_peer("127.0.0.36", false).await,
+            fake_live_peer("127.0.0.37", true).await,
+        ) else {
+            eprintln!("skipping: cannot bind 127.0.0.36-37:4001 on this host");
+            return;
+        };
+        let tier = test_tier(&["127.0.0.38"], 300); // refuses: cooled down
+        let t0 = Instant::now();
+        let (ip, _, greeting) = race_fallback_upstream(
+            &tier,
+            vec![
+                "127.0.0.38".into(),
+                "127.0.0.36".into(),
+                "127.0.0.37".into(),
+            ],
+            GREET_FALSE,
+            FALLBACK_WAIT,
+        )
+        .await
+        .unwrap();
+        assert_eq!(ip, "127.0.0.37");
+        assert_eq!(greeting, [0, 0, 0, 1, 0, 3]);
+        assert!(
+            t0.elapsed() < Duration::from_millis(500),
+            "{:?}",
+            t0.elapsed()
+        );
+        assert!(
+            tier.candidates().is_empty(),
+            "refused priority peer must cool down"
+        );
+
+        // nothing answers: gives up at the budget instead of walking the list
+        let t0 = Instant::now();
+        assert!(race_fallback_upstream(
+            &tier,
+            vec!["127.0.0.36".into()],
+            GREET_FALSE,
+            FALLBACK_WAIT
+        )
+        .await
+        .is_none());
+        assert!(t0.elapsed() < FALLBACK_WAIT + Duration::from_millis(300));
+        for h in [silent, ok] {
             h.abort();
         }
     }
