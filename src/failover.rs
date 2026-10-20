@@ -52,6 +52,9 @@ pub(crate) struct FailoverConfig {
     stall: Duration,
     lag: Duration,
     min_dwell: Duration,
+    // replace a standby whose median trails the active by more than this (0 = never)
+    rotate_slower: Duration,
+    rotate_every: Duration,
     status_dir: Option<PathBuf>,
 }
 
@@ -68,6 +71,8 @@ impl FailoverConfig {
             stall: Duration::from_millis(num("HYPERSYNC_FAILOVER_STALL_MS", 400).max(50)),
             lag: Duration::from_millis(num("HYPERSYNC_FAILOVER_LAG_MS", 150).max(20)),
             min_dwell: Duration::from_millis(num("HYPERSYNC_FAILOVER_DWELL_MS", 10_000)),
+            rotate_slower: Duration::from_millis(num("HYPERSYNC_FAILOVER_ROTATE_MS", 100)),
+            rotate_every: Duration::from_secs(num("HYPERSYNC_FAILOVER_ROTATE_SECS", 60).max(10)),
             status_dir: std::env::var("HYPERSYNC_FAILOVER_STATUS_DIR")
                 .ok()
                 .filter(|v| !v.trim().is_empty())
@@ -75,11 +80,13 @@ impl FailoverConfig {
         };
         if cfg.standbys > 0 {
             gwlog!(
-                "[gw] failover: standbys={} stall={}ms lag={}ms dwell={}ms status_dir={}",
+                "[gw] failover: standbys={} stall={}ms lag={}ms dwell={}ms rotate>{}ms/{}s status_dir={}",
                 cfg.standbys,
                 cfg.stall.as_millis(),
                 cfg.lag.as_millis(),
                 cfg.min_dwell.as_millis(),
+                cfg.rotate_slower.as_millis(),
+                cfg.rotate_every.as_secs(),
                 cfg.status_dir
                     .as_ref()
                     .map(|p| p.display().to_string())
@@ -114,6 +121,11 @@ const UPSTREAM_IDLE: Duration = Duration::from_secs(5);
 const NODE_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const STANDBY_CONNECT_TIMEOUT: Duration = Duration::from_millis(1500);
 const STANDBY_RETRY: Duration = Duration::from_secs(2);
+// Candidates dialed at once when filling a standby slot: the first to accept wins, which favours
+// the lowest-RTT (nearest) peers.
+const STANDBY_RACE: usize = 4;
+// A standby rotated out for being slow isn't retried for this long.
+const SLOW_PEER_COOLDOWN: Duration = Duration::from_secs(30 * 60);
 // The 6-byte status frame a serving peer answers our live greeting with.
 const ACCEPT_GREETING: [u8; 6] = [0, 0, 0, 1, 0, 3];
 
@@ -431,6 +443,21 @@ impl Core {
         Some((frames, bad))
     }
 
+    // The standby trailing the active the most, if its median lag exceeds `slower_ms` (standbys
+    // `exempt` returns true for — the operator's priority peers — are never picked).
+    pub(crate) fn slowest_standby(
+        &self,
+        slower_ms: i64,
+        exempt: impl Fn(&str) -> bool,
+    ) -> Option<(u64, i64)> {
+        self.ups
+            .iter()
+            .filter(|(&id, u)| id != self.active && !exempt(&u.ip))
+            .filter_map(|(&id, u)| u.median_lead().map(|m| (id, m)))
+            .filter(|&(_, m)| m < -slower_ms)
+            .min_by_key(|&(_, m)| m)
+    }
+
     pub(crate) fn active(&self) -> u64 {
         self.active
     }
@@ -553,9 +580,11 @@ fn spawn_reader(id: u64, mut r: OwnedReadHalf, ev: mpsc::Sender<Event>) -> JoinH
 }
 
 // Dial candidates in order until one accepts a live (send_abci:false) stream.
+// Dial candidates STANDBY_RACE at a time; the first to accept a live (send_abci:false) stream
+// wins and the rest are dropped.
 async fn connect_standby(candidates: Vec<String>, ev: mpsc::Sender<Event>) {
-    for ip in candidates {
-        let attempt = async {
+    async fn attempt(ip: String) -> Option<(String, TcpStream)> {
+        let dial = async {
             let mut s = TcpStream::connect((ip.as_str(), 4001)).await.ok()?;
             s.set_nodelay(true).ok();
             s.write_all(&GREET_FALSE).await.ok()?;
@@ -563,9 +592,19 @@ async fn connect_standby(candidates: Vec<String>, ev: mpsc::Sender<Event>) {
             s.read_exact(&mut g).await.ok()?;
             (g == ACCEPT_GREETING).then_some(s)
         };
-        if let Ok(Some(stream)) = timeout(STANDBY_CONNECT_TIMEOUT, attempt).await {
-            let _ = ev.send(Event::Connected { ip, stream }).await;
-            return;
+        timeout(STANDBY_CONNECT_TIMEOUT, dial).await.ok().flatten().map(|s| (ip, s))
+    }
+    for batch in candidates.chunks(STANDBY_RACE) {
+        let mut set = tokio::task::JoinSet::new();
+        for ip in batch {
+            set.spawn(attempt(ip.clone()));
+        }
+        while let Some(joined) = set.join_next().await {
+            if let Ok(Some((ip, stream))) = joined {
+                set.abort_all();
+                let _ = ev.send(Event::Connected { ip, stream }).await;
+                return;
+            }
         }
     }
     let _ = ev.send(Event::ConnectFailed).await;
@@ -677,6 +716,7 @@ pub(crate) async fn serve_failover(
     let mut last_switch_desc = String::new();
     let mut last_status = Instant::now() - Duration::from_secs(10);
     let mut last_summary = Instant::now();
+    let mut last_rotate = Instant::now();
     let rot = Arc::new(AtomicUsize::new(0));
     let net_tip = cfg.net_round_tip.clone();
     let live_floor: Arc<AtomicU32> = cfg.live_floor.clone();
@@ -880,6 +920,26 @@ pub(crate) async fn serve_failover(
                         break format!("active failed and no standby could continue the chain: {reason}");
                     }
                 }
+                // swap out the slowest standby now and then, so the set drifts toward the fastest
+                // peers this host can reach (operator priority peers are kept)
+                if fo.rotate_slower > Duration::ZERO
+                    && !connecting
+                    && active_dead.is_none()
+                    && core.standby_count() >= fo.standbys
+                    && now.saturating_duration_since(last_rotate) >= fo.rotate_every
+                {
+                    last_rotate = now;
+                    let prio = fctx.priority.clone();
+                    if let Some((id, m)) = core.slowest_standby(fo.rotate_slower.as_millis() as i64, |ip| prio.tier_of(ip) == "prio") {
+                        if let Some(ip) = core.remove(id) {
+                            gwlog!("[gw] [{node_label}] failover standby {ip} rotated out: {m}ms behind the active");
+                            cooldown.insert(ip, now + SLOW_PEER_COOLDOWN);
+                        }
+                        if let Some(l) = lives.remove(&id) {
+                            l.reader.abort();
+                        }
+                    }
+                }
                 // keep the standby set full
                 if !connecting && core.standby_count() < fo.standbys && now >= next_connect {
                     cooldown.retain(|_, until| *until > now);
@@ -892,7 +952,7 @@ pub(crate) async fn serve_failover(
                     }
                     let mut seen = HashSet::new();
                     cands.retain(|ip| !in_use.contains(ip) && !cooldown.contains_key(ip) && seen.insert(ip.clone()));
-                    cands.truncate(8);
+                    cands.truncate(STANDBY_RACE * 3);
                     if cands.is_empty() {
                         next_connect = now + STANDBY_RETRY;
                     } else {
@@ -1095,6 +1155,25 @@ mod tests {
             c.on_standby_block(2, r, r - 1, r as u64, t1, f(r));
         }
         assert_eq!(c.pick_switch(t1 + 400 * MS, false), Some((2, SwitchReason::Stall)));
+    }
+
+    #[test]
+    fn rotation_picks_the_slowest_non_exempt_standby_past_the_threshold() {
+        let mut c = core();
+        for (id, ip, off) in [(1, "near", 20i64), (2, "far", 300), (3, "prio", 500)] {
+            c.add_standby(id, ip.into());
+            let t0 = Instant::now();
+            for r in 100..=130u32 {
+                let ta = t0 + (r - 100) * 70 * MS;
+                c.on_active_block(r, r as u64, ta);
+                c.on_standby_block(id, r, r - 1, r as u64, ta + (off as u32) * MS, f(r));
+            }
+            c.last_forwarded = 0; // replay the same rounds for the next standby
+            c.forwarded.clear();
+        }
+        assert_eq!(c.slowest_standby(100, |ip| ip == "prio"), Some((2, -300)));
+        assert_eq!(c.slowest_standby(400, |ip| ip == "prio"), None);
+        assert_eq!(c.slowest_standby(100, |_| false), Some((3, -500)));
     }
 
     #[test]
