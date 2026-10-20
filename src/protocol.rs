@@ -58,6 +58,12 @@ const ROUND_SCAN_BYTES: usize = 0x400;
 const MAX_PARENT_ROUND_GAP: u32 = 256;
 
 fn find_block_round(dec: &[u8]) -> Option<u32> {
+    find_block_round_parent(dec).map(|(r, _)| r)
+}
+
+// (round, parent round) from the same header triple — the parent is what chains consecutive
+// live blocks, so a failover can prove a standby's stream continues exactly where the node is.
+fn find_block_round_parent(dec: &[u8]) -> Option<(u32, u32)> {
     let rd = |o: usize| u32::from_le_bytes([dec[o + 1], dec[o + 2], dec[o + 3], dec[o + 4]]);
     let end = dec.len().min(ROUND_SCAN_BYTES);
     let mut o = 0usize;
@@ -69,7 +75,7 @@ fn find_block_round(dec: &[u8]) -> Option<u32> {
                 && r2 < r1
                 && r1 - r2 <= MAX_PARENT_ROUND_GAP
             {
-                return Some(r);
+                return Some((r, r1));
             }
         }
         o += 1;
@@ -170,6 +176,18 @@ pub(crate) fn block_round(payload: &[u8]) -> Option<u32> {
         Some(n) => find_block_round(&buf[..n]),
         None => block_round_full(payload),
     }
+}
+
+// Like `block_round`, plus the block's parent round.
+pub(crate) fn block_round_parent(payload: &[u8]) -> Option<(u32, u32)> {
+    if payload.len() >= 5 {
+        let mut buf = [0u8; ROUND_SCAN_BYTES];
+        if let Some(n) = lz4_first_n(&payload[4..], &mut buf) {
+            return find_block_round_parent(&buf[..n]);
+        }
+    }
+    let dec = lz4_flex::block::decompress_size_prepended(payload).ok()?;
+    find_block_round_parent(&dec)
 }
 
 pub(crate) struct RoundDedup {

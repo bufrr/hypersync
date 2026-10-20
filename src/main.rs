@@ -9,6 +9,7 @@
 // Upstreams may be "ip" (=> :4001) or "ip:port" (for local mock peers / custom ports).
 // Subcommand `mock <bind:port> <dir> <start> <end>` replays captured blocks[start..end] for testing.
 
+mod failover;
 mod gateway;
 mod peerd;
 mod priority;
