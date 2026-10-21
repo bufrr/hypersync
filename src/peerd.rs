@@ -6,7 +6,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 
-use crate::protocol::{block_round, is_plausible_mainnet_round, max_clustered_round, GREET_FALSE};
+use crate::protocol::{
+    block_round, corroborated_clustered_round, is_plausible_mainnet_round, GREET_FALSE,
+};
 
 fn is_ipv4(s: &str) -> bool {
     let mut parts = 0;
@@ -157,6 +159,8 @@ struct LiveProbe {
 // abci_state). Bounded to a short wall-clock total; counts parseable type=1 live rounds (excludes
 // tiny status/rejection frames). A peer-controlled frame length is capped before allocating the
 // payload buffer (a live block is a few hundred KB at most).
+// Matches the live-block frame cap in protocol::max_block_round_in_frames (a fn-local const there).
+const MAX_PROBE_FRAME: usize = 2_000_000;
 async fn probe_live(ip: &str) -> LiveProbe {
     let deadline = Instant::now() + Duration::from_secs(6);
     let mut s = match timeout(
@@ -210,7 +214,7 @@ async fn probe_live(ip: &str) -> LiveProbe {
             }
         };
         let len = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as usize;
-        if len > 8_000_000 {
+        if len > MAX_PROBE_FRAME {
             status = ProbeStatus::OversizedFrame;
             break;
         }
@@ -253,13 +257,21 @@ async fn probe_live(ip: &str) -> LiveProbe {
             }
         }
     }
-    if blocks >= MIN_LIVE_BLOCKS {
-        status = ProbeStatus::Live;
-    }
     LiveProbe {
         blocks,
         max_round,
-        status,
+        status: final_probe_status(blocks, status),
+    }
+}
+
+// Enough live blocks reports the probe as Live even if a later frame ended it on an error/timeout,
+// but a PeerFull rejection is the more useful diagnosis and wins (the status only feeds logging;
+// liveness is decided from `blocks`/`max_round`).
+fn final_probe_status(blocks: usize, status: ProbeStatus) -> ProbeStatus {
+    if blocks >= MIN_LIVE_BLOCKS && status != ProbeStatus::PeerFull {
+        ProbeStatus::Live
+    } else {
+        status
     }
 }
 
@@ -422,7 +434,11 @@ where
             });
         }
 
+        // peers overlap heavily, so dedup the next frontier (`queued`) instead of carrying one copy
+        // per advertising peer; `discovered` stops growing at MAX_CANDIDATES, which is all the
+        // caller can merge anyway.
         let mut next: Vec<String> = Vec::new();
+        let mut queued: HashSet<String> = HashSet::new();
         while let Some(r) = set.join_next().await {
             queries += 1;
             if let Ok(peers) = r {
@@ -430,8 +446,10 @@ where
                     if self_ips.contains(&p) {
                         continue;
                     }
-                    discovered.insert(p.clone());
-                    if !visited.contains(&p) {
+                    if discovered.len() < MAX_CANDIDATES {
+                        discovered.insert(p.clone());
+                    }
+                    if !visited.contains(&p) && queued.insert(p.clone()) {
                         next.push(p);
                     }
                 }
@@ -511,16 +529,17 @@ pub(crate) fn extract_round_tip(contents: &str) -> Option<u32> {
 }
 
 // Probe rounds are floor-only validated, so clustering is the only thing standing between a high
-// decode artifact and the published tip. Always require a second peer to corroborate: the gateway
-// raises its net tip monotonically and now also rejects peers that trail it, so one uncorroborated
-// artifact would pin the tip out of reach and permanently starve live serving. No tip (null) is
-// safe by comparison — the gateway keeps its previous value and both round guards stay permissive.
+// decode artifact and the published tip. The gateway rejects peers that trail the tip, so a tip
+// raised by one peer would starve every honest peer: publish the cluster's SECOND-highest round,
+// so the top has to be corroborated by another peer (a lone artifact, or one peer reporting up to
+// MAX_LIVE_ROUND_LAG above the rest, can't move it). No tip (null) is safe by comparison: the
+// gateway keeps its last reading and, if none comes for a while, drops to floor-only checks.
 fn clustered_probe_tip(probes: &[(String, LiveProbe)]) -> Option<u32> {
     let mut rounds: Vec<u32> = probes
         .iter()
         .filter_map(|(_, probe)| probe.max_round)
         .collect();
-    max_clustered_round(&mut rounds, 2, MAX_LIVE_ROUND_LAG)
+    corroborated_clustered_round(&mut rounds, 2, MAX_LIVE_ROUND_LAG)
 }
 
 fn split_live_by_tip(
@@ -572,6 +591,18 @@ fn empty_pool_sleep_secs(interval: u64, empty_live_streak: u32, max_backoff: u64
         .clamp(interval, max_backoff.max(interval))
 }
 
+// Back off only when the probe found nothing AND there was no previous pool to keep. While
+// kept_previous holds a good pool, peers.json is not rewritten, so the gateway ages its round tip
+// out after 15 min; a backed-off sleep (up to 8x interval) would keep the recovery probe away for
+// that long, so probe at the normal cadence instead.
+fn next_empty_live_streak(streak: u32, ranked_empty: bool, kept_previous: bool) -> u32 {
+    if ranked_empty && !kept_previous {
+        streak.saturating_add(1)
+    } else {
+        0
+    }
+}
+
 fn select_probe_candidates(
     all_candidates: &[String],
     previous_live: &[String],
@@ -614,6 +645,36 @@ fn select_probe_candidates(
     }
 
     selected
+}
+
+// Root IPs from the gossipRootIps curl. A failed curl (non-zero exit: HTTP error with -f, timeout,
+// DNS) is treated like a spawn error/timeout and contributes nothing, even if it wrote some stdout.
+fn gossip_root_ips(out: &std::process::Output) -> Vec<String> {
+    if !out.status.success() {
+        return Vec::new();
+    }
+    extract_ipv4(&String::from_utf8_lossy(&out.stdout))
+}
+
+// peer_candidates.txt: one IP per line, newline-terminated so a manual `echo ip >> file` starts a
+// fresh line. On load keep only lines that are a routable IPv4 on their own, so a hand-edited or
+// corrupted line is dropped rather than seeded into the crawl and probe.
+fn parse_peer_candidates(contents: &str) -> HashSet<String> {
+    contents
+        .lines()
+        .map(str::trim)
+        .filter(|l| is_ipv4(l) && is_routable(l))
+        .map(str::to_string)
+        .collect()
+}
+
+fn format_peer_candidates(candidates: &HashSet<String>) -> String {
+    let mut out = String::new();
+    for ip in candidates {
+        out.push_str(ip);
+        out.push('\n');
+    }
+    out
 }
 
 pub(crate) fn split_csv(v: &str) -> Vec<String> {
@@ -662,7 +723,7 @@ pub(crate) async fn run_peerd(interval: u64) {
 
     let mut candidates: HashSet<String> = tokio::fs::read_to_string(&cand_path)
         .await
-        .map(|s| s.lines().map(str::to_string).collect())
+        .map(|s| parse_peer_candidates(&s))
         .unwrap_or_default();
     // the persisted file predates the current exclusions (a stand-in priority peer was usually a
     // pool candidate first)
@@ -681,12 +742,19 @@ pub(crate) async fn run_peerd(interval: u64) {
         // gossip peer graph (self-contained, no co-located node needed). tcp_lz4_stats stays as an
         // optional supplementary source. Shelling out to curl (rather than an HTTPS client) keeps
         // the API call to a thin, standard external tool instead of a heavyweight dependency for a
-        // one-shot JSON POST.
+        // one-shot JSON POST. curl's own timeouts sit inside the outer 15s guard, and
+        // kill_on_drop makes that guard actually reap a hung curl (tokio leaves a dropped child
+        // running otherwise, one more per cycle).
         let roots = timeout(
             Duration::from_secs(15),
             tokio::process::Command::new("curl")
                 .args([
                     "-s",
+                    "-f",
+                    "--connect-timeout",
+                    "5",
+                    "--max-time",
+                    "10",
                     "-X",
                     "POST",
                     "-H",
@@ -695,12 +763,13 @@ pub(crate) async fn run_peerd(interval: u64) {
                     r#"{"type":"gossipRootIps"}"#,
                     "https://api.hyperliquid.xyz/info",
                 ])
+                .kill_on_drop(true)
                 .output(),
         )
         .await;
 
         if let Ok(Ok(o)) = roots {
-            for ip in extract_ipv4(&String::from_utf8_lossy(&o.stdout)) {
+            for ip in gossip_root_ips(&o) {
                 if !self_ips.contains(ip.as_str()) {
                     candidates.insert(ip);
                 }
@@ -739,11 +808,7 @@ pub(crate) async fn run_peerd(interval: u64) {
                 }
             }
         }
-        write_atomic(
-            &cand_path,
-            &candidates.iter().cloned().collect::<Vec<_>>().join("\n"),
-        )
-        .await;
+        write_atomic(&cand_path, &format_peer_candidates(&candidates)).await;
 
         // 2. Probe a bounded slice for live-block serving. The candidate set can grow into the
         // hundreds; probing all of it with low concurrency makes a single cycle exceed the
@@ -837,11 +902,8 @@ pub(crate) async fn run_peerd(interval: u64) {
         if !kept_previous {
             write_atomic(&out_path, &json).await;
         }
-        if ranked.is_empty() {
-            empty_live_streak = empty_live_streak.saturating_add(1);
-        } else {
-            empty_live_streak = 0;
-        }
+        empty_live_streak =
+            next_empty_live_streak(empty_live_streak, ranked.is_empty(), kept_previous);
         let cycle_secs = cycle_start.elapsed().as_secs();
         let target_sleep = empty_pool_sleep_secs(interval, empty_live_streak, empty_backoff_max);
         // Discover+probe can itself take longer than `interval` once the candidate pool grows;
@@ -1059,7 +1121,7 @@ mod tests {
                 },
             ),
         ];
-        assert_eq!(clustered_probe_tip(&probes), Some(1_355_731_000));
+        assert_eq!(clustered_probe_tip(&probes), Some(1_355_730_000));
 
         // a lone probe cannot publish a tip: with nothing to corroborate it, a misparse would pin
         // the gateway's monotonic tip above every honest peer and starve live serving for good
@@ -1119,7 +1181,7 @@ mod tests {
             ("3.3.3.3".to_string(), mk(2_818_597_137)),
         ];
         let tip = clustered_probe_tip(&probes);
-        assert_eq!(tip, Some(1_355_900_100));
+        assert_eq!(tip, Some(1_355_900_000));
         let (live, failed) = split_live_by_tip(probes, tip);
         assert_eq!(live.len(), 2);
         assert_eq!(failed, vec!["3.3.3.3".to_string()]);
@@ -1443,5 +1505,113 @@ mod tests {
             !got.iter().any(|x| x.starts_with("1700000000")),
             "float/timestamp excluded"
         );
+    }
+
+    #[test]
+    fn peerd_probe_status_peer_full_wins_over_block_count() {
+        assert_eq!(
+            final_probe_status(2, ProbeStatus::PeerFull),
+            ProbeStatus::PeerFull
+        );
+        assert_eq!(
+            final_probe_status(2, ProbeStatus::HeaderTimeout),
+            ProbeStatus::Live
+        );
+        assert_eq!(
+            final_probe_status(1, ProbeStatus::HeaderTimeout),
+            ProbeStatus::HeaderTimeout
+        );
+    }
+
+    #[test]
+    fn peerd_empty_streak_only_grows_without_a_kept_pool() {
+        // nothing live and nothing kept: back off
+        assert_eq!(next_empty_live_streak(0, true, false), 1);
+        assert_eq!(next_empty_live_streak(3, true, false), 4);
+        // nothing live but a good previous pool kept: stay at the normal cadence
+        assert_eq!(next_empty_live_streak(3, true, true), 0);
+        assert_eq!(
+            empty_pool_sleep_secs(120, next_empty_live_streak(3, true, true), 1800),
+            120
+        );
+        // some live peers (kept or written): reset
+        assert_eq!(next_empty_live_streak(3, false, true), 0);
+        assert_eq!(next_empty_live_streak(3, false, false), 0);
+    }
+
+    #[test]
+    fn peer_candidates_round_trip_with_trailing_newline_and_validation() {
+        let set: HashSet<String> = ["8.8.8.8", "1.1.1.1"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let text = format_peer_candidates(&set);
+        assert!(text.ends_with('\n'));
+        assert_eq!(parse_peer_candidates(&text), set);
+        // a manual append now lands on its own line
+        let appended = format!("{text}9.9.9.9\n");
+        assert!(parse_peer_candidates(&appended).contains("9.9.9.9"));
+        assert!(format_peer_candidates(&HashSet::new()).is_empty());
+    }
+
+    #[test]
+    fn peer_candidates_load_drops_invalid_lines() {
+        let got = parse_peer_candidates(
+            "8.8.8.8\n 1.1.1.1 \n8.8.8.89.9.9.9\n10.0.0.1\n999.1.1.1\n\ngarbage\n172.20.0.1\n4.4.4.4",
+        );
+        let want: HashSet<String> = ["8.8.8.8", "1.1.1.1", "4.4.4.4"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(got, want);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gossip_root_ips_ignores_failed_curl() {
+        use std::os::unix::process::ExitStatusExt;
+        let out = |code: i32, body: &str| std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: body.as_bytes().to_vec(),
+            stderr: Vec::new(),
+        };
+        assert_eq!(
+            gossip_root_ips(&out(0, r#"["8.8.8.8","1.1.1.1"]"#)),
+            vec!["8.8.8.8".to_string(), "1.1.1.1".to_string()]
+        );
+        // e.g. curl -f on an HTTP 5xx (exit 22), or --max-time (exit 28) after a partial body
+        assert!(gossip_root_ips(&out(22, r#"["8.8.8.8"]"#)).is_empty());
+        assert!(gossip_root_ips(&out(28, r#"["8.8.8.8"]"#)).is_empty());
+    }
+
+    #[tokio::test]
+    async fn crawl_caps_discovered_at_max_candidates() {
+        // every query returns a full response of never-before-seen IPs
+        let next_id = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let query = {
+            let next_id = next_id.clone();
+            move |_ip: String| {
+                let base = next_id.fetch_add(
+                    MAX_PEERS_PER_QUERY_RESPONSE,
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+                let peers = (base..base + MAX_PEERS_PER_QUERY_RESPONSE)
+                    .map(|n| format!("11.{}.{}.{}", (n >> 16) & 255, (n >> 8) & 255, n & 255))
+                    .collect();
+                std::future::ready(peers)
+            }
+        };
+        let got = crawl_peers_with(
+            vec!["1.1.1.1".to_string()],
+            &HashSet::new(),
+            2,
+            100,
+            8,
+            query,
+        )
+        .await;
+        // 100 queries x 512 unique IPs would be ~51k without the cap
+        assert!(next_id.load(std::sync::atomic::Ordering::SeqCst) > MAX_CANDIDATES);
+        assert_eq!(got.len(), MAX_CANDIDATES);
     }
 }

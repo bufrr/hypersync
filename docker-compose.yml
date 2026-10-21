@@ -62,8 +62,8 @@ services:
       HYPERSYNC_FAILOVER_STATUS_DIR: "${HYPERSYNC_FAILOVER_STATUS_DIR:-}"
     volumes:
       - ./data:/pd
-    # image CMD is `gateway /pd/peers.json --push --cache --live 5`. --cache is off here: the
-    # in-memory snapshot cache + its ~5 min refresh races held 6-19 GiB, and next to a ~34 GiB
+    # same args as the image CMD. --cache is opt-in (append "--cache" here to enable it): the
+    # in-memory snapshot cache + its 4-min refresh races held 6-19 GiB, and next to a ~34 GiB
     # hl-node that pushed host memory past hl-visor's ~95% low-memory restart threshold
     # (2026-10-12 soak: 5 child restarts). Node cold-starts then bootstrap transparently via a peer.
     command: ["gateway", "/pd/peers.json", "--push", "--live", "5"]

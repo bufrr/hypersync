@@ -16,6 +16,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /build/target/release/hypersync /usr/local/bin/hypersync
 ENTRYPOINT ["/usr/local/bin/hypersync"]
-# default: full gateway in production mode; peers.json is expected at /pd
-# (bind-mount the peerd data dir there). Override CMD for other subcommands.
-CMD ["gateway", "/pd/peers.json", "--push", "--cache", "--live", "5"]
+# default: full gateway in production mode, same args as docker-compose.yml; peers.json is
+# expected at /pd (bind-mount the peerd data dir there). --cache is opt-in (it holds a ~6 GB
+# bootstrap in RAM plus refresh races); append it only with that memory headroom to spare.
+# Override CMD for other subcommands.
+CMD ["gateway", "/pd/peers.json", "--push", "--live", "5"]

@@ -212,8 +212,8 @@
 
         <div class="stats">
 		          <div class="stat"><div class="big">4001<span style="color:var(--faint);font-size:14px"> / 4002</span></div><div class="sm">4001 拉状态和 live block；4002 拉追块数据</div></div>
-          <div class="stat"><div class="big c">~4.5GB</div><div class="sm">完整启动快照：abci_state + EVM KVs</div></div>
-          <div class="stat"><div class="big">~950MB</div><div class="sm">abci_state，按源 IP 限流</div></div>
+          <div class="stat"><div class="big c">~5.8GB</div><div class="sm">完整启动快照（2026-10 主网）：abci_state ~1.29GB + EVM KVs</div></div>
+          <div class="stat"><div class="big">~1.29GB</div><div class="sm">abci_state（2026-10），按源 IP 限流</div></div>
           <div class="stat"><div class="big c">~135M/s</div><div class="sm">round 提取与去重热路径吞吐</div></div>
         </div>
 
@@ -326,7 +326,7 @@ sequenceDiagram
     S-->>N: 小控制帧 / 断开
     Note over N: 换下一个 peer 重试
   else peer 正在服务状态
-    S-->>N: abci_state(~950MB)<br/>EVM KVs(~3.5GB)<br/>之后进入 live 流
+    S-->>N: abci_state(~1.29GB)<br/>EVM KVs(~4.5GB)<br/>之后进入 live 流
   end
   Note over N: ③ 节点自己验收状态<br/>写 visor_abci_state.json
   Note over N,C: ④ 4002 补齐历史区块
@@ -364,7 +364,7 @@ sequenceDiagram
   G->>P2: 转发 greeting(send_abci:true)
   P2-->>G: 首帧 len>4MB (abci_state 开始)
 	  Note over G: ② active=P2·首帧写回<br/>之后纯透明转发<br/>(网关不解析内部 framing)
-  P2-->>N: abci_state(~950MB) → EVM KVs(~3.5GB) → live
+  P2-->>N: abci_state(~1.29GB) → EVM KVs(~4.5GB) → live
 	  Note over N: ③ 节点自己验收并落盘状态<br/>visor_abci_state.json 出现 = 冷启动完成
 	  Note over N,PX: ④ 通过 4002 继续追历史区块
   loop 连续 ~100-round 窗口
@@ -380,13 +380,13 @@ sequenceDiagram
 </pre>
           </div>
         </div>
-		        <p>要点：冷启动阶段 gateway <b>不解析</b> abci_state→EVM-KVs→live 的内部边界。它只转发字节；真正判断“这份状态能不能用”的是 HL node 自己。<code>visor_abci_state.json</code> 是 node 写出的本地小文件，表示启动状态已经被接受，不是那份 4.5GB 的状态数据本体。</p>
+		        <p>要点：冷启动阶段 gateway <b>不解析</b> abci_state→EVM-KVs→live 的内部边界。它只转发字节；真正判断“这份状态能不能用”的是 HL node 自己。<code>visor_abci_state.json</code> 是 node 写出的本地小文件，表示启动状态已经被接受，不是那份约 5.8GB 的启动数据本体。</p>
       </section>
 
       <!-- 04 CACHE -->
       <section id="cache">
 		        <div class="sec-head"><span class="sec-num">04</span><h2><code>--cache</code> 缓存冷启动<span style="color:var(--faint);font-weight:400;font-size:14px"> · 避免重复拉状态</span></h2></div>
-		        <p class="sec-sub"><code>--cache</code> 解决的是一个具体问题：节点重启时不想再从真实 peer 拉一遍约 4.5GB 的启动快照。gateway 先在后台抓一份完整启动快照放进 RAM；节点冷启动时，gateway 直接把这份缓存回放给它。代价也很明确：节点这次不是从真实 peer 拿状态，所以后续 4002 追块不能稳定直连 active，只能由 gateway 代问真实 peer。</p>
+		        <p class="sec-sub"><code>--cache</code> 解决的是一个具体问题：节点重启时不想再从真实 peer 拉一遍约 5.8GB 的启动快照。gateway 先在后台抓一份完整启动快照放进 RAM；节点冷启动时，gateway 直接把这份缓存回放给它。代价也很明确：节点这次不是从真实 peer 拿状态，所以后续 4002 追块不能稳定直连 active，只能由 gateway 代问真实 peer。</p>
         <div class="scope reveal">
 	          <div class="scope-bar"><span class="dots"><i></i><i></i><i></i></span><span class="ttl"><b>流程</b> · --cache 如何回放启动快照</span></div>
           <div class="scope-body">
@@ -404,7 +404,7 @@ sequenceDiagram
 	  Note over G: 太慢就换 peer<br/>只有完整结束的捕获才写入 boot_blob
 	  N->>G: dial 4001 + greeting(send_abci:true)
 	  Note over G: 命中 boot_blob → 直接回放
-	  G-->>N: 回放 ~4.5GB 缓存
+	  G-->>N: 回放 ~5.8GB 缓存
   opt 若同时开启 --push
 	    par 多路 live 合并
 	      LP-->>G: live block (各 peer)
@@ -514,7 +514,7 @@ stateDiagram-v2
 
         <div class="detail reveal">
           <h3><span class="pin">▸</span> I/O 与内存边界</h3>
-          <p style="margin:8px 0 0">所有 <code>timeout(..).await</code> 的读取都显式匹配 <code>Ok(Ok(_))</code>，避免把上游/节点提前关闭连接（<code>Ok(Err(_))</code>）误当成功继续、写出基于半截缓冲区的错误帧。对端可控的帧长度都有硬上限：bootstrap 单帧 ≤1.5GB（真实 abci_state 约 954MB），4002 响应 ≤64MB。<code>is_routable</code> 排除 <code>0./127./10./192.168./169.254./255.</code> 等常规私有/特殊段；对 <code>172.*</code> 段则只排除真正私有的 <code>172.16.0.0/12</code>（第二字节 16-31），不会把整个 <code>172.0.0.0/8</code>（包含 Cloudflare 等公网 172.64/13 段）误判为私有而丢弃。</p>
+          <p style="margin:8px 0 0">所有 <code>timeout(..).await</code> 的读取都显式匹配 <code>Ok(Ok(_))</code>，避免把上游/节点提前关闭连接（<code>Ok(Err(_))</code>）误当成功继续、写出基于半截缓冲区的错误帧。对端可控的帧长度都有硬上限：bootstrap 单帧 ≤1.5GB（真实 abci_state 2026-10 约 1.29GB，2026 年中约 954MB），4002 响应 ≤64MB。<code>is_routable</code> 排除 <code>0./127./10./192.168./169.254./255.</code> 等常规私有/特殊段；对 <code>172.*</code> 段则只排除真正私有的 <code>172.16.0.0/12</code>（第二字节 16-31），不会把整个 <code>172.0.0.0/8</code>（包含 Cloudflare 等公网 172.64/13 段）误判为私有而丢弃。</p>
         </div>
       </section>
 

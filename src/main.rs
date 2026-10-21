@@ -52,6 +52,9 @@ async fn main() {
         eprintln!("[main] WARN mallopt(M_MMAP_THRESHOLD) failed; 4002 buffers may stay resident");
     }
     let args: Vec<String> = env::args().collect();
+    // Priority (Tier P) IPs are redacted to prio-N in every log line of every mode (a sentry IP
+    // can also be given to proxy/relay as a plain upstream).
+    priority::init_redaction(&priority::priority_peers_from_env());
     if args.get(1).map(|s| s.as_str()) == Some("bench") {
         let dir = args.get(2).cloned().unwrap_or_else(|| ".".into());
         let iters: usize = args
@@ -116,8 +119,6 @@ async fn main() {
         run_cache(port, upstream).await;
         return;
     }
-    // Priority (Tier P) IPs are redacted to prio-N in every gateway/peerd log line.
-    priority::init_redaction(&priority::priority_peers_from_env());
     if args.get(1).map(|s| s.as_str()) == Some("peerd") {
         // peer discovery + probing daemon. Env config:
         // HYPERSYNC_DATA (data dir, default ./data), HL_STATS_DIR (optional, comma-separated:
@@ -131,7 +132,8 @@ async fn main() {
     if args.get(1).map(|s| s.as_str()) == Some("gateway") {
         // full P2P gateway: reads the node's OWN peer file (path arg) for its upstream pool, then
         // relays bootstrap/live/RPC through an active peer, with optional bootstrap cache.
-        let node_peer_file = args.get(2).cloned().unwrap_or_else(|| "/nodepeers".into());
+        let node_peer_file =
+            gateway_peer_file(&args[2..]).unwrap_or_else(|| "/nodepeers".to_string());
         // --push: use serve_push's active transparent backbone; an active-stream stall/death
         //   tears the session down so the node reconnects and a fresh active is pinned. Shadow
         //   multi-source injection is currently disabled, so --live N is only a future capacity knob.
@@ -153,7 +155,20 @@ async fn main() {
     // default `<port> <peers>` mode: multi-upstream live-block merge. Testing/aux only — `pump`
     // drops all type-0 (control) frames, so a real HL node would never receive the peer greeting
     // through it; it pairs with `mock` (which sends no greeting frame). Use `gateway` for nodes.
-    let port: u16 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(4001);
+    // Anything else must be a port (or nothing): an unknown subcommand or a typo would otherwise
+    // silently start this testing-only mode on :4001 against hard-coded upstreams.
+    let port: u16 = match args.get(1) {
+        None => 4001,
+        Some(a) => match a.parse() {
+            Ok(p) => p,
+            Err(_) => {
+                eprintln!(
+                    "unknown mode {a:?}; usage: hypersync <gateway|peerd|proxy|relay|cache|mock|fakenode|bench> ... | hypersync [port] [peers]"
+                );
+                std::process::exit(2);
+            }
+        },
+    };
     let upstreams: Vec<String> = match args.get(2) {
         Some(s) => split_csv(s),
         None => vec!["74.63.207.101".into(), "64.140.170.202".into()],
@@ -179,8 +194,38 @@ async fn main() {
     }
 }
 
+// The gateway's peer-file path: the first positional argument, skipping flags and the value of
+// `--live`, so `gateway --push /pd/peers.json` works as well as `gateway /pd/peers.json --push`.
+fn gateway_peer_file(args: &[String]) -> Option<String> {
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == "--live" {
+            it.next();
+        } else if !a.starts_with("--") {
+            return Some(a.clone());
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn gateway_peer_file_skips_flags() {
+        let v = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let f = |s: &[&str]| super::gateway_peer_file(&v(s));
+        assert_eq!(
+            f(&["/pd/peers.json", "--push", "--live", "5"]).as_deref(),
+            Some("/pd/peers.json")
+        );
+        assert_eq!(
+            f(&["--push", "/pd/peers.json"]).as_deref(),
+            Some("/pd/peers.json")
+        );
+        assert_eq!(f(&["--live", "5", "--push", "/x"]).as_deref(), Some("/x"));
+        assert_eq!(f(&["--push", "--live", "5"]), None);
+    }
+
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     #[test]
     fn malloc_mmap_threshold_is_accepted() {

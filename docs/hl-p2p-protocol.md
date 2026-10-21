@@ -85,11 +85,11 @@ They share only a ~2.6 KB common header (round, parent_round, qc, validator-set 
 
 A from-scratch node dials with `send_abci:true`; the peer streams, in order, on the one connection:
 
-1. **abci_state** — one type=1 frame, ~**950 MB** lz4→msgpack (HyperCore consensus/exchange state; visible field names `exchange`, `locus`, `ctx`, matching the on-disk `.rmp`). The node logs `reading bytes for abci_stream recv greeting: X/950…`.
-2. **EVM KVs** — the HyperEVM state checkpoint (`hyperliquid_data/evm_db_hub_slow/checkpoint/<height>/EvmState`), ~**3.5–3.7 GB**, streamed as a run of type=1 chunks of **variable size (≈0.2–1.2 MB)** right after the abci_state. The node logs `evm kvs` and, on failure, `failed to receive evm kvs: TcpRead::bincode err: LimitExceeded`.
+1. **abci_state** — one type=1 frame, ~**950 MB** in mid-2026 / ~**1.29 GB** in 2026-10, lz4→msgpack (HyperCore consensus/exchange state; visible field names `exchange`, `locus`, `ctx`, matching the on-disk `.rmp`). The node logs `reading bytes for abci_stream recv greeting: X/950…`.
+2. **EVM KVs** — the HyperEVM state checkpoint (`hyperliquid_data/evm_db_hub_slow/checkpoint/<height>/EvmState`), ~**3.5–3.7 GB** in mid-2026 (the rest of the ~5.8 GB total in 2026-10), streamed as a run of type=1 chunks of **variable size (≈0.2–1.2 MB)** right after the abci_state. The node logs `evm kvs` and, on failure, `failed to receive evm kvs: TcpRead::bincode err: LimitExceeded`.
 3. **live blocks** — the normal live stream begins.
 
-Total bootstrap ≈ **4.5 GB**. **The abci_state→EVM-KVs→live boundaries are internal to the (closed) framing and are NOT detectable from the wire** — EVM-KVs chunks and live blocks are both type=1 with overlapping sizes. Consequence for a gateway: don't try to parse the boundary. Either (a) relay the `send_abci:true` connection transparently and let the node find the boundaries, or (b) capture the byte stream verbatim and replay it verbatim (§12).
+Total bootstrap ≈ **5.8 GB** on mainnet in 2026-10 (abci_state ~1.29 GB + EVM KVs; it was ~4.5 GB in mid-2026 and keeps growing). **The abci_state→EVM-KVs→live boundaries are internal to the (closed) framing and are NOT detectable from the wire** — EVM-KVs chunks and live blocks are both type=1 with overlapping sizes. Consequence for a gateway: don't try to parse the boundary. Either (a) relay the `send_abci:true` connection transparently and let the node find the boundaries, or (b) capture the byte stream verbatim and replay it verbatim (§12).
 
 When the snapshot is certified and committed, the node writes `hyperliquid_data/visor_abci_state.json` (~225 B, `VisorAbciState { scheduled_freeze_height, consensus_time, wall_clock_time, reference_lag }`) — **this file appearing is the signal that bootstrap finished.**
 
@@ -136,7 +136,7 @@ The node logs `querying client blocks [X, Y]` → `got N client blocks first=X l
 4. **Finalize**: certify/commit the snapshot, write `visor_abci_state.json`.
 5. **Catch-up**: walk `client blocks [X,Y]` range queries (§8a) from the snapshot round to the committed tip; apply each batch in order (`got N client blocks` → `applied block …`). Catch-up runs ahead of live until it nears the tip (then a request returns `client block round too large` and it waits).
 6. **Steady state**: receive live blocks (type=1) on 4001 and apply them; `new app hashes reached quorum [(height, QuorumAppHash{…})]` confirms consensus. A synced non-validator keeps only ~1 active upstream in practice.
-7. **Restart**: a fresh start re-runs 3–6 (re-fetches the ~4.5 GB snapshot). Internal symbols for the non-validator path: `node_bootstrap`, `nv_stream_apply_execution_state`, `nv_stream_forward_client_blocks`, `split_client_blocks`, `process_client_block`.
+7. **Restart**: a fresh start re-runs 3–6 (re-fetches the ~5.8 GB bootstrap). Internal symbols for the non-validator path: `node_bootstrap`, `nv_stream_apply_execution_state`, `nv_stream_forward_client_blocks`, `split_client_blocks`, `process_client_block`.
 
 ## 10. Rate limiting [confirmed]
 

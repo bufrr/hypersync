@@ -8,3 +8,4 @@ docs
 review.md
 soak-test.sh
 README.md
+.env

@@ -6,7 +6,9 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 
 use crate::gateway::{
-    response_is_peer_only, MIN_COMPLETE_BOOTSTRAP_BYTES, MIN_COMPLETE_BOOTSTRAP_FRAMES,
+    response_has_client_block_round_too_large, response_has_client_block_round_too_small,
+    response_has_no_client_blocks, response_is_peer_only, MIN_COMPLETE_BOOTSTRAP_BYTES,
+    MIN_COMPLETE_BOOTSTRAP_FRAMES,
 };
 use crate::protocol::{block_round, block_round_full, RoundDedup, GREET_FALSE, GREET_TRUE};
 
@@ -88,11 +90,19 @@ pub(crate) async fn run_cache(port: u16, upstream: String) {
             let mut g = [0u8; 8];
             let _ = timeout(Duration::from_secs(15), down.read_exact(&mut g)).await;
             down.set_nodelay(true).ok();
-            let st = loop {
-                if let Some(s) = state.lock().unwrap().clone() {
-                    break s;
+            // bounded: a connection that arrives before any state was captured must not wait
+            // (and hold its socket) forever
+            let wait_state = async {
+                loop {
+                    if let Some(s) = state.lock().unwrap().clone() {
+                        break s;
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(200)).await;
+            };
+            let Ok(st) = timeout(Duration::from_secs(60), wait_state).await else {
+                eprintln!("[cache] node {addr}: no state captured within 60s; closing");
+                return;
             };
             let t0 = std::time::Instant::now();
             if down.write_all(&st).await.is_err() {
@@ -175,16 +185,18 @@ async fn feed_live(
     let mut s = TcpStream::connect(upstream).await?;
     s.set_nodelay(true).ok();
     s.write_all(&GREET_FALSE).await?; // send_abci:false: continuous live blocks
+                                      // a silent upstream must end the feed (so the caller reconnects) instead of freezing it
+    const READ: Duration = Duration::from_secs(30);
     loop {
         let mut hdr = [0u8; 5];
-        s.read_exact(&mut hdr).await?;
+        timeout(READ, s.read_exact(&mut hdr)).await??;
         let len = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as usize;
         let typ = hdr[4];
         if len > 50_000_000 {
             let mut rem = len;
             let mut buf = vec![0u8; 65536];
             while rem > 0 {
-                let n = s.read(&mut buf[..rem.min(65536)]).await?;
+                let n = timeout(READ, s.read(&mut buf[..rem.min(65536)])).await??;
                 if n == 0 {
                     return Ok(());
                 }
@@ -193,7 +205,7 @@ async fn feed_live(
             continue;
         }
         let mut payload = vec![0u8; len];
-        s.read_exact(&mut payload).await?;
+        timeout(READ, s.read_exact(&mut payload)).await??;
         if typ != 1 {
             continue;
         }
@@ -470,6 +482,18 @@ async fn fakenode_rpc(gw_ip: &str, port: u16, max_round: u32, label: &str) -> bo
         }
         if response_is_peer_only(&payload) {
             eprintln!("[fakenode:{label}] rpc got leaked Peer-only rejection");
+            return false;
+        }
+        // the gateway hands these terminal range errors to the node as a last resort; for a
+        // check that the RPC path works they are a failure, not a pass
+        if response_has_no_client_blocks(&payload)
+            || response_has_client_block_round_too_large(&payload)
+            || response_has_client_block_round_too_small(&payload)
+        {
+            eprintln!(
+                "[fakenode:{label}] rpc got a terminal range error: {}",
+                String::from_utf8_lossy(&payload[..len.min(120)])
+            );
             return false;
         }
         eprintln!(

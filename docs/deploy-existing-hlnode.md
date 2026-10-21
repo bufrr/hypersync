@@ -20,7 +20,7 @@ flowchart LR
     subgraph GNET["Docker network: hypersync_gwnet"]
       GW["hypersync-gw<br/>172.28.0.10:4000-4010<br/>not published to public internet"]
       PEERD["hypersync-peerd"]
-      PD[("/pd<br/>peers.json + bootstrap.cache")]
+      PD[("/pd<br/>peers.json<br/>(+ bootstrap.cache only with --cache)")]
     end
   end
 
@@ -54,12 +54,12 @@ hypersync 的 compose 里，但需要加入 `hypersync_gwnet` 网络，并把
 
 - 先保持已有 HL node 正常运行，不要一开始就停掉或切到 gateway-only。
 - 先启动 `peerd + gw`，让 peerd 读取已有 HL node 的 `tcp_lz4_stats`，建立 live peer pool。
-- 等 `data/peers.json` 有稳定 `live_servers`，并且 `gw` 生成 `data/bootstrap.cache` 后，再切换 HL node。
+- 等 `data/peers.json` 有稳定 `live_servers` 后，再切换 HL node。默认 compose 不开 `--cache`（`gateway /pd/peers.json --push --live 5`），不会生成 `data/bootstrap.cache`，也不需要等它；node 冷启动时 gateway 会透明转发一个正在提供 abci_state 的真实 peer 完成 bootstrap。只有确有内存余量时才按第 7 节开启 `--cache`。
 - 生产推荐把 gw/peerd 部署在至少一个真实 HL node 所在机器。备选方案也必须保证 gw 出公网的源 IP 和一个健康 HL node 的公网 peer 行为一致。公网 HL peers 可能根据源 IP 是否有正常 `4001/4002` 行为来降级连接；如果 gw 放在一台没有 HL node 公网端口行为的空机器上，peerd/gw 可能拿不到稳定 live peer。
 - gateway 默认只在 Docker 内网 `hypersync_gwnet` 暴露。同机部署时不要把 gateway 的 `4000-4010` publish 到宿主机；真实 HL node 继续占用宿主机公网 `4001/4002`。异机 node 访问 gw 时，也只应把 gateway 发布到私网/VPN IP，并用防火墙只允许 HL node 来源 IP。
 - HL node 自己的公网 `4001/4002` 可以保持原状；这些端口属于 HL node，不是 gateway。
 - 多个 HL node 可以共用一个 gateway，但 gateway 按 node 的来源 IP 区分 session。共用 gateway 的多个 node 必须在 gateway 看来拥有不同来源 IP，例如不同 Docker container IP。
-- 多 node 同机测试时，内存压力主要来自 HL node 自身，不是 gateway。gateway 常驻通常接近一个 bootstrap cache 的大小，cache refresh 时会短暂升高；每个 HL node 可能到 20GB+，两节点机器要预留足够 RAM/swap。
+- 多 node 同机测试时，内存压力主要来自 HL node 自身，不是 gateway。默认不开 `--cache` 时 gateway 稳态常驻只有几 MB（2026-10-21 实测约 6MB），每个进行中的 bootstrap 会短暂多占约 64MB 预取缓冲，写出后即释放；开 `--cache` 后 gateway 会常驻一份完整 bootstrap（2026-10 约 5.8GB），refresh race 时可升到 ~19GB。单个 HL node 实测约 34-40GB，两节点机器要预留足够 RAM/swap。
 
 ## 2. 前置条件
 
@@ -295,7 +295,7 @@ docker logs -f hypersync-peerd
 核心判断：
 
 - `live` 不应长期为 `0`。
-- 生产切换前建议 `live >= 4`；低于 4 时 gateway 会先暂缓 cache refresh，接近过期时仍会用可用 peer 强制尝试刷新，避免主动等到 cache 过期。
+- 生产切换前建议 `live >= 4`；开启 `--cache` 时若低于 4，gateway 会先暂缓 cache refresh，接近过期时仍会用可用 peer 强制尝试刷新，避免主动等到 cache 过期。
 - `round_tip` 应该是 `Some(...)`。
 - `data/peers.json` 里应该有 `live_servers`。
 
@@ -323,7 +323,16 @@ gateway 被暴露成公网入口了。
 cat data/peers.json
 ```
 
-## 7. 等待 bootstrap cache 生成
+## 7. bootstrap cache（可选，`--cache`）
+
+默认 compose 不开 `--cache`，不会生成 `data/bootstrap.cache`，可以直接跳过本节：node 冷启动时由 gateway
+透明转发一个正在提供 abci_state 的真实 peer。之所以默认关闭：内存 snapshot cache 加上它的 refresh race
+会占用 6-19GB，和约 34-40GB 的 hl-node 同机时，2026-10-12 把主机内存推过了 hl-visor 约 95% 的低内存
+重启阈值，导致 hl-node 子进程反复重启。
+
+只有主机有足够内存余量、并且希望 node 重启时不依赖外部 peer 提供 abci_state 时，才开启 `--cache`：在
+`docker-compose.yml` 的 `gw` 服务 `command` 里追加 `"--cache"`（或用 compose override 覆盖 `command`），
+例如 `["gateway", "/pd/peers.json", "--push", "--cache", "--live", "5"]`，然后重新 `up -d`。
 
 gateway 使用 `--cache` 时会捕获完整 bootstrap，生成：
 
@@ -351,7 +360,7 @@ docker logs -f hypersync-gw
 ```
 
 这通常只是 refresh race 淘汰慢 peer，不等同于 gateway 故障。只要后续能看到 cache persisted、
-`data/bootstrap.cache` 的 mtime 持续更新，并且 cache age 不超过 30 分钟，就可以继续观察。
+`data/bootstrap.cache` 的 mtime 持续更新，并且 cache age 不超过 8 分钟（fresh 窗口），就可以继续观察。
 
 确认 cache 文件：
 
@@ -360,10 +369,10 @@ ls -lh data/bootstrap.cache
 stat data/bootstrap.cache
 ```
 
-正常大小约 4.5GB。切换 node 前，建议 cache mtime 不超过 30 分钟。
+正常大小约 5.8GB（2026-10 主网）。切换 node 前，建议 cache mtime 不超过 8 分钟；超过 8 分钟的 cache 不会被回放。
 
 如果 cache 暂时没有生成，但 `peers.json` 已经有稳定 live peer，node 也可以通过透明 fallback
-从真实 peer bootstrap；只是首次切换时会更依赖公网 peer 状态。生产部署建议先等 cache 成功。
+从真实 peer bootstrap（这也正是默认不开 `--cache` 时的路径）；只是会更依赖公网 peer 状态。开启了 `--cache` 时，建议先等 cache 成功再切换。
 
 ## 8. 让已有 HL node 加入 hypersync 网络
 
@@ -518,12 +527,12 @@ docker inspect hypersync-gw hypersync-peerd <HL_NODE_CONTAINER> \
 - `hypersync-peerd` 的 `live` 不长期为 0；生产切换和 cache 预热阶段建议保持 `live >= 4`。
 - `hypersync-gw` 没有持续 `4002 client-block fetch failed`。
 - HL node 没有持续 `Peer-only request`、`LimitExceeded`、panic 或 OOM。
-- `data/bootstrap.cache` 持续刷新，mtime 不长期超过 30 分钟。
+- 仅开启 `--cache` 时：`data/bootstrap.cache` 持续刷新，mtime 不长期超过 8 分钟。
 - 冷启动 / catch-up 阶段可能短暂出现 `Querying jailed validators for high round` 或
   `forward_client_blocks no more blocks from reader, reconnecting to a new peer`。如果随后
   `applied block` 继续增长、gateway 重新选择 live peer、双 node 高度差重新收敛，可以视为可恢复事件；如果持续出现或高度停滞，应按故障处理。
 
-查看 cache 更新时间：
+开启 `--cache` 时查看 cache 更新时间：
 
 ```sh
 stat -c '%y %s' data/bootstrap.cache
@@ -652,18 +661,18 @@ Docker 内网 172.28.0.10:4001/4002 -> hypersync-gw container
 ### 是否需要先停 HL node？
 
 不需要。首次部署时反而应该先保持 HL node 正常运行，给 peerd 提供真实 peer 发现来源。
-等 peerd live pool 和 gateway cache 都准备好后，再重启 node 切到 gateway。
+等 peerd live pool 准备好（开启 `--cache` 时还要等 gateway cache 生成）后，再重启 node 切到 gateway。
 
 ### cache 多久刷新？
 
-gateway 会定期刷新 bootstrap cache。当前 fresh cache 窗口是 30 分钟，刷新周期约 10 分钟；如果 live pool 临时低于 4，gateway 会先放缓刷新，接近过期时仍会尝试刷新。
-切换前建议确认 `data/bootstrap.cache` 已存在并且 mtime 较新。
+默认不开 `--cache`，没有 cache 需要刷新。开启 `--cache` 时 gateway 会定期刷新 bootstrap cache：fresh cache 窗口是 8 分钟，每 4 分钟刷新一次，失败的刷新最多 30 秒后重试；如果 live pool 临时低于 4，gateway 会先放缓刷新，接近过期时仍会尝试刷新。
+开启 `--cache` 时，切换前建议确认 `data/bootstrap.cache` 已存在并且 mtime 较新。
 
 ### node 内存高是不是 gateway 导致？
 
-不是。HL node 和 gateway 是独立容器、独立进程。gateway 主要内存来自 bootstrap cache 和刷新过程。
+不是。HL node 和 gateway 是独立容器、独立进程。默认不开 `--cache` 时 gateway 稳态只占几 MB；开启 `--cache` 时它的主要内存来自 bootstrap cache 和刷新过程。
 node 自身同步、catch-up、状态加载也会占用大量内存，需要分别看 `docker stats`。实测双 node
-同机运行时，gateway 约 4.5GB 常驻、refresh 短时更高，而单个 HL node 可到 20GB+；如果主机开始大量
+同机运行时，不开 `--cache` 的 gateway 常驻约 6MB（每个进行中的 bootstrap 短暂 +64MB），开 `--cache` 时约 5.8GB 常驻、refresh 短时可到 ~19GB，而单个 HL node 约 34-40GB；如果主机开始大量
 使用 swap，node 可能短暂执行落后并触发 `Querying jailed validators`，这不一定是 gateway 断流。
 
 ### peerd live=0 能不能继续切？

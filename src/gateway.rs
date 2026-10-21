@@ -6,20 +6,20 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 
+use crate::failover::{serve_failover, FailoverConfig, FailoverCtx};
 use crate::peerd::{extract_round_tip, peer_candidates_path, read_node_peers};
-use crate::priority::{gwlog, BootstrapPolicy, PriorityTier};
+use crate::priority::{gwlog, BootstrapPolicy, PrioritySession, PriorityTier};
 use crate::protocol::{
     block_round, complete_bootstrap_at_frame_boundary, complete_frame_count,
     finish_header_after_partial, is_plausible_mainnet_round, max_block_round_in_frames,
-    read_header_or_timeout, round_lag_from_tip, unix_secs, HeaderRead, ACTIVE_ROUND_MAX_LAG,
-    GREET_FALSE, GREET_TRUE,
+    read_header_or_timeout, read_live_frame_with_timeout, response_is_peer_full,
+    round_lag_from_tip, unix_secs, HeaderRead, ACTIVE_ROUND_MAX_LAG, GREET_FALSE, GREET_TRUE,
 };
-use crate::failover::{serve_failover, FailoverConfig, FailoverCtx};
-use crate::push::{serve_push, splice, PushConfig};
+use crate::push::{serve_push, splice, PushConfig, NODE_WRITE_TIMEOUT};
 
 // ---- full P2P gateway ----
 
@@ -74,6 +74,14 @@ fn install_bootstrap_cache(blob: Vec<u8>, source: &str, sink: &CacheSink) {
             }
         });
     }
+}
+
+// One bounded write to a node (NODE_WRITE_TIMEOUT); false = the node is gone or not reading.
+async fn node_write<W: AsyncWrite + Unpin>(w: &mut W, buf: &[u8]) -> bool {
+    matches!(
+        timeout(NODE_WRITE_TIMEOUT, w.write_all(buf)).await,
+        Ok(Ok(()))
+    )
 }
 
 // Transparent bootstrap fallback, with a write-through cache tap. This keeps the node's real peer
@@ -143,10 +151,18 @@ async fn splice_bootstrap_capture(
             }
 
             let len = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as usize;
-            if len > 1_500_000_000 {
+            if len > MAX_ABCI_STATE_FRAME {
                 break;
             }
-            if dw.write_all(&hdr).await.is_err() {
+            // checked before appending: the frame alone may be up to 1.5GB
+            if capture && blob.len() + 5 + len > MAX_BOOTSTRAP_CAPTURE_BYTES {
+                gwlog!(
+                    "[gw] transparent bootstrap cache tap would exceed max capture size; disabling tap"
+                );
+                blob = Vec::new();
+                capture = false;
+            }
+            if !node_write(&mut dw, &hdr).await {
                 break;
             }
             if capture {
@@ -158,7 +174,7 @@ async fn splice_bootstrap_capture(
                 if payload_prefix.len() > remaining {
                     break;
                 }
-                if dw.write_all(&payload_prefix).await.is_err() {
+                if !node_write(&mut dw, &payload_prefix).await {
                     break;
                 }
                 if capture {
@@ -172,7 +188,7 @@ async fn splice_bootstrap_capture(
                     Ok(0) | Err(_) => return,
                     Ok(n) => n,
                 };
-                if dw.write_all(&buf[..n]).await.is_err() {
+                if !node_write(&mut dw, &buf[..n]).await {
                     return;
                 }
                 if capture {
@@ -215,6 +231,8 @@ async fn splice_bootstrap_capture(
 }
 
 const BOOTSTRAP_PREFETCH_BYTES: usize = 64_000_000;
+// Largest plausible single bootstrap frame (the abci_state is ~1.3GB in 2026-10).
+const MAX_ABCI_STATE_FRAME: usize = 1_500_000_000;
 const BOOTSTRAP_PREFETCH_SECS: u64 = 4;
 const BOOTSTRAP_SELECT_DEADLINE_SECS: u64 = 24;
 const BOOTSTRAP_SELECT_MAX_INFLIGHT: usize = 4;
@@ -333,6 +351,11 @@ async fn try_fast_bootstrap_peer(
             decline_detail(&mut upc, hdr[4], len).await
         ));
     }
+    // same bound as fetch_bootstrap / the tap (abci_state is ~1.3GB): a bigger first frame is a
+    // broken or hostile peer, and relaying its length would hang the node's bootstrap on it
+    if len > MAX_ABCI_STATE_FRAME {
+        return Err(format!("implausible abci_state len={len}"));
+    }
     let prefetch_len = len.min(BOOTSTRAP_PREFETCH_BYTES);
     let mut payload_prefix = vec![0u8; prefetch_len];
     stage(
@@ -416,31 +439,21 @@ async fn read_live_greeting_with_timeout(
     read_live_frame_with_timeout(s, wait, 1000).await
 }
 
-async fn read_live_frame_with_timeout(
-    s: &mut TcpStream,
-    wait: Duration,
-    max_len: usize,
-) -> std::io::Result<Vec<u8>> {
-    let mut hdr = [0u8; 5];
-    timeout(wait, s.read_exact(&mut hdr)).await??;
-    let len = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as usize;
-    if len > max_len {
-        return Err(std::io::Error::other("live frame too large"));
-    }
-    let mut payload = vec![0u8; len];
-    timeout(wait, s.read_exact(&mut payload)).await??;
-    let mut frame = hdr.to_vec();
-    frame.extend_from_slice(&payload);
-    Ok(frame)
-}
-
 struct LivePeerSession {
     ip: String,
     stream: TcpStream,
     greeting: Vec<u8>,
     prefetched_frames: Vec<Vec<u8>>,
     first_round: u32,
+    // the priority slot taken before dialing (None for pool peers); serve_push_repinned keeps it
+    prio_session: Option<PrioritySession>,
 }
+
+// Non-block frames read while vetting (control / no-round data) are kept, in order, and handed to
+// the push session ahead of the vetted block instead of being dropped; bounded so a peer streaming
+// only non-block data can't grow the buffer.
+const VET_KEEP_MAX_FRAMES: usize = 64;
+const VET_KEEP_MAX_BYTES: usize = 8_000_000;
 
 const LIVE_SELECT_WAIT: Duration = Duration::from_millis(3500);
 const LIVE_SELECT_MAX_PARALLEL: usize = 4;
@@ -456,6 +469,8 @@ async fn open_live_peer_session_with_greet(
     let (stream, greeting, prefetched_frames, first_round) = timeout(wait, async move {
         let (mut s, greeting) = connect_and_greet_4001(&connect_ip, greet, wait).await?;
         let deadline = Instant::now() + wait;
+        let mut kept: Vec<Vec<u8>> = Vec::new();
+        let mut kept_bytes = 0usize;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -467,7 +482,15 @@ async fn open_live_peer_session_with_greet(
             } else {
                 None
             };
-            if let Some(round) = round {
+            let Some(round) = round else {
+                if kept.len() < VET_KEEP_MAX_FRAMES && kept_bytes + frame.len() <= VET_KEEP_MAX_BYTES
+                {
+                    kept_bytes += frame.len();
+                    kept.push(frame);
+                }
+                continue;
+            };
+            {
                 if !is_plausible_mainnet_round(round, net_tip) || round <= min_round_exclusive {
                     continue;
                 }
@@ -481,7 +504,8 @@ async fn open_live_peer_session_with_greet(
                         "live block lagged round={round} net_tip={net_tip} lag={lag} max_lag={ACTIVE_ROUND_MAX_LAG}"
                     )));
                 }
-                return Ok::<_, std::io::Error>((s, greeting, vec![frame], round));
+                kept.push(frame);
+                return Ok::<_, std::io::Error>((s, greeting, kept, round));
             }
         }
     })
@@ -492,6 +516,7 @@ async fn open_live_peer_session_with_greet(
         greeting,
         prefetched_frames,
         first_round,
+        prio_session: None,
     })
 }
 
@@ -502,7 +527,13 @@ async fn connect_and_greet_4001(
     greet: [u8; 8],
     wait: Duration,
 ) -> std::io::Result<(TcpStream, Vec<u8>)> {
-    let mut s = timeout(wait, TcpStream::connect(format!("{ip}:4001"))).await??;
+    // "ip" normally; "ip:port" (custom ports, tests on ephemeral ports) is used as given
+    let addr = if ip.contains(':') {
+        ip.to_string()
+    } else {
+        format!("{ip}:4001")
+    };
+    let mut s = timeout(wait, TcpStream::connect(addr)).await??;
     s.set_nodelay(true).ok();
     timeout(wait, s.write_all(&greet)).await??;
     let greeting = read_live_greeting_with_timeout(&mut s, wait).await?;
@@ -516,7 +547,14 @@ async fn open_peer_relationship(ip: &str, wait: Duration) -> std::io::Result<Tcp
     Ok(connect_and_greet_4001(ip, GREET_FALSE, wait).await?.0)
 }
 
+const PRIORITY_CAP_REACHED: &str = "priority session cap reached";
+
+// A priority attempt takes its session slot BEFORE dialing (try_acquire), so concurrent
+// selections for several nodes can't overrun HYPERSYNC_PRIORITY_MAX_SESSIONS; a full peer counts
+// as a failed attempt. The slot travels with the session, or is released when the attempt fails
+// or loses the race.
 async fn live_attempt(
+    priority: Arc<PriorityTier>,
     ip: String,
     is_priority: bool,
     greet: [u8; 8],
@@ -524,9 +562,27 @@ async fn live_attempt(
     min_round_exclusive: u32,
     net_tip: u32,
 ) -> (String, bool, std::io::Result<LivePeerSession>) {
+    let slot = if is_priority {
+        match priority.try_acquire(&ip) {
+            Some(s) => Some(s),
+            None => {
+                return (
+                    ip,
+                    is_priority,
+                    Err(std::io::Error::other(PRIORITY_CAP_REACHED)),
+                )
+            }
+        }
+    } else {
+        None
+    };
     let r =
         open_live_peer_session_with_greet(ip.clone(), greet, wait, min_round_exclusive, net_tip)
-            .await;
+            .await
+            .map(|mut s| {
+                s.prio_session = slot;
+                s
+            });
     (ip, is_priority, r)
 }
 
@@ -541,7 +597,7 @@ async fn live_attempt(
 // priority attempt has failed; priority attempts still in flight keep racing alongside it. With no
 // priority peers this is the plain pool race.
 async fn select_live_peer(
-    priority: &PriorityTier,
+    priority: &Arc<PriorityTier>,
     peers: &[String],
     start: usize,
     greet: [u8; 8],
@@ -567,6 +623,7 @@ async fn select_live_peer(
     let mut prio_pending: Vec<String> = prio.clone();
     for ip in prio.iter().cloned() {
         set.spawn(live_attempt(
+            priority.clone(),
             ip,
             true,
             greet,
@@ -587,6 +644,7 @@ async fn select_live_peer(
                 }
                 let ip = peers[(start + launched) % peers.len()].clone();
                 set.spawn(live_attempt(
+                    priority.clone(),
                     ip,
                     false,
                     greet,
@@ -617,7 +675,10 @@ async fn select_live_peer(
                 if is_priority {
                     prio_in_flight = prio_in_flight.saturating_sub(1);
                     prio_pending.retain(|p| p != &ip);
-                    priority.mark_failed(&ip);
+                    // a full peer is busy with our other nodes, not broken: no cooldown
+                    if e.to_string() != PRIORITY_CAP_REACHED {
+                        priority.mark_failed(&ip);
+                    }
                     gwlog!(
                         "[gw] priority {ip} live attempt failed after {}ms (our sessions there={}): {e}",
                         started.elapsed().as_millis(),
@@ -663,21 +724,26 @@ async fn select_live_peer(
 // Run a 4001 push session with the node's 4002 RPC pinned to the same upstream: pin the active
 // peer for the session's lifetime, run serve_push, log the exit; the guard clears the pin on any
 // exit (incl. a panic in serve_push). Shared by every push-serving path (cache-live, live, fallback).
+#[allow(clippy::too_many_arguments)]
 async fn serve_push_repinned(
     down: TcpStream,
     upc: TcpStream,
     node: &Arc<NodeState>,
     priority: &Arc<PriorityTier>,
     pool: &Arc<Mutex<Vec<String>>>,
+    // the priority slot live selection already took for this peer (None: take one here)
+    prio_session: Option<PrioritySession>,
     mode: &str,
     cfg: PushConfig,
 ) {
     let active_ip = cfg.hosts[cfg.active_idx].clone();
+    let active_peer = node.pin_active(&active_ip);
+    // clears this pin on any exit; a no-op once a hot-standby switch re-pinned (newer epoch)
     let _active_guard = ActivePinGuard {
         node: node.clone(),
-        peer: node.pin_active(&active_ip),
+        peer: active_peer.clone(),
     };
-    let _prio_session = priority.acquire(&active_ip);
+    let _prio_session = prio_session.or_else(|| priority.acquire(&active_ip));
     let tier = priority.tier_of(&active_ip);
     let started = Instant::now();
     gwlog!(
@@ -851,6 +917,7 @@ async fn serve_push_4001_fallback(
         &node,
         &ctx.priority,
         &ctx.pool,
+        None,
         "fallback",
         PushConfig {
             hosts: Arc::new(vec![ip.clone()]),
@@ -861,6 +928,7 @@ async fn serve_push_4001_fallback(
             initial_last_forwarded,
             live_floor: node.live_floor.clone(),
             net_round_tip: ctx.net_round_tip.clone(),
+            superseded: None,
         },
     )
     .await;
@@ -890,14 +958,11 @@ impl Drop for ActivePinGuard {
 // briefly for the bootstrap to set it; falls back to a round-robin pool peer if none is set yet.
 async fn dial_active(
     node: &NodeState,
+    priority: &PriorityTier,
     peers: &[String],
     rr: &Arc<AtomicUsize>,
     port: u16,
 ) -> Option<TcpStream> {
-    let n = peers.len();
-    if n == 0 {
-        return None;
-    }
     // brief wait in case a concurrent bootstrap is about to set the active peer
     let mut target = None;
     for _ in 0..15 {
@@ -911,10 +976,16 @@ async fn dial_active(
     // one now so EVERY connection of this node converges on the same upstream (client-block RPC needs
     // it). Marked lazy: this pin must not suppress a cache replay if the node is actually cold-starting
     // and its 4001 bootstrap greet simply hasn't arrived yet.
+    // An existing pin is used even with an empty pool, and a priority-only deployment (empty
+    // pool) still has candidates: the priority tier.
     let target = match target {
         Some(t) => t,
         None => {
-            let t = peers[rr.fetch_add(1, Ordering::Relaxed) % n].clone();
+            let t = if peers.is_empty() {
+                priority.candidates().into_iter().next()?
+            } else {
+                peers[rr.fetch_add(1, Ordering::Relaxed) % peers.len()].clone()
+            };
             node.pin_lazy_active(&t)
         }
     };
@@ -937,31 +1008,19 @@ pub(crate) fn response_is_peer_only(payload: &[u8]) -> bool {
         .any(|w| w == b"Peer-only request")
 }
 
-fn response_is_peer_full(payload: &[u8]) -> bool {
-    // On the live 4001 greeting path, upstream refusal is often encoded as a compact binary
-    // status frame. 0x03 is the normal accepted greeting before live block frames; 0x04 is the
-    // observed peer-full refusal and must not be forwarded as a usable live greeting.
-    if payload.len() == 6 && payload[..4] == [0, 0, 0, 1] && payload[4] == 0 {
-        return payload[5] == 4;
-    }
-    payload
-        .windows(b"Peer full".len())
-        .any(|w| w == b"Peer full")
-}
-
-fn response_has_no_client_blocks(payload: &[u8]) -> bool {
+pub(crate) fn response_has_no_client_blocks(payload: &[u8]) -> bool {
     payload
         .windows(b"no client blocks to serve".len())
         .any(|w| w == b"no client blocks to serve")
 }
 
-fn response_has_client_block_round_too_large(payload: &[u8]) -> bool {
+pub(crate) fn response_has_client_block_round_too_large(payload: &[u8]) -> bool {
     payload
         .windows(b"client block round too large".len())
         .any(|w| w == b"client block round too large")
 }
 
-fn response_has_client_block_round_too_small(payload: &[u8]) -> bool {
+pub(crate) fn response_has_client_block_round_too_small(payload: &[u8]) -> bool {
     payload
         .windows(b"client block round too small".len())
         .any(|w| w == b"client block round too small")
@@ -997,7 +1056,7 @@ fn client_block_peer_candidates(
 enum ClientBlockUpstreamResponse {
     Frames(Vec<u8>),
     PeerOnly,
-    RangeTooSmall,
+    RangeTooSmall(Vec<u8>),
     TerminalError(Vec<u8>),
 }
 
@@ -1042,7 +1101,7 @@ async fn fetch_client_blocks_from_peer(
             return Ok(ClientBlockUpstreamResponse::TerminalError(frame));
         }
         if response_has_client_block_round_too_small(&rp) {
-            return Ok(ClientBlockUpstreamResponse::RangeTooSmall);
+            return Ok(ClientBlockUpstreamResponse::RangeTooSmall(frame));
         }
         Ok(ClientBlockUpstreamResponse::Frames(frame))
     }
@@ -1079,6 +1138,7 @@ fn note_client_block_result(
     result: std::io::Result<ClientBlockUpstreamResponse>,
     failures: &mut Vec<String>,
     terminal: &mut Option<Vec<u8>>,
+    too_small: &mut Option<Vec<u8>>,
 ) -> Option<Vec<u8>> {
     if let Some(peer) = tag {
         if !node.active_is_current(peer) {
@@ -1104,7 +1164,11 @@ fn note_client_block_result(
                 failures.push(format!("{ip}: peer-only"));
             }
         }
-        Ok(ClientBlockUpstreamResponse::RangeTooSmall) => {
+        Ok(ClientBlockUpstreamResponse::RangeTooSmall(frame)) => {
+            // another peer may still hold the range; kept only as the last-resort answer
+            if too_small.is_none() {
+                *too_small = Some(frame);
+            }
             failures.push(format!("{ip}: range-too-small"));
         }
         Err(e) => {
@@ -1153,22 +1217,33 @@ async fn fetch_client_blocks_raced(
     req: Arc<Vec<u8>>,
 ) -> Result<Vec<u8>, String> {
     let started = Instant::now();
-    let active = wait_active_session(node, ACTIVE_4002_PIN_WAIT).await;
+    // a remembered hedge winner (see NodeState::rpc_peer) stands in for a missing pin right away
+    let remembered = node.rpc_peer.lock().unwrap().clone();
+    let active = if remembered.is_some() {
+        node.active_session_snapshot()
+    } else {
+        wait_active_session(node, ACTIVE_4002_PIN_WAIT).await
+    };
+    let first = match (&active, &remembered) {
+        (Some(peer), _) => Some((Some(peer.clone()), peer.ip.clone(), false, "active")),
+        (None, Some(ip)) => Some((None, ip.clone(), true, "remembered")),
+        (None, None) => None,
+    };
     let mut attempts = tokio::task::JoinSet::new();
     let mut failures = Vec::new();
     let mut terminal = None;
+    let mut too_small = None;
 
-    // Stage 1: the pinned active ALONE within a grace budget (one upstream connection in the
-    // common case; no candidate can outrace it with a cross-peer response).
-    if let Some(peer) = active.clone() {
-        let req_for_active = req.clone();
-        let ip = peer.ip.clone();
-        let tag = peer.clone();
+    // Stage 1: the pinned active (or the remembered RPC peer) ALONE within a grace budget (one
+    // upstream connection in the common case; no candidate can outrace it with a cross-peer
+    // response).
+    if let Some((tag, ip, prewarm, stage)) = first.clone() {
+        let req_for_first = req.clone();
         attempts.spawn(async move {
-            let result = fetch_client_blocks_from_peer(ip.clone(), req_for_active, false)
+            let result = fetch_client_blocks_from_peer(ip.clone(), req_for_first, prewarm)
                 .await
                 .1;
-            (Some(tag), ip, result)
+            (tag, ip, result)
         });
         match timeout(ACTIVE_4002_GRACE, attempts.join_next()).await {
             Ok(Some(Ok((tag, ip, result)))) => {
@@ -1179,13 +1254,14 @@ async fn fetch_client_blocks_raced(
                     result,
                     &mut failures,
                     &mut terminal,
+                    &mut too_small,
                 ) {
-                    log_client_blocks(node, priority, &ip, "active", &frame, started);
+                    log_client_blocks(node, priority, &ip, stage, &frame, started);
                     return Ok(frame);
                 }
             }
             Ok(_) => {}
-            // grace expired: the active attempt stays in the set and keeps racing below
+            // grace expired: the first attempt stays in the set and keeps racing below
             Err(_) => {}
         }
     }
@@ -1193,7 +1269,10 @@ async fn fetch_client_blocks_raced(
     // Stage 2: hedge across pool candidates — only reached when the active is absent, failed,
     // or slow. Each candidate opens its own temporary live relationship (prewarm) first.
     for ip in client_block_peer_candidates(priority.candidates(), peers, rr, 8) {
-        if active.as_ref().is_some_and(|peer| peer.ip == ip) {
+        if first
+            .as_ref()
+            .is_some_and(|(_, first_ip, _, _)| *first_ip == ip)
+        {
             continue;
         }
         let req = req.clone();
@@ -1204,11 +1283,13 @@ async fn fetch_client_blocks_raced(
     }
 
     let mut terminal_from = String::new();
+    let mut too_small_from = String::new();
     while let Some(joined) = attempts.join_next().await {
         let Ok((tag, ip, result)) = joined else {
             continue;
         };
         let had_terminal = terminal.is_some();
+        let had_too_small = too_small.is_some();
         if let Some(frame) = note_client_block_result(
             node,
             tag.as_ref(),
@@ -1216,18 +1297,31 @@ async fn fetch_client_blocks_raced(
             result,
             &mut failures,
             &mut terminal,
+            &mut too_small,
         ) {
             attempts.abort_all();
             let stage = if tag.is_some() { "active" } else { "hedge" };
+            if tag.is_none() && node.active_session_snapshot().is_none() {
+                *node.rpc_peer.lock().unwrap() = Some(ip.clone());
+            }
             log_client_blocks(node, priority, &ip, stage, &frame, started);
             return Ok(frame);
         }
         if !had_terminal && terminal.is_some() {
-            terminal_from = ip;
+            terminal_from = ip.clone();
+        }
+        if !had_too_small && too_small.is_some() {
+            too_small_from = ip;
         }
     }
     if let Some(frame) = terminal {
         log_client_blocks(node, priority, &terminal_from, "terminal", &frame, started);
+        return Ok(frame);
+    }
+    // every peer said the range is older than what it keeps: tell the node so (it would otherwise
+    // only see the socket close and may retry the same range)
+    if let Some(frame) = too_small {
+        log_client_blocks(node, priority, &too_small_from, "terminal", &frame, started);
         return Ok(frame);
     }
     Err(failures.join("; "))
@@ -1268,9 +1362,27 @@ async fn serve_client_blocks(
     let mut req = hdr.to_vec();
     req.extend_from_slice(&payload);
 
-    match fetch_client_blocks_raced(&node, &priority, &peers, &rr, Arc::new(req)).await {
+    // Gateway-wide bound on concurrent fetches: each one can hold up to ~9 upstream attempts with
+    // multi-MB responses. A catch-up node sends one request at a time, so 8 is far above normal.
+    let Ok(Ok(_slot)) = timeout(Duration::from_secs(5), CLIENT_BLOCK_FETCH_SLOTS.acquire()).await
+    else {
+        gwlog!("[gw] [{}] 4002 client-block fetch busy; closing", node.ip);
+        return;
+    };
+    let fetched = timeout(
+        CLIENT_BLOCK_FETCH_DEADLINE,
+        fetch_client_blocks_raced(&node, &priority, &peers, &rr, Arc::new(req)),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        Err(format!(
+            "deadline {}s",
+            CLIENT_BLOCK_FETCH_DEADLINE.as_secs()
+        ))
+    });
+    match fetched {
         Ok(frame) => {
-            let _ = down.write_all(&frame).await;
+            let _ = timeout(NODE_WRITE_TIMEOUT, down.write_all(&frame)).await;
         }
         Err(failure) => {
             gwlog!(
@@ -1281,6 +1393,11 @@ async fn serve_client_blocks(
         }
     }
 }
+
+// One 4002 request's whole budget: the active grace plus a hedge round normally answer within a
+// few seconds (median ~2s, 20MB batches); past this the node is better off retrying.
+const CLIENT_BLOCK_FETCH_DEADLINE: Duration = Duration::from_secs(15);
+static CLIENT_BLOCK_FETCH_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(8);
 
 // Capture a full bootstrap (abci_state + EVM KVs) VERBATIM from a serving state-server, frame-aligned,
 // stopping when the bulk transfer ends (byte rate collapses from the bulk's tens-of-MB/s to the
@@ -1301,7 +1418,11 @@ fn bootstrap_capture_err(
     ))
 }
 
-pub(crate) const MIN_COMPLETE_BOOTSTRAP_BYTES: usize = 4_400_000_000;
+// A capture that ends (timeout / EOF / rate collapse) at a frame boundary counts as complete only
+// past this size. It has to track the real bootstrap: at the old 4.4GB a stall inside the 2026-10
+// EVM-KV tail (~5.8GB total) was installed and replayed as complete. ~90% of the 2026-10 size;
+// raise it again when the bootstrap grows (gw logs the size of every capture).
+pub(crate) const MIN_COMPLETE_BOOTSTRAP_BYTES: usize = 5_200_000_000;
 pub(crate) const MIN_COMPLETE_BOOTSTRAP_FRAMES: u64 = 4_000;
 const CACHE_REPLAY_COOLDOWN_SECS: u64 = 30;
 // hl-node's live/bootstrap reader times out in roughly five minutes once it sees the live
@@ -1429,6 +1550,31 @@ fn load_bootstrap_cache(path: &Path, now: u64) -> std::io::Result<Option<(Vec<u8
     Ok(Some((blob, cached_at)))
 }
 
+// persist_bootstrap_cache writes `<cache>.tmp<N>` then renames it; a crash or OOM kill in between
+// leaves a ~6GB orphan, and the sequence restarts at 0, so higher-numbered ones are never reused.
+// No writer is running yet at startup, so every such file is an orphan.
+fn remove_orphan_cache_tmps(path: &Path) {
+    let (Some(dir), Some(stem)) = (path.parent(), path.file_stem().and_then(|s| s.to_str())) else {
+        return;
+    };
+    let dir = if dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        dir
+    };
+    let prefix = format!("{stem}.tmp");
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.starts_with(&prefix)
+            && name[prefix.len()..].chars().all(|c| c.is_ascii_digit())
+            && std::fs::remove_file(entry.path()).is_ok()
+        {
+            gwlog!("[gw] removed orphaned cache temp file {name}");
+        }
+    }
+}
+
 fn persist_bootstrap_cache(path: &Path, blob: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -1531,9 +1677,18 @@ async fn fetch_bootstrap(upstream: &str) -> std::io::Result<Vec<u8>> {
         // Cap a single frame: the only legitimately-large frame is the ~954MB abci_state snapshot;
         // 1.5GB leaves headroom for state growth while rejecting a bogus/huge length that would
         // otherwise force a multi-GB allocation (3 of these race concurrently).
-        if len > 1_500_000_000 {
+        if len > MAX_ABCI_STATE_FRAME {
             return Err(bootstrap_capture_err(
                 format!("frame too large len={len}"),
+                blob.len(),
+                frames,
+                t0,
+            ));
+        }
+        // checked BEFORE allocating/appending: the frame alone may be up to 1.5GB
+        if blob.len() + 5 + len > MAX_BOOTSTRAP_CAPTURE_BYTES {
+            return Err(bootstrap_capture_err(
+                format!("capture too large with next frame len={len}"),
                 blob.len(),
                 frames,
                 t0,
@@ -1743,6 +1898,13 @@ struct NodeState {
     // A cold-starting node's gossip ports can connect before its 4001 bootstrap greet; a lazy pin
     // must not count as "has an active session" or it would suppress the node's cache replay.
     lazy_active: AtomicBool,
+    // The upstream that last answered this node's client-block RPC as a hedge after the active
+    // stopped serving it (Peer-only, so the pin was cleared while the 4001 session stays up).
+    // Tried first, without waiting for a pin, until the next real 4001 session pins a new active;
+    // otherwise every later 4002 request pays the pin wait plus the full hedge fan-out.
+    rpc_peer: Mutex<Option<String>>,
+    // a cache replay to this node is running (see ReplayInFlight)
+    replay_in_flight: AtomicBool,
 }
 
 impl NodeState {
@@ -1756,6 +1918,8 @@ impl NodeState {
             last_seen_secs: AtomicU64::new(now),
             open_conns: AtomicUsize::new(0),
             lazy_active: AtomicBool::new(false),
+            rpc_peer: Mutex::new(None),
+            replay_in_flight: AtomicBool::new(false),
         }
     }
 
@@ -1771,6 +1935,7 @@ impl NodeState {
         let mut active = self.active.lock().unwrap();
         *active = Some(peer.clone());
         self.lazy_active.store(false, Ordering::Release);
+        *self.rpc_peer.lock().unwrap() = None;
         peer
     }
 
@@ -1985,6 +2150,17 @@ fn live_greeting_for(greet: [u8; 8]) -> [u8; 8] {
     g
 }
 
+// Held for the duration of one cache replay to a node (set by cache_replay_blob): the replay can
+// outlast CACHE_REPLAY_COOLDOWN_SECS, and has_active_session() stays false until the live session
+// after it, so without this a second greet mid-replay would start a second full replay.
+struct ReplayInFlight(Arc<NodeState>);
+
+impl Drop for ReplayInFlight {
+    fn drop(&mut self) {
+        self.0.replay_in_flight.store(false, Ordering::Release);
+    }
+}
+
 // Decide whether THIS bootstrap greet gets the cached blob replayed (fresh cache + no active
 // session + replay cooldown passed); logs why a present blob is being withheld otherwise.
 fn cache_replay_blob(node: &NodeState, ctx: &GatewayCtx) -> Option<Arc<Vec<u8>>> {
@@ -1994,7 +2170,18 @@ fn cache_replay_blob(node: &NodeState, ctx: &GatewayCtx) -> Option<Arc<Vec<u8>>>
     let cached_at = ctx.boot_blob_cached_at.load(Ordering::Acquire);
     let blob = ctx.boot_blob.lock().unwrap().clone()?;
     if should_replay_cache(now, last, has_active_session, cached_at) {
-        return Some(blob);
+        if node
+            .replay_in_flight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return Some(blob);
+        }
+        gwlog!(
+            "[gw] [{}] cache replay suppressed: a replay to this node is still running; using transparent fallback",
+            node.ip
+        );
+        return None;
     }
     if has_active_session {
         gwlog!(
@@ -2039,6 +2226,7 @@ async fn replay_cache_then_live(
         blob.len() / 1_000_000
     );
     node.last_cache_replay_secs.store(now, Ordering::Release);
+    let in_flight = ReplayInFlight(node.clone());
     // Chunked on purpose: one write_all over the whole >4GB blob wedges permanently at ~2^31
     // bytes when the reader drains faster than the send-buffer copy loop (a single send()
     // syscall then never returns to userspace before its byte count overflows). Bounding each
@@ -2046,23 +2234,19 @@ async fn replay_cache_then_live(
     // cache-draining fakenode reliably does.
     let mut replay_err = false;
     for chunk in blob.chunks(8 * 1024 * 1024) {
-        if down.write_all(chunk).await.is_err() {
+        if !node_write(&mut down, chunk).await {
             replay_err = true;
             break;
         }
     }
+    drop(in_flight);
     if replay_err {
+        // The cooldown stamp stays: clearing it let a client that reads a few bytes and closes
+        // trigger full 5.8GB replays back to back. A node restarting within the cooldown simply
+        // bootstraps transparently from a peer.
         gwlog!(
             "[gw] [{}] cache replay write failed; node will re-bootstrap",
             node.ip
-        );
-        // reset the cooldown only if our own stamp is still current — never clobber a
-        // concurrent newer replay's
-        let _ = node.last_cache_replay_secs.compare_exchange(
-            now,
-            0,
-            Ordering::AcqRel,
-            Ordering::Acquire,
         );
         return;
     }
@@ -2114,6 +2298,7 @@ async fn replay_cache_then_live(
             &node,
             &ctx.priority,
             &ctx.pool,
+            live.prio_session,
             "cache-live",
             PushConfig {
                 hosts: Arc::new(hosts),
@@ -2124,6 +2309,7 @@ async fn replay_cache_then_live(
                 initial_last_forwarded: cache_floor,
                 live_floor: node.live_floor.clone(),
                 net_round_tip: ctx.net_round_tip.clone(),
+                superseded: None,
             },
         )
         .await;
@@ -2220,11 +2406,15 @@ async fn transparent_bootstrap(
                 node.ip
             );
         }
-        if down.write_all(&hdr).await.is_err() {
-            return;
-        }
-        if down.write_all(&payload_prefix).await.is_err() {
-            return;
+        // bounded like every other node write: a node that stops reading must not park this
+        // task (and its pin, priority slot and upstream connection) until TCP gives up
+        for chunk in [&hdr[..], &payload_prefix[..]] {
+            if !matches!(
+                timeout(NODE_WRITE_TIMEOUT, down.write_all(chunk)).await,
+                Ok(Ok(()))
+            ) {
+                return;
+            }
         }
         // Free the 64MB prefetch before the splice: the bootstrap connection can stay open long
         // after the state transfer, and keeping it in scope held 64MB per open bootstrap
@@ -2294,6 +2484,7 @@ async fn handle_4001_live(
                 &node,
                 &ctx.priority,
                 &ctx.pool,
+                live.prio_session,
                 "live",
                 PushConfig {
                     hosts: Arc::new(hosts),
@@ -2304,6 +2495,7 @@ async fn handle_4001_live(
                     initial_last_forwarded: 0,
                     live_floor: node.live_floor.clone(),
                     net_round_tip: ctx.net_round_tip.clone(),
+                    superseded: None,
                 },
             )
             .await;
@@ -2322,66 +2514,73 @@ async fn handle_4001_live(
         }
         return;
     }
-    for ip in tiered_peers(&ctx.priority, &peers, start) {
-        let is_priority = ctx.priority.contains(&ip);
-        let up = format!("{}:4001", ip);
-        let t0 = Instant::now();
-        let mut upc = match timeout(Duration::from_secs(5), TcpStream::connect(&up)).await {
-            Ok(Ok(c)) => c,
-            other => {
-                if is_priority {
-                    ctx.priority.mark_failed(&ip);
-                    let why = match other {
-                        Ok(Err(e)) => e.to_string(),
-                        _ => "connect timeout".to_string(),
-                    };
-                    gwlog!(
-                        "[gw] [{}] 4001 splice priority {} failed: {why}",
-                        node.ip,
-                        ip
-                    );
-                }
-                continue;
-            }
-        };
-        upc.set_nodelay(true).ok();
-        if upc.write_all(&greet).await.is_err() {
-            if is_priority {
-                ctx.priority.mark_failed(&ip);
-            }
-            continue;
-        }
-        let active_peer = node.pin_active(&ip);
-        let _prio_session = ctx.priority.acquire(&ip);
+    // Transparent splice. Race the candidates (priority first) like the push fallback: the first
+    // peer to answer the greeting wins, a refusal (peer full) or a hung peer is skipped instead of
+    // being handed to the node as its greeting, failed priority peers cool down, and the whole
+    // race fits the node's ~5s live-connect deadline (one hung candidate dialed sequentially used
+    // to burn all of it).
+    let t0 = Instant::now();
+    let candidates = tiered_peers(&ctx.priority, &peers, start);
+    let tried = candidates.len().min(FALLBACK_MAX_PARALLEL);
+    let Some((ip, upc, greeting)) =
+        race_fallback_upstream(&ctx.priority, candidates, greet, LIVE_SELECT_WAIT).await
+    else {
         gwlog!(
-            "[gw] [{}] 4001 splice start peer={} tier={} connect_ms={} prio_sessions={}",
-            node.ip,
-            ip,
-            ctx.priority.tier_of(&ip),
-            t0.elapsed().as_millis(),
-            ctx.priority.sessions(&ip)
+            "[gw] [{}] 4001 splice: no upstream answered (tried={tried})",
+            node.ip
         );
-        let (to_node, to_peer) = splice(down, upc).await;
-        gwlog!(
-            "[gw] [{}] 4001 splice ended peer={} tier={} secs={} bytes_to_node={} bytes_to_peer={}",
-            node.ip,
-            ip,
-            ctx.priority.tier_of(&ip),
-            t0.elapsed().as_secs(),
-            to_node,
-            to_peer
-        );
-        node.clear_active_if_current(&active_peer);
-        break;
+        return;
+    };
+    let _active_guard = ActivePinGuard {
+        node: node.clone(),
+        peer: node.pin_active(&ip),
+    };
+    let _prio_session = ctx.priority.acquire(&ip);
+    gwlog!(
+        "[gw] [{}] 4001 splice start peer={} tier={} connect_ms={} prio_sessions={}",
+        node.ip,
+        ip,
+        ctx.priority.tier_of(&ip),
+        t0.elapsed().as_millis(),
+        ctx.priority.sessions(&ip)
+    );
+    let mut down = down;
+    if !matches!(
+        timeout(NODE_WRITE_TIMEOUT, down.write_all(&greeting)).await,
+        Ok(Ok(()))
+    ) {
+        return;
     }
+    let (to_node, to_peer) = splice(down, upc).await;
+    gwlog!(
+        "[gw] [{}] 4001 splice ended peer={} tier={} secs={} bytes_to_node={} bytes_to_peer={}",
+        node.ip,
+        ip,
+        ctx.priority.tier_of(&ip),
+        t0.elapsed().as_secs(),
+        to_node,
+        to_peer
+    );
 }
 
-// peerd's round_tip from the peer file, only if peerd wrote it recently. The tip only ever rises
-// and caps plausible rounds at tip + NET_TIP_SLACK_ROUNDS (~4h), so a file left over from a
-// gateway that was down for weeks would make every real round look implausible until peerd's
-// first rewrite. peerd also leaves the file untouched (kept_previous) when a cycle finds no
-// live peers, so the same check covers a stalled peerd.
+// peerd's round_tip from the peer file, only if peerd wrote it recently: the tip caps plausible
+// rounds at tip + NET_TIP_SLACK_ROUNDS (~4h), so a file left over from a gateway that was down for
+// weeks would make every real round look implausible.
 const PEER_FILE_TIP_MAX_AGE: Duration = Duration::from_secs(15 * 60);
+
+// The refresher's tip update for one peer-file read (None = leave the tip as it is). peerd
+// re-measures the tip every cycle, so a fresh reading REPLACES the old one: a bad cycle lasts one
+// cycle instead of pinning the tip forever. With no fresh reading for PEER_FILE_TIP_MAX_AGE (peerd
+// stalled, kept_previous, or publishing round_tip:null) the tip drops to 0 = unknown: floor-only
+// plausibility and no lag guard. A frozen tip would otherwise fall behind mainnet and, ~4h later,
+// make every real round exceed tip + NET_TIP_SLACK_ROUNDS and starve all live serving.
+fn next_net_tip(fresh: Option<u32>, since_fresh: Duration) -> Option<u32> {
+    match fresh {
+        Some(tip) => Some(tip),
+        None if since_fresh > PEER_FILE_TIP_MAX_AGE => Some(0),
+        None => None,
+    }
+}
 
 fn fresh_peer_file_tip(path: &str) -> Option<u32> {
     let age = std::fs::metadata(path)
@@ -2420,6 +2619,7 @@ pub(crate) async fn run_gateway(
     let boot_blob_cached_at = Arc::new(AtomicU64::new(0));
     let disk_cache_path = cache_coldstart.then(|| bootstrap_cache_path(&node_peer_file));
     if let Some(path) = &disk_cache_path {
+        remove_orphan_cache_tmps(path);
         match load_bootstrap_cache(path, unix_secs()) {
             Ok(Some((blob, cached_at))) => {
                 gwlog!(
@@ -2449,15 +2649,14 @@ pub(crate) async fn run_gateway(
     // Single-flight for the transparent-fallback cache tap: concurrent fallback bootstraps must not
     // stack multiple multi-GB tap buffers or race the disk cache file; the loser relays untapped.
     let capture_tap = Arc::new(tokio::sync::Semaphore::new(1));
-    // Best-known network round tip (monotonic; 0 until first learned). Sources: peerd's clustered
-    // round_tip in peers.json and the bootstrap-cache scans. Reference for both the tip-relative
-    // round-plausibility ceiling (a stale/absent tip only widens it) and the ACTIVE_ROUND_MAX_LAG
-    // freshness guard, which a too-high tip tightens instead. Because the value only ever rises,
-    // both sources must be corroborated: peerd clusters across >=2 peers, and cache scans report a
-    // round that was really observed on disk.
+    // Best-known network round tip (0 = unknown). Set from peerd's corroborated round_tip in
+    // peers.json (see next_net_tip: each fresh reading replaces the last, no reading for 15 min
+    // resets it to 0); --cache scans may also raise it between readings. Reference for both the
+    // tip-relative round-plausibility ceiling and the ACTIVE_ROUND_MAX_LAG freshness guard, which a
+    // too-high tip tightens — hence peerd publishes a round at least two peers back.
     let net_round_tip = Arc::new(AtomicU32::new(0));
     if let Some(tip) = fresh_peer_file_tip(&node_peer_file) {
-        raise_round_floor(&net_round_tip, tip);
+        net_round_tip.store(tip, Ordering::Release);
     }
     gwlog!(
         "[gw] full P2P gateway: pool from {} ({} peers); bootstrap={}; live={}; live-upstream budget={}",
@@ -2484,12 +2683,34 @@ pub(crate) async fn run_gateway(
         let net_round_tip = net_round_tip.clone();
         let priority = priority.clone();
         tokio::spawn(async move {
+            let mut last_fresh_tip = Instant::now();
             loop {
                 tokio::time::sleep(Duration::from_secs(30)).await;
                 let p = priority.strip(read_node_peers(&path));
-                *pool.lock().unwrap() = p;
-                if let Some(tip) = fresh_peer_file_tip(&path) {
-                    raise_round_floor(&net_round_tip, tip);
+                if p.is_empty() {
+                    // missing/unreadable/empty file (peerd itself never writes an empty pool over
+                    // a good one): keep serving from the last pool rather than dropping every
+                    // upstream
+                    if !pool.lock().unwrap().is_empty() {
+                        gwlog!(
+                            "[gw] WARN peer file {path} has no peers; keeping the previous pool"
+                        );
+                    }
+                } else {
+                    *pool.lock().unwrap() = p;
+                }
+                let fresh = fresh_peer_file_tip(&path);
+                if fresh.is_some() {
+                    last_fresh_tip = Instant::now();
+                }
+                if let Some(tip) = next_net_tip(fresh, last_fresh_tip.elapsed()) {
+                    let old = net_round_tip.swap(tip, Ordering::AcqRel);
+                    if tip == 0 && old != 0 {
+                        gwlog!(
+                            "[gw] WARN no fresh round_tip from peerd for {}s; round tip unknown (floor-only round checks)",
+                            last_fresh_tip.elapsed().as_secs()
+                        );
+                    }
                 }
             }
         });
@@ -2526,6 +2747,11 @@ pub(crate) async fn run_gateway(
                     let now = unix_secs();
                     let cached_at = boot_blob_cached_at.load(Ordering::Acquire);
                     let have_fresh_cache = have_cache && is_bootstrap_cache_fresh(now, cached_at);
+                    if have_cache && !have_fresh_cache {
+                        // past the freshness window it can never be replayed again: free the
+                        // ~6GB now instead of holding it alongside the refresh captures
+                        *boot_blob.lock().unwrap() = None;
+                    }
                     if have_fresh_cache {
                         let next_refresh = cached_at.saturating_add(CACHE_REFRESH_SECS);
                         if now < next_refresh {
@@ -2741,7 +2967,9 @@ pub(crate) async fn run_gateway(
                         .await;
                     } else {
                         // Other gossip channels stay transparently spliced to the node's active peer.
-                        let Some(upc) = dial_active(&node, &peers, &ctx.rr, port).await else {
+                        let Some(upc) =
+                            dial_active(&node, &ctx.priority, &peers, &ctx.rr, port).await
+                        else {
                             return;
                         };
                         splice(down, upc).await;
@@ -2899,6 +3127,52 @@ mod tests {
         assert!(!response_has_client_block_round_too_small(
             br#"{"Ok":{"blocks":[1]}}"#
         ));
+    }
+
+    #[test]
+    fn net_tip_follows_fresh_readings_and_resets_when_they_stop() {
+        let fresh_a_while = Duration::from_secs(60);
+        let stale = PEER_FILE_TIP_MAX_AGE + Duration::from_secs(1);
+        // a fresh reading replaces the tip, including a LOWER one (a bad cycle lasts one cycle)
+        assert_eq!(
+            next_net_tip(Some(1_490_000_000), fresh_a_while),
+            Some(1_490_000_000)
+        );
+        assert_eq!(
+            next_net_tip(Some(1_400_000_000), stale),
+            Some(1_400_000_000)
+        );
+        // no reading for a short while: keep the current tip
+        assert_eq!(next_net_tip(None, fresh_a_while), None);
+        // no reading for longer than the file-age limit: unknown, never frozen
+        assert_eq!(next_net_tip(None, stale), Some(0));
+    }
+
+    #[test]
+    fn orphan_cache_tmps_are_removed_but_nothing_else() {
+        let dir = std::env::temp_dir().join(format!("hs-tmp-clean-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = dir.join("bootstrap.cache");
+        for f in [
+            "bootstrap.tmp0",
+            "bootstrap.tmp17",
+            "bootstrap.cache",
+            "bootstrap.tmpx",
+            "peers.json",
+        ] {
+            std::fs::write(dir.join(f), b"x").unwrap();
+        }
+        remove_orphan_cache_tmps(&cache);
+        let mut left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            vec!["bootstrap.cache", "bootstrap.tmpx", "peers.json"]
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -3142,11 +3416,22 @@ mod tests {
         frame
     }
 
-    // A fake upstream on <ip>:4001. healthy: greeting + one live block, then hold. silent: accept
-    // and say nothing. None when the address can't be bound on this host (test is skipped).
-    async fn fake_live_peer(ip: &str, healthy: bool) -> Option<tokio::task::JoinHandle<()>> {
-        let l = TcpListener::bind((ip, 4001)).await.ok()?;
-        Some(tokio::spawn(async move {
+    #[derive(Clone, Copy)]
+    enum FakePeer {
+        // greeting + one live block, then hold
+        Healthy,
+        // accept, say nothing
+        Silent,
+        // answer the greeting with the 0x04 peer-full status
+        Full,
+    }
+
+    // A fake upstream 4001 on an ephemeral 127.0.0.1 port; returns ("127.0.0.1:port", task).
+    // Ephemeral ports keep these tests running on hosts where a real node owns :4001.
+    async fn fake_live_peer(kind: FakePeer) -> (String, tokio::task::JoinHandle<()>) {
+        let l = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        let h = tokio::spawn(async move {
             loop {
                 let Ok((mut s, _)) = l.accept().await else {
                     return;
@@ -3156,52 +3441,72 @@ mod tests {
                     if s.read_exact(&mut greet).await.is_err() {
                         return;
                     }
-                    if healthy {
-                        let _ = s.write_all(&[0, 0, 0, 1, 0, 3]).await;
-                        let _ = s.write_all(&live_block_frame(1_400_000_000)).await;
+                    match kind {
+                        FakePeer::Healthy => {
+                            let _ = s.write_all(&[0, 0, 0, 1, 0, 3]).await;
+                            let _ = s.write_all(&live_block_frame(1_400_000_000)).await;
+                        }
+                        FakePeer::Full => {
+                            let _ = s.write_all(&[0, 0, 0, 1, 0, 4]).await;
+                        }
+                        FakePeer::Silent => {}
                     }
                     tokio::time::sleep(Duration::from_secs(10)).await;
                 });
             }
-        }))
+        });
+        (addr, h)
     }
 
-    fn test_tier(peers: &[&str], stage_ms: u64) -> PriorityTier {
-        PriorityTier::new(
+    // An address that refuses connections (a port that was just free).
+    async fn refused_addr() -> String {
+        let l = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        l.local_addr().unwrap().to_string()
+    }
+
+    fn test_tier(peers: &[&str], stage_ms: u64) -> Arc<PriorityTier> {
+        test_tier_capped(peers, stage_ms, 0)
+    }
+
+    fn test_tier_capped(peers: &[&str], stage_ms: u64, max: usize) -> Arc<PriorityTier> {
+        Arc::new(PriorityTier::new(
             peers.iter().map(|s| s.to_string()).collect(),
-            0,
+            max,
             Duration::from_millis(stage_ms),
             BootstrapPolicy::Fallback,
-        )
+        ))
     }
 
     #[tokio::test]
     async fn live_selection_prefers_priority_then_falls_back_to_pool() {
-        let (Some(p1), Some(o1), Some(slow)) = (
-            fake_live_peer("127.0.0.31", true).await,
-            fake_live_peer("127.0.0.32", true).await,
-            fake_live_peer("127.0.0.33", false).await,
-        ) else {
-            eprintln!("skipping: cannot bind 127.0.0.31-33:4001 on this host");
-            return;
-        };
-        let pool = vec!["127.0.0.32".to_string()];
+        let (p1, h1) = fake_live_peer(FakePeer::Healthy).await;
+        let (o1, h2) = fake_live_peer(FakePeer::Healthy).await;
+        let (slow, h3) = fake_live_peer(FakePeer::Silent).await;
+        let refused = refused_addr().await;
+        let pool = vec![o1.clone()];
 
         // healthy priority peer wins even though the pool is healthy too
-        let tier = test_tier(&["127.0.0.31"], 300);
+        let tier = test_tier(&[&p1], 300);
         let s = select_live_peer(&tier, &pool, 0, GREET_FALSE, 0, 0)
             .await
             .unwrap();
-        assert_eq!(s.ip, "127.0.0.31");
+        assert_eq!(s.ip, p1);
+        assert!(
+            s.prio_session.is_some(),
+            "priority slot travels with the session"
+        );
+        assert_eq!(tier.sessions(&p1), 1);
+        drop(s);
+        assert_eq!(tier.sessions(&p1), 0, "slot released with the session");
 
         // refused priority peer: pool wins without waiting out the stage, and the priority peer
         // goes into cooldown
-        let tier = test_tier(&["127.0.0.34"], 2000);
+        let tier = test_tier(&[&refused], 2000);
         let t0 = Instant::now();
         let s = select_live_peer(&tier, &pool, 0, GREET_FALSE, 0, 0)
             .await
             .unwrap();
-        assert_eq!(s.ip, "127.0.0.32");
+        assert_eq!(s.ip, o1);
         assert!(
             t0.elapsed() < Duration::from_millis(1500),
             "{:?}",
@@ -3213,12 +3518,12 @@ mod tests {
         );
 
         // silent priority peer: the pool opens at the stage boundary and wins
-        let tier = test_tier(&["127.0.0.33"], 300);
+        let tier = test_tier(&[&slow], 300);
         let t0 = Instant::now();
         let s = select_live_peer(&tier, &pool, 0, GREET_FALSE, 0, 0)
             .await
             .unwrap();
-        assert_eq!(s.ip, "127.0.0.32");
+        assert_eq!(s.ip, o1);
         assert!(
             t0.elapsed() >= Duration::from_millis(300),
             "{:?}",
@@ -3230,21 +3535,41 @@ mod tests {
         let s = select_live_peer(&tier, &pool, 0, GREET_FALSE, 0, 0)
             .await
             .unwrap();
-        assert_eq!(s.ip, "127.0.0.32");
-        for h in [p1, o1, slow] {
+        assert_eq!(s.ip, o1);
+        for h in [h1, h2, h3] {
+            h.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn live_selection_respects_the_priority_cap_without_cooling_down() {
+        let (p1, h1) = fake_live_peer(FakePeer::Healthy).await;
+        let (o1, h2) = fake_live_peer(FakePeer::Healthy).await;
+        let pool = vec![o1.clone()];
+        let tier = test_tier_capped(&[&p1], 300, 1);
+        let held = tier.try_acquire(&p1).unwrap(); // another node holds the only slot
+        let s = select_live_peer(&tier, &pool, 0, GREET_FALSE, 0, 0)
+            .await
+            .unwrap();
+        assert_eq!(s.ip, o1, "a full priority peer is skipped");
+        assert_eq!(tier.sessions(&p1), 1, "the cap was never exceeded");
+        drop(held);
+        assert_eq!(
+            tier.candidates(),
+            vec![p1.clone()],
+            "being full is not a failure: no cooldown"
+        );
+        for h in [h1, h2] {
             h.abort();
         }
     }
 
     #[tokio::test]
     async fn failed_live_selection_cools_down_hung_priority_peers() {
-        let Some(silent) = fake_live_peer("127.0.0.35", false).await else {
-            eprintln!("skipping: cannot bind 127.0.0.35:4001 on this host");
-            return;
-        };
+        let (silent, h) = fake_live_peer(FakePeer::Silent).await;
         // a priority peer that accepts and greets nothing never errors; when the window runs out
         // it must still be cooled down so the fallback doesn't re-dial it first
-        let tier = test_tier(&["127.0.0.35"], 300);
+        let tier = test_tier(&[&silent], 300);
         assert!(select_live_peer(&tier, &[], 0, GREET_FALSE, 0, 0)
             .await
             .is_none());
@@ -3252,56 +3577,55 @@ mod tests {
             tier.candidates().is_empty(),
             "hung priority peer must cool down"
         );
-        silent.abort();
+        h.abort();
     }
 
     #[tokio::test]
     async fn fallback_race_is_not_held_up_by_a_hung_peer() {
-        let (Some(silent), Some(ok)) = (
-            fake_live_peer("127.0.0.36", false).await,
-            fake_live_peer("127.0.0.37", true).await,
-        ) else {
-            eprintln!("skipping: cannot bind 127.0.0.36-37:4001 on this host");
-            return;
-        };
-        let tier = test_tier(&["127.0.0.38"], 300); // refuses: cooled down
+        let (silent, h1) = fake_live_peer(FakePeer::Silent).await;
+        let (ok, h2) = fake_live_peer(FakePeer::Healthy).await;
+        let (full, h3) = fake_live_peer(FakePeer::Full).await;
+        let refused = refused_addr().await;
+        let tier = test_tier(&[&refused, &full], 300);
         let t0 = Instant::now();
         let (ip, _, greeting) = race_fallback_upstream(
             &tier,
-            vec![
-                "127.0.0.38".into(),
-                "127.0.0.36".into(),
-                "127.0.0.37".into(),
-            ],
+            vec![refused.clone(), full.clone(), silent.clone(), ok.clone()],
             GREET_FALSE,
             FALLBACK_WAIT,
         )
         .await
         .unwrap();
-        assert_eq!(ip, "127.0.0.37");
+        assert_eq!(ip, ok);
         assert_eq!(greeting, [0, 0, 0, 1, 0, 3]);
         assert!(
             t0.elapsed() < Duration::from_millis(500),
             "{:?}",
             t0.elapsed()
         );
+        // the refused and the peer-full priority peers both cool down (peer-full may still be
+        // in flight when the healthy peer wins; give it a moment)
+        tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(
-            tier.candidates().is_empty(),
+            !tier.candidates().contains(&refused),
             "refused priority peer must cool down"
         );
 
         // nothing answers: gives up at the budget instead of walking the list
         let t0 = Instant::now();
-        assert!(race_fallback_upstream(
-            &tier,
-            vec!["127.0.0.36".into()],
-            GREET_FALSE,
-            FALLBACK_WAIT
-        )
-        .await
-        .is_none());
+        assert!(
+            race_fallback_upstream(&tier, vec![silent.clone()], GREET_FALSE, FALLBACK_WAIT)
+                .await
+                .is_none()
+        );
         assert!(t0.elapsed() < FALLBACK_WAIT + Duration::from_millis(300));
-        for h in [silent, ok] {
+        // a peer-full answer is never returned as a greeting
+        assert!(
+            race_fallback_upstream(&tier, vec![full.clone()], GREET_FALSE, FALLBACK_WAIT)
+                .await
+                .is_none()
+        );
+        for h in [h1, h2, h3] {
             h.abort();
         }
     }

@@ -14,8 +14,8 @@ pub(crate) const MIN_PLAUSIBLE_MAINNET_ROUND: u32 = 1_000_000_000;
 // itself stale — peerd rewrites peers.json every cycle (`peerd [interval]`, 120s in compose) and the gateway re-reads it every
 // 30s — so the effective threshold is 1500 rounds plus however far the tip has aged, in practice
 // ~100-255s at a 120s peerd cycle. Treat this as a floor on how bad a peer must be, not a deadline.
-// If peerd stops publishing entirely the frozen tip falls behind every live round and the guard
-// simply stops firing, which is the direction we want it to fail.
+// If peerd stops publishing, the gateway drops the tip to 0 after 15 min (gateway::next_net_tip)
+// and both this guard and the ceiling below go quiet rather than misfiring on a frozen value.
 pub(crate) const ACTIVE_ROUND_MAX_LAG: u32 = 1_500;
 // Ceiling slack above the observed network round tip (~4h of rounds at ~14.5/s). The ceiling is
 // tip-relative rather than a constant so it keeps rejecting high decode artifacts (e.g. the
@@ -23,11 +23,12 @@ pub(crate) const ACTIVE_ROUND_MAX_LAG: u32 = 1_500;
 // round counter grows past any fixed value.
 pub(crate) const NET_TIP_SLACK_ROUNDS: u32 = 200_000;
 
-// `net_tip` is the best-known network round tip (peerd's clustered probe tip via peers.json,
-// raised by bootstrap-cache scans); 0 = unknown, which disables the ceiling and falls back to the
-// floor-only check (clustering downstream still rejects isolated artifacts). A too-high tip only
-// widens *this* ceiling, but it does tighten round_lag_from_tip below, so the tip must never be
-// raised from an uncorroborated sample.
+// `net_tip` is the best-known network round tip (peerd's corroborated probe tip via peers.json,
+// replaced on every fresh reading and reset to 0 when readings stop; --cache scans may raise it);
+// 0 = unknown, which disables the ceiling and falls back to the floor-only check (the push
+// session's round-jump guard still rejects isolated high artifacts). A too-high tip only widens
+// *this* ceiling, but it does tighten round_lag_from_tip below, so the tip must never come from an
+// uncorroborated sample.
 pub(crate) fn is_plausible_mainnet_round(round: u32, net_tip: u32) -> bool {
     round >= MIN_PLAUSIBLE_MAINNET_ROUND
         && (net_tip == 0 || round <= net_tip.saturating_add(NET_TIP_SLACK_ROUNDS))
@@ -83,10 +84,23 @@ fn find_block_round_parent(dec: &[u8]) -> Option<(u32, u32)> {
     None
 }
 
-// Reference / correctness oracle + fallback: full lz4 decompress, then the same header scan.
+// A live block decompresses to a few hundred KB; anything declaring more is not a block.
+const MAX_DECOMPRESSED_BLOCK: usize = 16_000_000;
+
+// Reference / correctness oracle + fallback: full lz4 decompress, then the same header scan. The
+// size prefix is peer-controlled and lz4_flex allocates it up front (ff ff ff ff = a 4GB buffer,
+// which aborts the process under strict overcommit), so check it first.
 pub(crate) fn block_round_full(payload: &[u8]) -> Option<u32> {
-    let dec = lz4_flex::block::decompress_size_prepended(payload).ok()?;
-    find_block_round(&dec)
+    find_block_round(&decompress_block(payload)?)
+}
+
+// Full decode of a live-block payload, refusing a declared size no block can have.
+fn decompress_block(payload: &[u8]) -> Option<Vec<u8>> {
+    let declared = u32::from_le_bytes(payload.get(..4)?.try_into().ok()?) as usize;
+    if declared > MAX_DECOMPRESSED_BLOCK {
+        return None;
+    }
+    lz4_flex::block::decompress_size_prepended(payload).ok()
 }
 
 // Bounded LZ4 block decode: produce only the first `out.len()` bytes (the round lives in the
@@ -186,8 +200,7 @@ pub(crate) fn block_round_parent(payload: &[u8]) -> Option<(u32, u32)> {
             return find_block_round_parent(&buf[..n]);
         }
     }
-    let dec = lz4_flex::block::decompress_size_prepended(payload).ok()?;
-    find_block_round_parent(&dec)
+    find_block_round_parent(&decompress_block(payload)?)
 }
 
 pub(crate) struct RoundDedup {
@@ -215,6 +228,38 @@ impl RoundDedup {
 pub(crate) enum HeaderRead {
     Complete,
     TimedOut(usize),
+}
+
+pub(crate) fn response_is_peer_full(payload: &[u8]) -> bool {
+    // On the live 4001 greeting path, upstream refusal is often encoded as a compact binary
+    // status frame. 0x03 is the normal accepted greeting before live block frames; 0x04 is the
+    // observed peer-full refusal and must not be forwarded as a usable live greeting.
+    if payload.len() == 6 && payload[..4] == [0, 0, 0, 1] && payload[4] == 0 {
+        return payload[5] == 4;
+    }
+    payload
+        .windows(b"Peer full".len())
+        .any(|w| w == b"Peer full")
+}
+
+// Read one framed message ([u32 BE len][type][payload]) with a per-read deadline; rejects frames
+// longer than `max_len` without allocating them.
+pub(crate) async fn read_live_frame_with_timeout<R: AsyncRead + Unpin>(
+    s: &mut R,
+    wait: Duration,
+    max_len: usize,
+) -> std::io::Result<Vec<u8>> {
+    let mut hdr = [0u8; 5];
+    timeout(wait, s.read_exact(&mut hdr)).await??;
+    let len = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as usize;
+    if len > max_len {
+        return Err(std::io::Error::other("live frame too large"));
+    }
+    let mut payload = vec![0u8; len];
+    timeout(wait, s.read_exact(&mut payload)).await??;
+    let mut frame = hdr.to_vec();
+    frame.extend_from_slice(&payload);
+    Ok(frame)
 }
 
 pub(crate) async fn read_header_or_timeout<R: AsyncRead + Unpin>(
@@ -316,32 +361,41 @@ pub(crate) fn max_clustered_round(
     min_cluster: usize,
     max_gap: u32,
 ) -> Option<u32> {
+    best_round_cluster(rounds, min_cluster, max_gap).map(|c| c[c.len() - 1])
+}
+
+// The second-highest round of the best cluster: the top of the cluster has to be backed by a
+// second peer, so one outlier inside the gap window (e.g. a peer reporting tip + 49_999) cannot
+// raise the result. Needs min_cluster >= 2.
+pub(crate) fn corroborated_clustered_round(
+    rounds: &mut [u32],
+    min_cluster: usize,
+    max_gap: u32,
+) -> Option<u32> {
+    best_round_cluster(rounds, min_cluster.max(2), max_gap).map(|c| c[c.len() - 2])
+}
+
+// The longest run of sorted rounds whose neighbours are within `max_gap` (ties go to the higher
+// run), if it has at least `min_cluster` members.
+fn best_round_cluster(rounds: &mut [u32], min_cluster: usize, max_gap: u32) -> Option<&[u32]> {
     if rounds.len() < min_cluster || min_cluster == 0 {
         return None;
     }
     rounds.sort_unstable();
-    let mut best_len = 1usize;
-    let mut best_max = rounds[0];
-    let mut cur_len = 1usize;
-    let mut cur_max = rounds[0];
-    for pair in rounds.windows(2) {
-        if pair[1].saturating_sub(pair[0]) <= max_gap {
-            cur_len += 1;
-            cur_max = pair[1];
-        } else {
-            if cur_len > best_len || (cur_len == best_len && cur_max > best_max) {
-                best_len = cur_len;
-                best_max = cur_max;
-            }
-            cur_len = 1;
-            cur_max = pair[1];
+    let (mut best_start, mut best_len) = (0usize, 1usize);
+    let mut cur_start = 0usize;
+    for i in 1..=rounds.len() {
+        if i < rounds.len() && rounds[i].saturating_sub(rounds[i - 1]) <= max_gap {
+            continue;
         }
+        // run rounds[cur_start..i] ended; later runs are higher, so >= prefers the higher one
+        if i - cur_start >= best_len {
+            best_start = cur_start;
+            best_len = i - cur_start;
+        }
+        cur_start = i;
     }
-    if cur_len > best_len || (cur_len == best_len && cur_max > best_max) {
-        best_len = cur_len;
-        best_max = cur_max;
-    }
-    (best_len >= min_cluster).then_some(best_max)
+    (best_len >= min_cluster).then(|| &rounds[best_start..best_start + best_len])
 }
 
 fn should_forward_block_round(
@@ -464,6 +518,20 @@ mod tests {
         let payload = include_bytes!("testdata/block-2026-10.lz4");
         assert_eq!(block_round_full(payload), Some(1_483_968_338));
         assert_eq!(block_round(payload), Some(1_483_968_338));
+    }
+
+    #[test]
+    fn block_round_rejects_oversized_declared_size_without_allocating_it() {
+        // 0xffffffff declared bytes: must be refused before lz4 sizes a buffer for it
+        assert_eq!(block_round(&[0xff, 0xff, 0xff, 0xff, 0x1f]), None);
+        assert_eq!(block_round_full(&[0xff, 0xff, 0xff, 0xff, 0x1f]), None);
+        assert_eq!(block_round_parent(&[0xff, 0xff, 0xff, 0xff, 0x1f]), None);
+        assert_eq!(block_round_full(&[0x01]), None);
+        // a real block is far below the limit
+        assert_eq!(
+            block_round_full(&test_block_payload(1_480_000_000, 7)),
+            Some(1_480_000_000)
+        );
     }
 
     #[test]

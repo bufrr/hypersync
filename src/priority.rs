@@ -176,6 +176,23 @@ impl PriorityTier {
         })
     }
 
+    // Like acquire, but refuses once `ip` is at max_sessions (0 = unlimited). The check and the
+    // increment are one atomic step, so two nodes selecting at the same time can't both take the
+    // last slot (candidates() only filters at the time it is called).
+    pub(crate) fn try_acquire(self: &Arc<Self>, ip: &str) -> Option<PrioritySession> {
+        let i = self.index(ip)?;
+        let max = self.max_sessions;
+        self.sessions[i]
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (max == 0 || n < max).then_some(n + 1)
+            })
+            .ok()?;
+        Some(PrioritySession {
+            tier: self.clone(),
+            idx: i,
+        })
+    }
+
     pub(crate) fn sessions(&self, ip: &str) -> usize {
         self.index(ip)
             .map(|i| self.sessions[i].load(Ordering::Acquire))
@@ -303,6 +320,28 @@ mod tests {
             Duration::from_millis(1500),
             BootstrapPolicy::Fallback,
         ))
+    }
+
+    #[test]
+    fn try_acquire_never_exceeds_the_cap() {
+        let t = tier(&["1.2.3.4"], 2);
+        let a = t.try_acquire("1.2.3.4").expect("first slot");
+        let b = t.try_acquire("1.2.3.4").expect("second slot");
+        assert!(t.try_acquire("1.2.3.4").is_none(), "cap of 2 reached");
+        assert_eq!(t.sessions("1.2.3.4"), 2);
+        drop(a);
+        assert!(
+            t.try_acquire("1.2.3.4").is_some(),
+            "a freed slot is reusable"
+        );
+        drop(b);
+        assert!(
+            t.try_acquire("9.9.9.9").is_none(),
+            "pool peers have no slots"
+        );
+        let unlimited = tier(&["1.2.3.4"], 0);
+        let held: Vec<_> = (0..10).map(|_| unlimited.try_acquire("1.2.3.4")).collect();
+        assert!(held.iter().all(|s| s.is_some()));
     }
 
     #[test]

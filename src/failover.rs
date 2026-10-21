@@ -218,6 +218,9 @@ pub(crate) enum StandbyVerdict {
     Mismatch(u32),
 }
 
+// switch_to result: the frames to send the node, and the standbys found disagreeing on the way.
+type SwitchFrames = (Vec<Vec<u8>>, Vec<(u64, u32)>);
+
 pub(crate) struct Core {
     pub(crate) last_forwarded: u32,
     forwarded: BTreeMap<u32, (u64, Instant)>,
@@ -354,7 +357,11 @@ impl Core {
     }
 
     // Which standby to switch to right now, if any.
-    pub(crate) fn pick_switch(&self, now: Instant, active_dead: bool) -> Option<(u64, SwitchReason)> {
+    pub(crate) fn pick_switch(
+        &self,
+        now: Instant,
+        active_dead: bool,
+    ) -> Option<(u64, SwitchReason)> {
         if self.last_forwarded == 0 {
             return None;
         }
@@ -366,7 +373,7 @@ impl Core {
         let mut lag_best: Option<(u64, i64)> = None;
         let dwell_ok = self
             .last_switch
-            .map_or(true, |t| now.saturating_duration_since(t) >= self.min_dwell);
+            .is_none_or(|t| now.saturating_duration_since(t) >= self.min_dwell);
         for (&id, u) in &self.ups {
             if id == self.active || u.verified < min_verified {
                 continue;
@@ -388,7 +395,7 @@ impl Core {
             }
             if dwell_ok {
                 if let Some(m) = u.median_lead() {
-                    if m >= self.lag.as_millis() as i64 && lag_best.map_or(true, |(_, bm)| m > bm) {
+                    if m >= self.lag.as_millis() as i64 && lag_best.is_none_or(|(_, bm)| m > bm) {
                         lag_best = Some((id, m));
                     }
                 }
@@ -408,11 +415,7 @@ impl Core {
     // Make `id` the active upstream. Returns the frames to send the node (the standby's buffered
     // chain continuing exactly from the node's last block) and standbys found disagreeing on the
     // way, or None if `id` cannot continue the chain gap-free (nothing is changed then).
-    pub(crate) fn switch_to(
-        &mut self,
-        id: u64,
-        now: Instant,
-    ) -> Option<(Vec<Vec<u8>>, Vec<(u64, u32)>)> {
+    pub(crate) fn switch_to(&mut self, id: u64, now: Instant) -> Option<SwitchFrames> {
         let u = self.ups.get_mut(&id)?;
         let mut cur = self.last_forwarded;
         let mut chain = Vec::new();
@@ -471,7 +474,11 @@ impl Core {
     }
 
     fn status_json(&self, node: &str, switches: u64, last: &str, now: Instant) -> String {
-        let mut sb: Vec<(&u64, &Upstream)> = self.ups.iter().filter(|(&id, _)| id != self.active).collect();
+        let mut sb: Vec<(&u64, &Upstream)> = self
+            .ups
+            .iter()
+            .filter(|(&id, _)| id != self.active)
+            .collect();
         sb.sort_by(|a, b| a.1.ip.cmp(&b.1.ip));
         let ms_ago = |t: Option<Instant>| {
             t.map(|t| now.saturating_duration_since(t).as_millis().to_string())
@@ -571,7 +578,16 @@ fn spawn_reader(id: u64, mut r: OwnedReadHalf, ev: mpsc::Sender<Event>) -> JoinH
             }
             let at = Instant::now();
             let block = classify(&frame);
-            if ev.send(Event::Frame { id, frame, block, at }).await.is_err() {
+            if ev
+                .send(Event::Frame {
+                    id,
+                    frame,
+                    block,
+                    at,
+                })
+                .await
+                .is_err()
+            {
                 return;
             }
         };
@@ -592,7 +608,11 @@ async fn connect_standby(candidates: Vec<String>, ev: mpsc::Sender<Event>) {
             s.read_exact(&mut g).await.ok()?;
             (g == ACCEPT_GREETING).then_some(s)
         };
-        timeout(STANDBY_CONNECT_TIMEOUT, dial).await.ok().flatten().map(|s| (ip, s))
+        timeout(STANDBY_CONNECT_TIMEOUT, dial)
+            .await
+            .ok()
+            .flatten()
+            .map(|s| (ip, s))
     }
     for batch in candidates.chunks(STANDBY_RACE) {
         let mut set = tokio::task::JoinSet::new();
@@ -656,8 +676,10 @@ pub(crate) async fn serve_failover(
             g
         }
     };
-    if let Err(e) = node_w.write_all(&greeting).await {
-        return format!("node greeting write failed: {e}");
+    match timeout(NODE_WRITE_TIMEOUT, node_w.write_all(&greeting)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return format!("node greeting write failed: {e}"),
+        Err(_) => return "node greeting write failed: timeout".to_string(),
     }
 
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(256);
@@ -767,7 +789,10 @@ pub(crate) async fn serve_failover(
                             break;
                         }
                         let floor = live_floor.load(Ordering::Acquire);
-                        if r > floor && core.on_active_block(r, h, Instant::now()).0 && tx.send(frame).await.is_err() {
+                        if r > floor
+                            && core.on_active_block(r, h, Instant::now()).0
+                            && tx.send(frame).await.is_err()
+                        {
                             failed = Some("node writer closed".to_string());
                             break;
                         }
@@ -1006,18 +1031,24 @@ mod tests {
     // active delivers rounds [from..=to] at t, each standby 'b' copy arriving `b_off` relative
     fn feed(c: &mut Core, from: u32, to: u32, t0: Instant, b: u64, b_off_ms: i64) {
         for r in from..=to {
-            let ta = t0 + (r - from) as u32 * 70 * MS;
+            let ta = t0 + (r - from) * 70 * MS;
             let tb = if b_off_ms >= 0 {
                 ta + (b_off_ms as u32) * MS
             } else {
                 ta - ((-b_off_ms) as u32) * MS
             };
             if b_off_ms < 0 {
-                assert_eq!(c.on_standby_block(b, r, r - 1, r as u64, tb, f(r)), StandbyVerdict::Ok);
+                assert_eq!(
+                    c.on_standby_block(b, r, r - 1, r as u64, tb, f(r)),
+                    StandbyVerdict::Ok
+                );
                 assert!(c.on_active_block(r, r as u64, ta).0);
             } else {
                 assert!(c.on_active_block(r, r as u64, ta).0);
-                assert_eq!(c.on_standby_block(b, r, r - 1, r as u64, tb, f(r)), StandbyVerdict::Ok);
+                assert_eq!(
+                    c.on_standby_block(b, r, r - 1, r as u64, tb, f(r)),
+                    StandbyVerdict::Ok
+                );
             }
         }
     }
@@ -1039,12 +1070,16 @@ mod tests {
         c.add_standby(1, "b".into());
         let t0 = Instant::now();
         feed(&mut c, 100, 110, t0, 1, 30); // b slightly slower, verified 11x
-        // active stalls; b delivers 111..=114
+                                           // active stalls; b delivers 111..=114
         let t1 = t0 + 2000 * MS;
         for r in 111..=114 {
             c.on_standby_block(1, r, r - 1, r as u64, t1, f(r));
         }
-        assert_eq!(c.pick_switch(t1 + 100 * MS, false), None, "not held long enough");
+        assert_eq!(
+            c.pick_switch(t1 + 100 * MS, false),
+            None,
+            "not held long enough"
+        );
         let (id, why) = c.pick_switch(t1 + 400 * MS, false).expect("stall switch");
         assert_eq!((id, why), (1, SwitchReason::Stall));
         let (frames, bad) = c.switch_to(1, t1 + 400 * MS).unwrap();
@@ -1106,7 +1141,10 @@ mod tests {
         c.add_standby(1, "b".into());
         let t0 = Instant::now();
         assert!(c.on_active_block(100, 100, t0).0);
-        assert_eq!(c.on_standby_block(1, 100, 99, 999, t0, f(100)), StandbyVerdict::Mismatch(100));
+        assert_eq!(
+            c.on_standby_block(1, 100, 99, 999, t0, f(100)),
+            StandbyVerdict::Mismatch(100)
+        );
         // ahead-of-active copy that later disagrees
         c.on_standby_block(1, 101, 100, 555, t0, f(101));
         let (_, bad) = c.on_active_block(101, 101, t0);
@@ -1154,7 +1192,10 @@ mod tests {
         for r in 131..=132 {
             c.on_standby_block(2, r, r - 1, r as u64, t1, f(r));
         }
-        assert_eq!(c.pick_switch(t1 + 400 * MS, false), Some((2, SwitchReason::Stall)));
+        assert_eq!(
+            c.pick_switch(t1 + 400 * MS, false),
+            Some((2, SwitchReason::Stall))
+        );
     }
 
     #[test]
