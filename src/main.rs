@@ -47,7 +47,9 @@ fn pin_malloc_mmap_threshold() -> bool {
 #[cfg_attr(feature = "hotpath", hotpath::main)]
 async fn main() {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    pin_malloc_mmap_threshold();
+    if !pin_malloc_mmap_threshold() {
+        eprintln!("[main] WARN mallopt(M_MMAP_THRESHOLD) failed; 4002 buffers may stay resident");
+    }
     let args: Vec<String> = env::args().collect();
     if args.get(1).map(|s| s.as_str()) == Some("bench") {
         let dir = args.get(2).cloned().unwrap_or_else(|| ".".into());

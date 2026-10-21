@@ -75,7 +75,7 @@ The same logical block appears on the wire in **two different bincode serializat
 |---|---|---|
 | reached via | `send_abci:false` live stream / bootstrap tail | client-block range query response |
 | leading byte | `0x00` discriminant, then the block | (none per element; the batch has one leading `0x00`) |
-| **round offset** | decompressed **`[0x5e]`** = `0xfc`, u32 LE at `[0x5f..0x63]` | element_start **`+ 0x5d`** = `0xfc`, u32 LE at `+0x5e` |
+| **round offset** | **variable since 2026-10**: the first `0xfc R 0xfc R-1 0xfc R-2` varint triple (round, parent, grandparent; seen at decompressed `0x71..0xd1`), found by scanning — see `protocol::find_block_round`. Before 2026-10 it was fixed at decompressed **`[0x5e]`** = `0xfc`, u32 LE at `[0x5f..0x63]` | element_start **`+ 0x5d`** = `0xfc`, u32 LE at `+0x5e` (pre-2026-10 observation; the gateway does not parse client-block rounds) |
 | body | `{ signed_action_bundles, round, parent_round, abci_block, resps }` — the full block incl. `abci_block` (here ~200 KB) | `ClientBlock { proof, txs, commit_proof:{ child_qc, grandchild_qc } }` — compact (here ~7 KB) |
 | size | varies with tx volume | varies; usually smaller |
 

@@ -104,6 +104,8 @@ async fn splice_bootstrap_capture(
         let mut win_bytes = 0usize;
         let mut slow = 0u32;
         let source = "transparent fallback";
+        // one relay buffer for the whole bootstrap (thousands of frames), not one per frame
+        let mut buf = vec![0u8; 1_048_576];
 
         loop {
             if !capture {
@@ -151,7 +153,6 @@ async fn splice_bootstrap_capture(
             }
 
             let mut remaining = len;
-            let mut buf = vec![0u8; 1_048_576.min(len.max(1))];
             if !payload_prefix.is_empty() {
                 if payload_prefix.len() > remaining {
                     break;
@@ -659,8 +660,8 @@ async fn select_live_peer(
 }
 
 // Run a 4001 push session with the node's 4002 RPC pinned to the same upstream: pin the active
-// peer for the session's lifetime, run serve_push, log the exit, clear the pin. Shared by every
-// push-serving path (cache-live, live, fallback).
+// peer for the session's lifetime, run serve_push, log the exit; the guard clears the pin on any
+// exit (incl. a panic in serve_push). Shared by every push-serving path (cache-live, live, fallback).
 async fn serve_push_repinned(
     down: TcpStream,
     upc: TcpStream,
@@ -670,7 +671,10 @@ async fn serve_push_repinned(
     cfg: PushConfig,
 ) {
     let active_ip = cfg.hosts[cfg.active_idx].clone();
-    let active_peer = node.pin_active(&active_ip);
+    let _active_guard = ActivePinGuard {
+        node: node.clone(),
+        peer: node.pin_active(&active_ip),
+    };
     let _prio_session = priority.acquire(&active_ip);
     let tier = priority.tier_of(&active_ip);
     let started = Instant::now();
@@ -692,7 +696,6 @@ async fn serve_push_repinned(
         started.elapsed().as_secs(),
         exit_reason
     );
-    node.clear_active_if_current(&active_peer);
 }
 
 // Priority candidates first (least-loaded), then the pool rotated from `start`, deduped.
