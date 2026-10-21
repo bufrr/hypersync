@@ -18,6 +18,7 @@ use crate::protocol::{
     read_header_or_timeout, round_lag_from_tip, unix_secs, HeaderRead, ACTIVE_ROUND_MAX_LAG,
     GREET_FALSE, GREET_TRUE,
 };
+use crate::failover::{serve_failover, FailoverConfig, FailoverCtx};
 use crate::push::{serve_push, splice, PushConfig};
 
 // ---- full P2P gateway ----
@@ -667,6 +668,7 @@ async fn serve_push_repinned(
     upc: TcpStream,
     node: &Arc<NodeState>,
     priority: &Arc<PriorityTier>,
+    pool: &Arc<Mutex<Vec<String>>>,
     mode: &str,
     cfg: PushConfig,
 ) {
@@ -686,6 +688,49 @@ async fn serve_push_repinned(
         mode,
         priority.sessions(&active_ip)
     );
+    if FailoverConfig::get().standbys > 0 {
+        // hot-standby session: the active upstream can change mid-session, so the 4002 pin and the
+        // priority session accounting follow every switch
+        let pin = Arc::new(Mutex::new((active_peer, _prio_session)));
+        let on_switch = {
+            let node = node.clone();
+            let priority = priority.clone();
+            let pin = pin.clone();
+            Box::new(move |ip: &str| {
+                let p = node.pin_active(ip);
+                let s = priority.acquire(ip);
+                *pin.lock().unwrap() = (p, s);
+            })
+        };
+        let exit_reason = serve_failover(
+            down,
+            upc,
+            cfg,
+            FailoverCtx {
+                node_label: node.ip.to_string(),
+                pool: pool.clone(),
+                priority: priority.clone(),
+                on_switch,
+            },
+        )
+        .await;
+        let (last_peer, _last_session) = {
+            let mut g = pin.lock().unwrap();
+            let p = g.0.clone();
+            (p, g.1.take())
+        };
+        gwlog!(
+            "[gw] [{}] 4001 push session ended active_peer={} tier={} mode={} secs={} reason={}",
+            node.ip,
+            last_peer.ip,
+            priority.tier_of(&last_peer.ip),
+            mode,
+            started.elapsed().as_secs(),
+            exit_reason
+        );
+        node.clear_active_if_current(&last_peer);
+        return;
+    }
     let exit_reason = serve_push(down, upc, cfg).await;
     gwlog!(
         "[gw] [{}] 4001 push session ended active_peer={} tier={} mode={} secs={} reason={}",
@@ -805,6 +850,7 @@ async fn serve_push_4001_fallback(
         upc,
         &node,
         &ctx.priority,
+        &ctx.pool,
         "fallback",
         PushConfig {
             hosts: Arc::new(vec![ip.clone()]),
@@ -1868,6 +1914,8 @@ struct GatewayCtx {
     // (the common failure), a known server cuts recovery from minutes of rescanning to seconds.
     state_servers: Arc<Mutex<Vec<String>>>,
     priority: Arc<PriorityTier>,
+    // the live peer pool (peerd's file, refreshed every 30s) — failover standbys are drawn from it
+    pool: Arc<Mutex<Vec<String>>>,
     cache_coldstart: bool,
     push: bool,
     n_live: usize,
@@ -2065,6 +2113,7 @@ async fn replay_cache_then_live(
             live.stream,
             &node,
             &ctx.priority,
+            &ctx.pool,
             "cache-live",
             PushConfig {
                 hosts: Arc::new(hosts),
@@ -2244,6 +2293,7 @@ async fn handle_4001_live(
                 live.stream,
                 &node,
                 &ctx.priority,
+                &ctx.pool,
                 "live",
                 PushConfig {
                     hosts: Arc::new(hosts),
@@ -2617,6 +2667,7 @@ pub(crate) async fn run_gateway(
         net_round_tip,
         state_servers: Arc::new(Mutex::new(Vec::new())),
         priority: priority.clone(),
+        pool: pool.clone(),
         cache_coldstart,
         push,
         n_live,

@@ -55,6 +55,11 @@ services:
       HYPERSYNC_PRIORITY_BOOTSTRAP: "${HYPERSYNC_PRIORITY_BOOTSTRAP:-fallback}"
       HYPERSYNC_PRIORITY_MAX_SESSIONS: "${HYPERSYNC_PRIORITY_MAX_SESSIONS:-0}"
       HYPERSYNC_PRIORITY_STAGE_MS: "${HYPERSYNC_PRIORITY_STAGE_MS:-1500}"
+      # hot-standby failover (README "Hot-standby failover"); 0 standbys = off
+      HYPERSYNC_FAILOVER_STANDBYS: "${HYPERSYNC_FAILOVER_STANDBYS:-0}"
+      HYPERSYNC_FAILOVER_STALL_MS: "${HYPERSYNC_FAILOVER_STALL_MS:-400}"
+      HYPERSYNC_FAILOVER_LAG_MS: "${HYPERSYNC_FAILOVER_LAG_MS:-150}"
+      HYPERSYNC_FAILOVER_STATUS_DIR: "${HYPERSYNC_FAILOVER_STATUS_DIR:-}"
     volumes:
       - ./data:/pd
     # image CMD is `gateway /pd/peers.json --push --cache --live 5`. --cache is off here: the
