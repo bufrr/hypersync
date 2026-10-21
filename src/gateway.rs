@@ -2177,6 +2177,10 @@ async fn transparent_bootstrap(
         if down.write_all(&payload_prefix).await.is_err() {
             return;
         }
+        // Free the 64MB prefetch before the splice: the bootstrap connection can stay open long
+        // after the state transfer, and keeping it in scope held 64MB per open bootstrap
+        // connection (2026-10-21 2-node soak: 68MB resident for 25+ min).
+        drop(payload_prefix);
         splice(down, upc).await;
     }
 }
