@@ -1,130 +1,134 @@
 # hypersync
 
-A Hyperliquid P2P sync gateway — a multi-peer, health-monitored **failover transparent proxy** that keeps a Hyperliquid node synced with low lag.
+A P2P sync gateway for Hyperliquid nodes. Your nodes peer only with hypersync; hypersync picks healthy upstream peers for them, watches those peers, and replaces any peer that stalls, lags or misbehaves.
 
-A local HL node points its `root_node_ips` at hypersync; hypersync transparently relays the node's P2P traffic to one of several real upstream peers, monitors that peer's health, and automatically fails over to another peer if it stalls or dies — so the node keeps syncing even when an individual peer degrades.
+## How it works
 
-## Why
+```text
+public HL peers ─┐
+priority peers ──┼─▶ hypersync gateway ─▶ your hl-node(s)
+                 │         ▲
+             peerd ── peers.json (live peers + network round tip)
+```
 
-Hyperliquid non-validator nodes sync by dialing peers and streaming consensus / client blocks. A single slow or flaky peer can cause sync lag. hypersync sits in front of the node as its peer, fronting a pool of real upstream peers with automatic failover, decoupling the node from any one peer's problems.
+- **gateway** relays each node's bootstrap, live blocks (4001) and client-block RPC (4002) through one vetted upstream peer per node, and serves several nodes at once (one session per node source IP).
+- **peerd** discovers peers (`gossipRootIps` API + a `query_peers` crawl), probes which ones serve live blocks, and writes `peers.json` for the gateway every cycle.
+- **Priority peers** (e.g. dedicated sentries) are tried first; the public pool is the backup.
+- A node only ingests blocks from peers it dials, so each node points `root_node_ips` at the gateway and dials nothing else.
+
+## Quick start (docker compose)
+
+```sh
+echo 'HL_SELF_IP=<public IPs of all your nodes, comma-separated>' > .env   # see Configuration
+docker compose up -d    # gateway + peerd
+```
+
+Point each node at the gateway in `override_gossip_config.json` and restart it:
+
+```json
+{"root_node_ips": [{"Ip": "172.28.0.10"}], "try_new_peers": false, "chain": "Mainnet"}
+```
+
+- **Same host:** the node's compose project joins the external `hypersync_gwnet` network and dials `172.28.0.10`.
+- **Other hosts:** publish the gateway's 4000-4010 only on a private/VPN address, firewalled to your nodes. If a real node on the same host owns the public 4000-4010, bind that node to the public IP and the gateway to the private one.
+- Smoke test: `docker run --rm --network hypersync_gwnet hypersync:latest fakenode 172.28.0.10 --rpc --label smoke`
+
+> **Never publish the gateway on the internet.** Anyone who reaches it can trigger a ~5.8 GB bootstrap relay. The public 4001/4002 on your egress IP should belong to a real hl-node; upstream peers deprioritise IPs whose 4001/4002 don't answer.
 
 ## Modes
 
-- `gateway <peers-file> [--push] [--cache] [--live N]` — **full P2P gateway** (recommended): each node points `root_node_ips` at it and syncs the real mainnet ONLY through the gateway, which fronts a whole pool of real peers read from `<peers-file>` (maintained by `peerd`, refreshed live). The gateway serves **multiple downstream nodes concurrently**: session state (active-peer pin, cache-replay cooldown, live round floor) is kept **per node, keyed by the node's source IP** — so run one node per egress IP (two nodes NAT'd through one IP would be conflated into one session). All of a node's connections are pinned to that node's **active** peer so the client-block RPC isn't rejected with "Peer-only request". The flags are orthogonal and compose:
-  - **default (no flags)** — pure transparent failover: on bootstrap the gateway relays a peer that is *currently* serving the abci_state (peeks the first frame; rotates to a fresh state-server each time, so node/gateway restarts never hit the per-IP abci_state rate-limit), and splices live blocks + gossip RPC to that active peer. The gateway never has to understand HL's closed bootstrap framing.
-  - **`--push`** — route 4001 live/resume traffic through `serve_push`: the active peer still relays the full stream and owns the peer relationship, and if the active stream stalls, stops making block progress, falls behind the network or sends an implausible round, the session is torn down so the node reconnects and the gateway pins a fresh active (see [Upstream health checks](#upstream-health-checks)). Shadow multi-source block injection is currently disabled because round-only dedup cannot prove proposer/fork correctness; `--live N` is retained as a future capacity knob. With `HYPERSYNC_FAILOVER_STANDBYS` set, the gateway switches the node to a standby peer inside the same session instead of tearing it down (see [Hot-standby failover](#hot-standby-failover)).
-  - **`--cache`** — additionally capture the full bootstrap (abci_state + EVM KVs, ~5.8 GB in 2026-10) verbatim from a fast peer (hedged race across the pool, early-abort on slow peers) and cache it in memory plus disk. The default disk path is `bootstrap.cache` next to the peer file, falling back to `/tmp/hypersync-bootstrap.cache` if that directory is read-only; override with `HYPERSYNC_BOOT_CACHE`. Fresh cache entries (<=8 minutes old) are replayed to cold-starting nodes; the gateway refreshes cache every 4 minutes and retries failed fresh refreshes after up to 30 seconds, shortening the retry as the cache approaches expiry. Stale cache is ignored and the node transparently bootstraps from a real peer, while the gateway tees that successful fallback stream back into cache. Trade-off: a cache-cold-started node has **no peer relationship of its own**, so the gateway pins a live 4001 peer immediately after replay and serves the node's 4002 catch-up RPC in stages: the pinned active peer answers **alone** within a short grace budget (one upstream connection in the common case, and no other peer's response can outrace it); pool candidates — each behind its own temporary live relationship — are hedged in only when the active is absent, failed, or slow. A `Peer-only request` from the pinned active unpins it, and the hedge peer that answered instead is tried first for that node's later requests until a new 4001 session pins an active; terminal range errors (`no client blocks to serve`, `client block round too large`, and `client block round too small` when every peer says so) are forwarded to the node as a last resort; if every attempt fails the request socket closes and the node retries. Each request has a 15 s overall budget and at most 8 run at once across the gateway. A capture counts as complete only past 5.2 GB (about 90% of the 2026-10 bootstrap; raise `MIN_COMPLETE_BOOTSTRAP_BYTES` as the bootstrap grows), a node gets at most one replay at a time, and a cache past its freshness window is dropped from memory. **Memory cost**: the cache holds one bootstrap in memory (~6 GB) and every refresh race downloads one to three more in parallel, so the gateway swings between ~6 and ~19 GB. On a 64 GB host shared with a ~35 GB hl-node this pushed host memory past hl-visor's ~95% low-memory threshold and caused repeated hl-node child restarts (2026-10-12 soak), so the bundled `docker-compose.yml` runs the gateway **without** `--cache` (gateway RSS then stays at a few MB in steady state — ~6 MB measured on 2026-10-21 — plus a transient ~64 MB prefetch buffer per in-flight bootstrap, freed once written; the image `CMD` matches and omits `--cache` too). Enable it only with that headroom to spare. The benefit: without a cache, any hl-node child restart (e.g. an hl-visor binary update) must find an external peer willing to serve the full abci_state right then, which can take minutes when most of the pool declines or rate-limits (the gateway does remember recent state-servers and tries them first, but a warm cache removes the dependency entirely).
-  - **Hot standbys** (`HYPERSYNC_FAILOVER_STANDBYS=N`, needs `--push`). Each node session also streams live blocks from N standby peers. When the active peer stalls, dies or falls behind, the gateway moves the node's feed to a standby without closing the node's 4001 connection. See [Hot-standby failover](#hot-standby-failover).
-- `proxy <peer1,peer2,...> [--push]` — **failover transparent proxy**: listens on 4000-4010, relays to the active upstream, health-monitors it, and fails over to the next healthy peer (bad peers skipped with a cooldown; no oscillation). Like `gateway` but with a fixed upstream list instead of the live `peerd` pool. On 4001 the proxy vets the upstream's first frame, so a `peer full` refusal or a silent upstream rotates it out instead of reaching the node. Add `--push` to use the same active-stream checks as `gateway --push`: the 4001 session itself is then the health signal, a session that ends for an upstream-side reason fails the active over, and a failover ends every session of the previous upstream so 4001 and 4002 always follow the same peer. Shadow multi-source injection is disabled for now.
+| Command | Use |
+|---|---|
+| `gateway <peers.json> [--push] [--cache] [--live N]` | The gateway. Compose runs `--push` without `--cache`. |
+| `peerd [interval-secs]` | Peer discovery and probing (default 300 s; compose uses 120). Run as its own container. |
+| `proxy <ip1,ip2,...> [--push]` | Failover proxy over a fixed upstream list instead of peerd's pool. |
+| `relay <ip>` | Plain relay of 4000-4010 to one upstream. |
+| `fakenode <gw-ip> [--rpc] [--live-secs N] [--label X]` | Synthetic node for testing a gateway. |
+| `cache`, `mock`, `bench`, `<port> <peers>` | Testing only. |
 
-`peerd [interval]` (default 300s) is the companion daemon: it discovers peers (the `gossipRootIps` API + a `query_peers` crawl of the gossip peer graph, with the node's own `tcp_lz4_stats/<date>` files as an optional supplementary source) and probes candidates for **live-block serving** (`send_abci:false`, cheap and not rate-limited — it never probes the rate-limited abci_state), writing a ranked pool to `<data-dir>/peers.json` (atomically, via temp+rename) that `gateway` reads and refreshes every 30s. The file also carries `round_tip`, the network round tip the gateway checks blocks against: the second-highest round of the largest cluster of probed peers, so one peer reporting a high round can't move it (see [Upstream health checks](#upstream-health-checks)). Probes default to 8 concurrent sockets (`PEERD_PROBE_CONCURRENCY`, clamped 1-64) and at most 256 candidates per cycle (`PEERD_PROBE_MAX_PER_CYCLE`, clamped 32-5000): previous top live peers are kept hot, while the rest of the candidate set is covered by rotation. A cycle that finds no live peers keeps the previous pool; peerd backs off (up to `PEERD_EMPTY_BACKOFF_MAX_SECS`, default 1800s) only when there was no previous pool to keep. Candidates that fail 50 consecutive probe cycles are pruned (re-discovered automatically if they come back). It's a subcommand of the same `hypersync` binary, but deliberately still runs as its **own process**, not a background task inside the gateway — a probing storm across 100+ candidates never touches the process actively serving a node, and either side can be restarted independently. Container-friendly: the stats harvest only needs a node's data volume mounted read-only (no docker.sock, no subprocess); the only runtime dep is `curl` on PATH (each `gossipRootIps` call is bounded to 10 s and killed if it overruns). Config is via env vars: `HYPERSYNC_DATA` (data dir, default `./data`), `HL_STATS_DIR` (optional, **comma-separated** — one `tcp_lz4_stats` dir per co-located node; unset — the normal case when gw+peerd run on a separate machine from the nodes — means discovery relies on the API + previously persisted candidates), `HL_SELF_IP` (optional, **comma-separated** — the public IPs of ALL your own nodes; they're legitimate routable addresses but must never enter the upstream pool, or the gateway can end up relaying your nodes to each other).
+Gateway flags:
 
-`soak-test.sh [restart-node-at-start] [samples] [interval-seconds] [log-file]` monitors a running node+gateway pair over time: applied-block rate, sync source, real error count, and container health. Real errors are filtered by *signature* (e.g. `desc: "tcp greeting ... gossip"`) rather than by source IP, since the node never accepts inbound peer connections — that class of error is always internet-scanner noise on its public ports, regardless of which IP sent it.
-- `relay <upstream>` — plain transparent relay of ports 4000-4010 to a single upstream.
-- `<port> <peer1,peer2,...>` (no subcommand) — multi-upstream live-block merge with round-based dedup (freshest block wins, gap-free). Testing-only: it drops control frames, so a real node never receives the peer greeting through it — pair it with `mock`. A first argument that is neither a known mode nor a port prints usage and exits rather than starting this mode.
-- `cache <port> <upstream>` — fetches the abci_state snapshot once, caches it, serves connecting nodes at local speed. Testing-only: binds a single port, and a real node also needs 4002 to bootstrap — use `gateway --cache` for nodes.
-- `mock <bind> <dir> <start> <end>` — replays captured blocks for testing.
-- `fakenode <gw-ip[:base-port]> [--live-secs N] [--rpc] [--label NAME]` — testing-only synthetic downstream node: receives a full bootstrap (counting bytes/frames, never buffering), reads the live stream (parsing block rounds), and optionally sends a real 4002 client-block range query (a leaked "Peer-only request" rejection counts as FAIL — it means the gateway mis-routed the RPC). Prints one machine-checkable `FAKENODE ...` summary line; exit code is a bitmask (0 pass, +1 boot, +2 live, +4 rpc, 64 usage/dial). Run each fakenode as its own container so the gateway sees distinct source IPs.
-- `bench <dir> <iters>` — benchmarks the hot path (lz4 decode + round dedup).
+- **`--push`** (recommended): live blocks pass through the gateway's checks (below) instead of a raw splice, and a bad upstream ends the session so the node reconnects to a fresh one.
+- **`--cache`**: keep the full bootstrap (~5.8 GB) in memory and on disk and replay it to cold-starting nodes, avoiding the per-IP abci_state rate limit. Costs ~6-19 GB of RAM, which pushed a 64 GB host shared with an hl-node past hl-visor's low-memory restart threshold — so it is off by default. Without it, a node restart bootstraps from a peer that is serving state right now (the gateway remembers recent state servers).
+- **`--live N`**: reserved for multi-source push (disabled).
 
-**Deployment note:** the gateway/proxy/relay listeners bind `0.0.0.0:4000-4010` inside their own network namespace with no peer allowlist — anyone who can reach those ports can trigger a ~5.8 GB bootstrap relay or a cache replay (bandwidth amplification). `--cache` keeps one bootstrap in memory (~6 GB) and holds up to three more in flight during each 4-minute refresh race (observed peak ~19 GB); budget RAM and upstream bandwidth accordingly. Run gateway listeners on an internal/container/private network only; never publish them to the internet. The public 4001/4002 should belong to a real HL node on the same public egress path, not to the gateway.
+## Configuration
 
-## Build & run
+Set in `.env`; compose passes them through.
 
-```sh
-cargo build --release
-./target/release/hypersync proxy 1.2.3.4,5.6.7.8,9.10.11.12
-```
-
-Point each node's `override_gossip_config.json` at hypersync and restart it so the node dials the gateway:
-
-```json
-{"root_node_ips": [{"Ip": "<hypersync-host>"}], "try_new_peers": false, "chain": "Mainnet"}
-```
-
-## Deploy with docker compose
-
-gw + peerd run as their own compose project (`docker-compose.yml` in this repo). The gateway reads no node files; peerd can optionally read mounted/copied `tcp_lz4_stats` to improve discovery. Set `HL_SELF_IP` in `.env` to a comma-separated list of all your nodes' public IPs.
-
-- **Co-located nodes** (same machine): node compose projects join the attachable `hypersync_gwnet` network (`external: true`) and dial the gateway's static IP `172.28.0.10`. Gateway `ports:` stay disabled, so the host's public 4001/4002 remain owned by the real HL node. Optionally add stats harvesting from the local node: `docker compose -f docker-compose.yml -f docker-compose.colocated.yml up -d`.
-- **Remote nodes** (nodes on other machines): expose gateway only on a private/VPN interface and firewall 4000-4010 to the node machines. If this is the same host that also publishes a real HL node, do not let both containers bind the same host `0.0.0.0:4000-4010`; bind the real node to the public IP and gateway to the private/VPN IP. A gateway-only public IP without real HL node 4001/4002 behavior may be deprioritized by upstream peers.
-
-Smoke-test a running gateway with a synthetic node:
-
-```sh
-docker run --rm --network hypersync_gwnet hypersync:latest fakenode 172.28.0.10 --rpc --label smoke
-```
+| Variable | Default | Meaning |
+|---|---|---|
+| `HL_SELF_IP` | – | Comma-separated public IPs of **all** your nodes; never used as upstreams. |
+| `HYPERSYNC_PRIORITY_PEERS` | – | Comma-separated priority peer IPs. Logged as `prio-N`, never by IP. |
+| `HYPERSYNC_PRIORITY_MAX_SESSIONS` | `0` | Max node sessions per priority peer (`0` = unlimited). |
+| `HYPERSYNC_PRIORITY_STAGE_MS` | `1500` | How long priority peers race alone before the pool joins. |
+| `HYPERSYNC_PRIORITY_BOOTSTRAP` | `fallback` | Bootstrap from priority peers: `fallback` (after the pool), `prefer`, or `never`. |
+| `HYPERSYNC_FAILOVER_STANDBYS` | `0` | Hot standbys per node session (see below). |
+| `HYPERSYNC_BOOT_CACHE` | next to peers.json | Disk path for `--cache`. |
+| `HYPERSYNC_DATA` | `./data` | peerd's data dir (`peers.json`, candidates). |
+| `HL_STATS_DIR` | – | Optional, comma-separated `tcp_lz4_stats` dirs of co-located nodes (extra discovery source). |
+| `PEERD_PROBE_CONCURRENCY` / `PEERD_PROBE_MAX_PER_CYCLE` | `8` / `256` | Probe parallelism and candidates per cycle. |
+| `PEERD_CRAWL_DEPTH` / `PEERD_CRAWL_MAX_QUERIES` / `PEERD_CRAWL_CONCURRENCY` | `3` / `200` / `8` | `query_peers` crawl bounds. |
+| `PEERD_EMPTY_BACKOFF_MAX_SECS` | `1800` | Max backoff when no live peer is found and there is no previous pool. |
 
 ## Upstream health checks
 
-How the gateway picks a live peer for a node and when it drops one (`gateway --push`, no standbys):
+**Picking a peer** (on every node 4001 connect):
 
-**Picking a peer.** The gateway races every priority peer at once. Each priority attempt reserves one of that peer's `HYPERSYNC_PRIORITY_MAX_SESSIONS` slots before dialing, so concurrent nodes can't exceed the cap; a peer that is full is skipped without a cooldown. The pool joins after `HYPERSYNC_PRIORITY_STAGE_MS` (4 at a time). The first peer whose first live block is plausible and within 1,500 rounds of the network round tip wins, all within 3.5 s, because hl-node gives up on a 4001 connection about 5 s after its greeting. If nothing qualifies, a fallback races up to 8 peers for a greeting in the ~1.3 s left. A priority peer that errors, refuses (`peer full`) or hangs through the whole window is cooled down for 30 s.
+- Priority peers race first, each reserving a session slot before dialing; a full peer is skipped without penalty. The pool joins after the stage delay, 4 at a time.
+- The first peer whose first live block is plausible and within 1,500 rounds of the network tip wins — all within 3.5 s, because hl-node abandons a connect ~5 s after greeting. If none qualifies, a fallback races up to 8 peers in the time left.
+- A priority peer that errors, refuses (`peer full`) or hangs is cooled down for 30 s.
 
-**During a session.** The session ends, and the node reconnects to a newly picked peer, when the active peer:
+**Dropping a peer** (`--push`). The session ends and the node reconnects when the active peer:
 
-- sends nothing for 10 s;
-- sends frames but no higher block round for 30 s (a peer still sending control or mempool frames never trips the idle timer, and hl-node would not reconnect on its own);
-- sends a block round more than 20,000 above its previous block (a decode artifact or a hostile peer; forwarding it would make the gateway drop every real block after it as a duplicate);
-- falls more than 1,500 rounds behind the network round tip, or sends a round below 1e9 or more than 200,000 above the tip;
+- sends nothing for 10 s, or no higher block for 30 s;
+- sends a block more than 20,000 rounds above its previous one;
+- falls more than 1,500 rounds behind the network tip, or sends an implausible round;
 - stops reading the node's outbound traffic for 5 s.
 
-Every write to a node is bounded to 30 s, so a node that stops reading can't hold a session, its pin and its priority slot until TCP gives up.
+Writes to a node are bounded to 30 s, so a stuck node can't hold a session open.
 
-**Network round tip.** The tip comes from `round_tip` in `peers.json` (see `peerd` above). Each fresh reading replaces the previous one, so a bad reading lasts one peerd cycle. If no fresh reading arrives for 15 minutes (peerd stopped, the file stopped updating, or peerd found too few live peers to cluster), the gateway resets the tip to unknown and logs a `WARN`. With an unknown tip only the floor and the per-session checks above apply. A frozen tip would otherwise fall behind mainnet and, about 4 hours later, make every real round look implausible.
+**Network round tip.** peerd publishes the second-highest round of the largest cluster of probed peers, so one peer can't move it. The gateway replaces its tip with each fresh reading and resets it to unknown (with a `WARN`) if none arrives for 15 minutes, rather than freezing on a stale value.
 
-**Pool refresh.** The gateway re-reads `peers.json` every 30 s. If the file is missing, unreadable or empty it keeps the previous pool and logs a `WARN`.
+**Pool.** Re-read every 30 s; a missing or empty `peers.json` keeps the previous pool.
 
-**Client-block RPC (4002).** The pinned active peer answers alone for 2 s; then up to 8 other peers are hedged in, each behind a temporary live relationship. A request gets 15 s in total and at most 8 requests run at once across the gateway.
+**Client blocks (4002).** The node's active peer answers alone for 2 s, then up to 8 others are hedged in. 15 s per request, at most 8 requests at once.
 
 ## Hot-standby failover
 
-With `--push` and no standbys, the gateway ends a node's 4001 session after the active peer sends nothing for 10 s (or no new block for 30 s). The node then reconnects and the gateway elects a new peer. On a mainnet node in Tokyo that cycle took about 11 s from the last block to the next one, and a peer that kept sending blocks a few hundred ms late was never replaced.
+With `HYPERSYNC_FAILOVER_STANDBYS=N` (needs `--push`), each node session also streams live blocks from N standby peers into a buffer. When the active peer fails or falls behind, the gateway switches the node to a standby **on the same TCP connection**, instead of ending the session (which took ~11 s from last block to next).
 
-Set `HYPERSYNC_FAILOVER_STANDBYS=N` to give every node session N standby peers. Each standby streams live blocks into a buffer that the gateway does not forward. When the active peer fails or falls behind, the gateway switches the node to a standby on the node's existing TCP connection.
-
-### Why a switch is safe
-
-The node rejects a block whose parent it never received, so the gateway can't start forwarding from wherever the standby happens to be. It replays the standby's buffered blocks starting at the block whose parent is the last block the node received, then follows parent links. If the standby's buffer has a gap, the gateway doesn't switch to it.
-
-Live blocks for a round are byte-identical on every peer. On 2026-10-20 we compared 429 rounds from 6 peers and found no difference in the decompressed blocks or in the wire frames. The gateway hashes every block and checks each standby's copy against the block the active peer delivered for that round. One mismatch drops the standby. A standby needs 3 matching blocks before it can replace a live active peer, and 1 when the active peer has already died.
-
-Only one upstream feeds the node at any time. The gateway never mixes frames from two peers, so the round-only dedup problem that keeps `ENABLE_SHADOW_PUSH` off doesn't apply.
-
-### When the gateway switches
-
-- The active stream errors, closes or sends nothing for 5 s. The gateway switches at once to a standby that can continue the chain.
-- A verified standby has held the node's next block for `HYPERSYNC_FAILOVER_STALL_MS` and the active peer still hasn't sent it.
-- A verified standby's median lead over the active peer, across the last 40 blocks both delivered, is above `HYPERSYNC_FAILOVER_LAG_MS`. The gateway makes this kind of switch at most once per `HYPERSYNC_FAILOVER_DWELL_MS`.
-
-On a stall the gateway picks the standby with the best median lead, then the one holding the most of the chain. After a switch it repins the node's 4002 RPC to the new active peer, closes the old one, keeps it out for 120 s and dials a replacement standby. If the active peer dies and no standby can continue the chain within 3 s, the session ends the same way it does without standbys.
-
-### Choosing standbys
-
-The gateway fills a standby slot by dialing up to 4 candidates at once, priority peers first and then the peerd pool, and keeps the first one that accepts the live greeting. The first to accept is usually the nearest. Every `HYPERSYNC_FAILOVER_ROTATE_SECS` it drops the standby that trails the active peer the most, if that standby trails by more than `HYPERSYNC_FAILOVER_ROTATE_MS`, and skips it for 30 minutes. Priority peers are never rotated out.
-
-### Settings
+- **Safe switch:** the gateway replays the standby's buffered blocks starting from the block whose parent is the node's last block, following parent links; a standby with a gap isn't used. Every standby block is hashed and checked against the active's block for the same round (identical on all peers); one mismatch drops the standby, and a standby needs 3 matches before it can take over. Only one upstream feeds the node at a time.
+- **When:** the active errors, closes or is silent for 5 s; a verified standby has held the next block for `STALL_MS`; or a standby's median lead over the last 40 blocks exceeds `LAG_MS` (at most once per `DWELL_MS`).
+- **After a switch:** 4002 is repinned to the new active, the old one is dropped for 120 s and a replacement standby is dialed (up to 4 at once, priority first). If no standby can continue within 3 s, the session ends as without standbys.
 
 | Variable | Default | Effect |
 |---|---|---|
-| `HYPERSYNC_FAILOVER_STANDBYS` | `0` | Standby peers per node session (max 16). `0` keeps the behavior described under `--push`. |
-| `HYPERSYNC_FAILOVER_STALL_MS` | `400` | How long a standby may hold the next block before the gateway switches to it. |
-| `HYPERSYNC_FAILOVER_LAG_MS` | `150` | Median lead a standby needs over the active peer to trigger a lag switch. |
-| `HYPERSYNC_FAILOVER_DWELL_MS` | `10000` | Minimum time between lag switches. Stall and dead-peer switches ignore it. |
-| `HYPERSYNC_FAILOVER_ROTATE_MS` | `100` | A standby trailing the active peer by more than this gets replaced. `0` turns rotation off. |
-| `HYPERSYNC_FAILOVER_ROTATE_SECS` | `60` | How often the gateway checks for a standby to rotate out. |
-| `HYPERSYNC_FAILOVER_STATUS_DIR` | unset | If set, the gateway writes `failover-<node-ip>.json` there every second with the active peer, switch count, last switch and, per standby, matched blocks, median lead and buffered blocks. |
+| `HYPERSYNC_FAILOVER_STANDBYS` | `0` | Standbys per session (max 16). |
+| `HYPERSYNC_FAILOVER_STALL_MS` | `400` | Standby hold time before a stall switch. |
+| `HYPERSYNC_FAILOVER_LAG_MS` | `150` | Median lead that triggers a lag switch. |
+| `HYPERSYNC_FAILOVER_DWELL_MS` | `10000` | Minimum time between lag switches. |
+| `HYPERSYNC_FAILOVER_ROTATE_MS` | `100` | Replace a standby trailing the active by more than this (`0` = off; priority peers never rotate). |
+| `HYPERSYNC_FAILOVER_ROTATE_SECS` | `60` | Rotation check interval. |
+| `HYPERSYNC_FAILOVER_STATUS_DIR` | unset | Write `failover-<node-ip>.json` status there every second. |
 
-Each standby is one more live stream from the gateway's IP, about 1 to 2 MB/s. The buffers hold only blocks the node hasn't received yet, so memory use stays in the low MB.
+Each standby is one more live stream (~1-2 MB/s) from the gateway's IP.
 
-## HL P2P protocol (reverse-engineered)
+## HL P2P protocol notes
 
-- Plaintext TCP, ports 4000-4010 (4001 = abci_state / block heavy channel, 4002 = gossip RPC).
-- Frame: `[u32 BE length][1 type byte][payload]`; type 0 = control, type 1 = data.
-- Greeting: `TcpGreeting { send_abci, broadcast_group, id }` (8 bytes).
-- Blocks are lz4-compressed (u32-LE size prefix). Since 2026-10 the round is no longer at a fixed offset: the decompressed header carries the round and its parents as `0xfc R 0xfc R-1 0xfc R-2` within the first 0x400 bytes, and the gateway takes the first such triple (`src/protocol.rs`). Before that the round sat at offset `0x5e`.
-- Bootstrap is **interactive RPC** (query height → request client blocks → commit). A node only ingests blocks from peers **it dials** (outbound) — so hypersync must be an outbound peer (configured in `root_node_ips`), never an inbound pusher.
+- Plaintext TCP on 4000-4010: 4001 = bootstrap and live blocks, 4002 = gossip RPC (client blocks, `query_peers`).
+- Frames are `[u32 BE length][type][payload]`; type 0 = control, 1 = data. The 8-byte greeting carries `send_abci` and the broadcast group.
+- Blocks are lz4 (u32-LE size prefix). Since 2026-10 the round is found by scanning the first 0x400 decompressed bytes for `0xfc R 0xfc R-1 0xfc R-2` (it used to sit at 0x5e).
+- A full bootstrap is ~5.8 GB (abci_state ~1.3 GB + EVM KVs, 2026-10) and abci_state is rate-limited per source IP.
 
-## Performance
+More detail: [`docs/hl-p2p-protocol.md`](docs/hl-p2p-protocol.md), [`docs/deploy-existing-hlnode.md`](docs/deploy-existing-hlnode.md).
 
-The hot path (lz4 round-decode + dedup) is heavily optimized. Reading a block's consensus round needs only the block header, so the gateway decodes just the first 0x400 decompressed bytes into a fixed stack buffer (blocks run to ~250 KB decompressed) and falls back to a full decompress only if that bounded decode fails (refusing any payload that declares more than 16 MB decompressed, since lz4 would allocate the declared size up front). Dedup is a lock-free, hash-free sliding window: a power-of-two `AtomicU32` array indexed by `round & mask` and updated with a single atomic swap — no mutex, no hashing, no ring-buffer eviction. ~**135M frames/s** in the included `bench` (measured with the pre-2026-10 fixed-offset decoder; not re-measured since) — about **4.3x** the previous already-optimized baseline (and far higher vs a naive full-decompress).
+## Development
+
+```sh
+cargo build --release
+cargo test --release
+cargo clippy --release --all-targets -- -D warnings
+```
+
+`soak-test.sh` monitors a running node + gateway over time (block rate, sync source, errors). The gateway pins glibc's mmap threshold at 1 MiB so large 4002 buffers are returned to the OS; steady-state memory is a few MB.
