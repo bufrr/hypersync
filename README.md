@@ -88,6 +88,8 @@ Set in `.env`; compose passes them through.
 
 The peer is then skipped for 30 s (priority peers via their own cooldown), so the reconnect lands on a different one unless every peer is cooling down.
 
+**Returning to priority peers.** A session that ended up on a pool peer (e.g. after a network-wide pause cooled the priority peers down) moves back once a priority peer serves again: after the session has run 60 s, the gateway probes the least-loaded available priority peer with the same first-block vetting as selection and, if it passes, ends the session so the node reconnects to it. A failed probe cools that peer down; each node probes at most once per 5 minutes, since the reconnect costs it a few seconds of blocks. With hot standbys the switch happens on the same connection instead (below).
+
 Live frames over 8 MB end the session (blocks average ~200 KB), at most 64 MB of frames are queued per node, and writes to a node are bounded to 30 s, so neither a hostile peer nor a stuck node can make a session hold more.
 
 **Network round tip.** peerd publishes the median round of the largest cluster of probed peers, so a minority of peers (even a few colluding ones) can't move it; a majority of the probed peers lying still could. The gateway replaces its tip with each fresh reading and resets it to unknown (with a `WARN`) if none arrives for 15 minutes, rather than freezing on a stale value.
@@ -112,7 +114,7 @@ IPv4 addresses hypersync never connects to, however they are advertised (gossip 
 With `HYPERSYNC_FAILOVER_STANDBYS=N` (needs `--push`), each node session also streams live blocks from N standby peers into a buffer. When the active peer fails or falls behind, the gateway switches the node to a standby **on the same TCP connection**, instead of ending the session (which took ~11 s from last block to next).
 
 - **Safe switch:** the gateway replays the standby's buffered blocks starting from the block whose parent is the node's last block, following parent links; a standby with a gap isn't used. Every standby block is hashed after decompression and checked against the active's block for the same round (identical on all peers). A mismatch resets the standby's verification and 3 in a row drop it; a standby needs 3 matches before it can take over, even when the active has died. The active stays the reference, so an active that sends wrong blocks can still push its standbys out. Only one upstream feeds the node at a time.
-- **When:** the active errors, closes or is silent for 5 s, sends no higher block for 30 s, or jumps more than 20,000 rounds; a verified standby has held the next block for `STALL_MS`; or a standby's median lead over the last 40 blocks exceeds `LAG_MS` (at most once per `DWELL_MS`).
+- **When:** the active errors, closes or is silent for 5 s, sends no higher block for 30 s, or jumps more than 20,000 rounds; a verified standby has held the next block for `STALL_MS`; the active is a pool peer and a verified priority standby can continue the chain (at most once per `DWELL_MS`); or a standby's median lead over the last 40 blocks exceeds `LAG_MS` (at most once per `DWELL_MS`). A priority active is only left for speed by another priority peer.
 - **After a switch:** 4002 is repinned to the new active, the old one is dropped for 120 s and a replacement standby is dialed (up to 4 at once, priority first). If no standby can continue within 3 s, the session ends as without standbys.
 
 | Variable | Default | Effect |

@@ -3,6 +3,8 @@ use crate::protocol::{
     block_round, is_plausible_mainnet_round, read_live_frame_with_timeout, response_is_peer_full,
     round_lag_from_tip, RoundForwardGate, ACTIVE_ROUND_MAX_LAG, MAX_LIVE_FRAME,
 };
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -79,7 +81,7 @@ pub(crate) async fn splice_with_idle(
         })
     });
     let (to_peer, upstream_ended) = tokio::select! {
-        r = tokio::io::copy(&mut dr, &mut uw) => (r.unwrap_or(0), false),
+        r = copy_node_to_upstream(&mut dr, &mut uw, RELAY_UPSTREAM_WRITE_TIMEOUT) => r,
         r = &mut h.0 => (0, r.unwrap_or(false)),
         _ = crate::blacklist::wait_blacklisted(&up_ip) => (0, true),
     };
@@ -88,6 +90,35 @@ pub(crate) async fn splice_with_idle(
         to_node: to_node.load(Ordering::Relaxed),
         to_peer,
         upstream_ended,
+    }
+}
+
+// How long a write to an upstream may stall before the session treats the upstream as gone: it
+// has stopped draining its socket while the node still has requests and acks for it. The push
+// session and the proxy act on it fast; the plain relays (side ports, bootstrap) exist to attribute
+// a dead upstream and never hang, so they allow brief backpressure.
+pub(crate) const UPSTREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const RELAY_UPSTREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
+// The node -> upstream half of a relay: (bytes copied, whether the upstream ended it). The node
+// closing or failing a read ends it as the node's doing; a failed or stalled write to the upstream
+// as the upstream's — tokio::io::copy can't tell the two apart, and has no write bound.
+pub(crate) async fn copy_node_to_upstream(
+    dr: &mut OwnedReadHalf,
+    uw: &mut tokio::net::tcp::OwnedWriteHalf,
+    write_timeout: Duration,
+) -> (u64, bool) {
+    let mut buf = vec![0u8; 65536];
+    let mut copied = 0u64;
+    loop {
+        let n = match dr.read(&mut buf).await {
+            Ok(0) | Err(_) => return (copied, false),
+            Ok(n) => n,
+        };
+        match timeout(write_timeout, uw.write_all(&buf[..n])).await {
+            Ok(Ok(())) => copied += n as u64,
+            _ => return (copied, true),
+        }
     }
 }
 
@@ -221,6 +252,9 @@ pub(crate) struct PushConfig {
     // proxy only: (failover generation, value at session start). When the proxy fails over, the
     // session ends so the node reconnects to the new active with 4001 and 4002 on the same peer.
     pub(crate) superseded: Option<(Arc<AtomicU64>, u64)>,
+    // the caller's own reason to end the session (e.g. returning to a priority peer): resolves
+    // with the exit reason; polled with the session's other ends so it shuts down cleanly
+    pub(crate) end_when: Option<Pin<Box<dyn Future<Output = String> + Send>>>,
 }
 
 // Resolves once the proxy's failover generation moves past the session's; never without one.
@@ -235,6 +269,10 @@ pub(super) async fn wait_superseded(superseded: Option<(Arc<AtomicU64>, u64)>) {
 
 // serve_push exit reasons that are the NODE's doing (it left, or stopped reading) or a proxy
 // failover; anything else is the active upstream's fault and should rotate it out.
+// The exit reason of a session ended to move its node back to a priority peer (the pool peer it
+// leaves did nothing wrong).
+pub(crate) const RETURNING_TO_PRIORITY: &str = "returning to a priority peer";
+
 pub(crate) fn push_exit_is_upstream_fault(reason: &str) -> bool {
     !(reason.starts_with("node outbound ended")
         // serve_failover's node reader
@@ -246,7 +284,8 @@ pub(crate) fn push_exit_is_upstream_fault(reason: &str) -> bool {
         || reason.starts_with("event channel closed")
         || reason.starts_with("node write")
         || reason.starts_with("node greeting write")
-        || reason.starts_with("active superseded"))
+        || reason.starts_with("active superseded")
+        || reason.starts_with(RETURNING_TO_PRIORITY))
 }
 
 // Per-session accounting of what the active stream forwarded and what the round gates dropped
@@ -400,7 +439,8 @@ pub(crate) async fn serve_push(node: TcpStream, active_conn: TcpStream, cfg: Pus
     // that still sends blocks but stops draining node outbound would otherwise park write_all
     // forever, silently dropping acks/RPC. A write stall means the active is unusable — exit so
     // the session tears down and the node re-elects a fresh active.
-    let mut up = {
+    // spawned tasks are aborted on drop too, so cancelling this future can't leave them running
+    let mut up = AbortOnDrop({
         let mut node_r = node_r;
         let mut act_w = act_w;
         tokio::spawn(async move {
@@ -409,7 +449,7 @@ pub(crate) async fn serve_push(node: TcpStream, active_conn: TcpStream, cfg: Pus
                 match node_r.read(&mut buf).await {
                     Ok(0) | Err(_) => break "node outbound ended".to_string(),
                     Ok(n) => {
-                        match timeout(Duration::from_secs(5), act_w.write_all(&buf[..n])).await {
+                        match timeout(UPSTREAM_WRITE_TIMEOUT, act_w.write_all(&buf[..n])).await {
                             Ok(Ok(())) => {}
                             Ok(Err(e)) => break format!("node outbound write failed: {e}"),
                             Err(_) => break "node outbound write timeout".to_string(),
@@ -418,7 +458,7 @@ pub(crate) async fn serve_push(node: TcpStream, active_conn: TcpStream, cfg: Pus
                 }
             }
         })
-    };
+    });
     for frame in cfg.prefetched_frames {
         if let Err(e) = process_live_frame(
             frame,
@@ -432,13 +472,12 @@ pub(crate) async fn serve_push(node: TcpStream, active_conn: TcpStream, cfg: Pus
         .await
         {
             // `up` is already running; don't leave the node->active copy behind on this early exit
-            up.abort();
             return format!("prefetched frame processing failed: {e}");
         }
     }
     // Spawned only once the session is past every early return above: a detached JoinHandle keeps
     // the task running, so an early exit here would leak a forever-logging task per failed session.
-    let mut lag_log = {
+    let mut lag_log = AbortOnDrop({
         let active_peer = cfg
             .hosts
             .get(cfg.active_idx)
@@ -460,12 +499,12 @@ pub(crate) async fn serve_push(node: TcpStream, active_conn: TcpStream, cfg: Pus
                 );
             }
         })
-    };
+    });
     // active peer -> node: the transparent backbone (forwards non-block frames + blocks). If the
     // active stream stalls or dies the session is torn down so the node reconnects and a fresh
     // active is elected — a mid-session replacement peer would start at its own tip and hand the
     // node a block whose parent it never saw (invalid parent round).
-    let mut active_task = spawn_active_pump(
+    let mut active_task = AbortOnDrop(spawn_active_pump(
         act_r,
         tx.clone(),
         forward_gate.clone(),
@@ -473,7 +512,7 @@ pub(crate) async fn serve_push(node: TcpStream, active_conn: TcpStream, cfg: Pus
         cfg.net_round_tip.clone(),
         active_round.clone(),
         stats.clone(),
-    );
+    ));
     fn active_exit_reason(joined: Result<std::io::Result<()>, tokio::task::JoinError>) -> String {
         match joined {
             Ok(Ok(())) => "active stream ended".to_string(),
@@ -483,6 +522,14 @@ pub(crate) async fn serve_push(node: TcpStream, active_conn: TcpStream, cfg: Pus
     }
     let superseded = wait_superseded(cfg.superseded);
     tokio::pin!(superseded);
+    let end_signal = cfg.end_when;
+    let end_when = async move {
+        match end_signal {
+            Some(end) => end.await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(end_when);
     let active_host = cfg.hosts.get(cfg.active_idx).cloned().unwrap_or_default();
     let blacklisted = crate::blacklist::wait_blacklisted(&active_host);
     tokio::pin!(blacklisted);
@@ -490,6 +537,7 @@ pub(crate) async fn serve_push(node: TcpStream, active_conn: TcpStream, cfg: Pus
         tokio::select! {
             _ = &mut superseded => break "active superseded by failover".to_string(),
             _ = &mut blacklisted => break "active peer blacklisted".to_string(),
+            reason = &mut end_when => break reason,
             maybe = rx.recv() => match maybe {
                 // Bounded like the node -> peer direction: a half-open node (no RST) would
                 // otherwise park write_all until the kernel gives up (~15 min), holding the
@@ -503,22 +551,20 @@ pub(crate) async fn serve_push(node: TcpStream, active_conn: TcpStream, cfg: Pus
                 // Unreachable in practice: serve_push itself keeps its own tx alive, so the
                 // channel never reports closed. Kept as a safe fallback that surfaces the
                 // active pump's real exit reason.
-                None => break active_exit_reason((&mut active_task).await),
+                None => break active_exit_reason((&mut active_task.0).await),
             },
-            joined = &mut up => break match joined {
+            joined = &mut up.0 => break match joined {
                 Ok(reason) => reason,
                 Err(e) => format!("node outbound task join error: {e}"),
             },
-            joined = &mut active_task => break active_exit_reason(joined),
-            joined = &mut lag_log => break match joined {
+            joined = &mut active_task.0 => break active_exit_reason(joined),
+            joined = &mut lag_log.0 => break match joined {
                 Ok(()) => "active lag logger ended".to_string(),
                 Err(e) => format!("active lag logger task join error: {e}"),
             },
         }
     };
-    up.abort();
-    active_task.abort();
-    lag_log.abort();
+    drop((up, active_task, lag_log));
     format!("{exit_reason} stats=[{}]", stats.summary())
 }
 
@@ -831,6 +877,7 @@ mod tests {
             "node write timeout",
             "node greeting write failed: timeout",
             "active superseded by failover",
+            "returning to a priority peer (1.2.3.4 is serving) stats=[]",
         ] {
             assert!(!push_exit_is_upstream_fault(node_side), "{node_side}");
         }
@@ -891,6 +938,7 @@ mod tests {
                 live_floor: Arc::new(AtomicU32::new(0)),
                 net_round_tip: Arc::new(AtomicU32::new(0)),
                 superseded: None,
+                end_when: None,
             },
         )
         .await;
@@ -901,6 +949,98 @@ mod tests {
 
     // An active peer blacklisted mid-session ends the session (the node reconnects elsewhere),
     // though the peer itself is healthy and still connected.
+    // The caller's own end signal (returning to a priority peer) ends the session through the
+    // normal exit path: the node sees EOF, the reason is the caller's.
+    #[tokio::test]
+    async fn push_session_ends_on_the_callers_signal() {
+        let node_l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let node_addr = node_l.local_addr().unwrap();
+        let fake_node = tokio::spawn(async move {
+            let mut c = TcpStream::connect(node_addr).await.unwrap();
+            let mut buf = Vec::new();
+            c.read_to_end(&mut buf).await.unwrap();
+            buf
+        });
+        let (node_conn, _) = node_l.accept().await.unwrap();
+        let peer_l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer_l.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let (mut s, _) = peer_l.accept().await.unwrap();
+            s.write_all(&[0, 0, 0, 1, 0, 7]).await.unwrap();
+            let mut b = [0u8; 64];
+            while s.read(&mut b).await.is_ok_and(|n| n > 0) {}
+        });
+        let active_conn = TcpStream::connect(peer_addr).await.unwrap();
+        let reason = timeout(
+            Duration::from_secs(3),
+            serve_push(
+                node_conn,
+                active_conn,
+                PushConfig {
+                    hosts: Arc::new(vec!["127.0.0.1".into()]),
+                    active_idx: 0,
+                    prefetched_greeting: None,
+                    prefetched_frames: Vec::new(),
+                    initial_last_forwarded: 0,
+                    live_floor: Arc::new(AtomicU32::new(0)),
+                    net_round_tip: Arc::new(AtomicU32::new(0)),
+                    superseded: None,
+                    end_when: Some(Box::pin(async {
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        format!("{RETURNING_TO_PRIORITY} (test)")
+                    })),
+                },
+            ),
+        )
+        .await
+        .expect("ends on the signal");
+        assert!(reason.starts_with(RETURNING_TO_PRIORITY), "{reason}");
+        assert_eq!(fake_node.await.unwrap(), [0, 0, 0, 1, 0, 7]);
+        timeout(Duration::from_secs(2), peer)
+            .await
+            .expect("upstream connection closed")
+            .unwrap();
+    }
+
+    // The node -> upstream half tells who ended it: the node closing is the node's doing, an
+    // upstream that stops reading (its write stalls) is the upstream's.
+    #[tokio::test]
+    async fn node_to_upstream_copy_says_who_ended_it() {
+        async fn pair() -> (TcpStream, TcpStream) {
+            let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let a = TcpStream::connect(l.local_addr().unwrap()).await.unwrap();
+            let (b, _) = l.accept().await.unwrap();
+            (a, b)
+        }
+        let (mut node, gw_down) = pair().await;
+        let (gw_up, mut upstream) = pair().await;
+        node.write_all(b"abc").await.unwrap();
+        drop(node);
+        let (mut dr, _dw) = gw_down.into_split();
+        let (_ur, mut uw) = gw_up.into_split();
+        let r = copy_node_to_upstream(&mut dr, &mut uw, Duration::from_millis(200)).await;
+        assert_eq!(r, (3, false));
+        let mut got = [0u8; 3];
+        upstream.read_exact(&mut got).await.unwrap();
+
+        let (mut node, gw_down) = pair().await;
+        let (gw_up, _upstream_never_reads) = pair().await;
+        let writer = tokio::spawn(async move {
+            let chunk = vec![0u8; 1 << 20];
+            while node.write_all(&chunk).await.is_ok() {}
+        });
+        let (mut dr, _dw) = gw_down.into_split();
+        let (_ur, mut uw) = gw_up.into_split();
+        let (_, upstream_ended) = timeout(
+            Duration::from_secs(10),
+            copy_node_to_upstream(&mut dr, &mut uw, Duration::from_millis(200)),
+        )
+        .await
+        .expect("a stalled upstream write ends the copy");
+        assert!(upstream_ended);
+        writer.abort();
+    }
+
     #[tokio::test]
     async fn push_session_ends_when_active_is_blacklisted() {
         let _g = crate::blacklist::TEST_LOCK.lock().await;
@@ -939,6 +1079,7 @@ mod tests {
                     live_floor: Arc::new(AtomicU32::new(0)),
                     net_round_tip: Arc::new(AtomicU32::new(0)),
                     superseded: None,
+                    end_when: None,
                 },
             ),
         )
@@ -996,6 +1137,7 @@ mod tests {
                 live_floor: Arc::new(AtomicU32::new(0)),
                 net_round_tip: Arc::new(AtomicU32::new(0)),
                 superseded: None,
+                end_when: None,
             },
         )
         .await;
@@ -1064,6 +1206,7 @@ mod tests {
                 live_floor: Arc::new(AtomicU32::new(0)),
                 net_round_tip: Arc::new(AtomicU32::new(0)),
                 superseded: None,
+                end_when: None,
             },
         )
         .await;
@@ -1125,6 +1268,7 @@ mod tests {
                 live_floor: Arc::new(AtomicU32::new(0)),
                 net_round_tip: Arc::new(AtomicU32::new(net_tip)),
                 superseded: None,
+                end_when: None,
             },
         )
         .await;

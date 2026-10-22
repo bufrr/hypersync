@@ -246,6 +246,7 @@ async fn proxy_conn(
                 // and block-progress guards still apply)
                 net_round_tip: Arc::new(AtomicU32::new(0)),
                 superseded: Some((st.generation.clone(), cur_gen)),
+                end_when: None,
             },
         )
         .await;
@@ -308,7 +309,7 @@ async fn proxy_conn(
         let end = loop {
             match dr.read(&mut buf).await {
                 Ok(0) | Err(_) => break N2uEnd::Node,
-                Ok(nb) => match timeout(Duration::from_secs(5), uw.write_all(&buf[..nb])).await {
+                Ok(nb) => match timeout(UPSTREAM_WRITE_TIMEOUT, uw.write_all(&buf[..nb])).await {
                     Ok(Ok(())) => {}
                     Ok(Err(_)) => break N2uEnd::UpstreamGone,
                     Err(_) => break N2uEnd::UpstreamStalled,

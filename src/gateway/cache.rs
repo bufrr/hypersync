@@ -5,7 +5,9 @@ use crate::protocol::{
     max_block_round_in_frames, read_header_or_timeout, unix_secs, HeaderRead, ACTIVE_ROUND_MAX_LAG,
     GREET_TRUE, MIN_COMPLETE_BOOTSTRAP_BYTES,
 };
-use crate::push::{AbortOnDrop, Relayed, NODE_WRITE_TIMEOUT};
+use crate::push::{
+    copy_node_to_upstream, AbortOnDrop, Relayed, NODE_WRITE_TIMEOUT, RELAY_UPSTREAM_WRITE_TIMEOUT,
+};
 use crate::util::lock;
 use std::collections::HashSet;
 use std::env;
@@ -120,7 +122,7 @@ pub(super) async fn splice_bootstrap_capture(
     let upstream_ended = Arc::new(AtomicBool::new(false));
     // aborted on drop too: if this future is cancelled the copy task (and the capture permit it
     // holds) must not live on detached
-    let h = AbortOnDrop({
+    let mut h = AbortOnDrop({
         let delivered = delivered.clone();
         let upstream_ended = upstream_ended.clone();
         let upstream_gone = move || upstream_ended.store(true, Ordering::Release);
@@ -298,8 +300,16 @@ pub(super) async fn splice_bootstrap_capture(
     // like splice: a source blacklisted mid-relay ends it (an unfinished capture is discarded).
     // When the upstream side ends the copy task, dropping its node writer shows the node EOF,
     // and the node closing ends the node -> upstream copy here.
+    // ...and the copy task ending is waited on too: a node that never closes (half-open, a
+    // non-standard client) must not keep this relay alive after the upstream side is done
     let to_peer = tokio::select! {
-        r = tokio::io::copy(&mut dr, &mut uw) => r.unwrap_or(0),
+        (n, upstream_gone) = copy_node_to_upstream(&mut dr, &mut uw, RELAY_UPSTREAM_WRITE_TIMEOUT) => {
+            if upstream_gone {
+                upstream_ended.store(true, Ordering::Release);
+            }
+            n
+        }
+        _ = &mut h.0 => 0,
         _ = crate::blacklist::wait_blacklisted(&up_ip) => {
             upstream_ended.store(true, Ordering::Release);
             0
@@ -1078,6 +1088,50 @@ mod tests {
 
     // A tapped bootstrap relay whose upstream goes silent mid-frame ends: the single-flight
     // capture permit is released (it used to be held forever) and the upstream is blamed.
+    // A node that never closes (half-open, a non-standard client) must not keep the tapped relay
+    // alive once the upstream side has ended it.
+    #[tokio::test]
+    async fn a_half_open_node_does_not_keep_the_tapped_relay_alive() {
+        let up_l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = up_l.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (_s, _) = up_l.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        });
+        let node_l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let node_addr = node_l.local_addr().unwrap();
+        let node = tokio::spawn(async move {
+            // connected, never reads, never closes
+            let _c = TcpStream::connect(node_addr).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        });
+        let (down, _) = node_l.accept().await.unwrap();
+        let upc = TcpStream::connect(up_addr).await.unwrap();
+        let tap = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = tap.clone().try_acquire_owned().unwrap();
+        let r = timeout(
+            Duration::from_secs(3),
+            splice_bootstrap_capture(
+                down,
+                upc,
+                [0, 0, 0, 100, 1],
+                vec![7u8; 10],
+                CacheSink {
+                    boot_blob: Arc::new(Mutex::new(None)),
+                    boot_blob_cached_at: Arc::new(AtomicU64::new(0)),
+                    disk_cache_path: None,
+                },
+                permit,
+                Duration::from_millis(200),
+            ),
+        )
+        .await
+        .expect("the relay ends without waiting for the node to close");
+        assert!(r.upstream_ended);
+        assert_eq!(tap.available_permits(), 1);
+        node.abort();
+    }
+
     #[tokio::test]
     async fn silent_upstream_ends_the_tapped_bootstrap_relay_and_frees_the_permit() {
         let up_l = TcpListener::bind("127.0.0.1:0").await.unwrap();

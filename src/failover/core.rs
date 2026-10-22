@@ -38,6 +38,8 @@ pub(crate) enum SwitchReason {
     Stall,
     Lag,
     ActiveDead,
+    // back to an operator priority peer from a pool active
+    Preferred,
 }
 
 impl SwitchReason {
@@ -46,6 +48,7 @@ impl SwitchReason {
             Self::Stall => "stall",
             Self::Lag => "lag",
             Self::ActiveDead => "active-dead",
+            Self::Preferred => "preferred",
         }
     }
 }
@@ -73,6 +76,9 @@ pub(super) struct Upstream {
     // ms the active was later than this standby, per common round (negative = standby later)
     leads: VecDeque<i64>,
     last_rx: Option<Instant>,
+    // an operator priority peer: the session moves back to one once it is verified (see
+    // pick_switch), and lag switches never leave one for a pool peer
+    preferred: bool,
 }
 
 impl Upstream {
@@ -86,6 +92,7 @@ impl Upstream {
             dropped_max: 0,
             leads: VecDeque::new(),
             last_rx: None,
+            preferred: false,
         }
     }
 
@@ -229,6 +236,13 @@ impl Core {
         self.ups.insert(id, Upstream::new(ip));
     }
 
+    // Mark an upstream (the active or a standby) as an operator priority peer.
+    pub(crate) fn mark_preferred(&mut self, id: u64) {
+        if let Some(u) = self.ups.get_mut(&id) {
+            u.preferred = true;
+        }
+    }
+
     pub(crate) fn remove(&mut self, id: u64) -> Option<String> {
         self.ups.remove(&id).map(|u| u.ip)
     }
@@ -332,9 +346,12 @@ impl Core {
         // that is steadily slower than the others
         let mut stall_best: Option<(u64, i64, usize, Instant)> = None;
         let mut lag_best: Option<(u64, i64)> = None;
+        // back to a priority peer: the fastest verified one that continues the chain
+        let mut preferred_best: Option<(u64, i64)> = None;
         let dwell_ok = self
             .last_switch
             .is_none_or(|t| now.saturating_duration_since(t) >= self.min_dwell);
+        let active_preferred = self.ups.get(&self.active).is_some_and(|u| u.preferred);
         for (&id, u) in &self.ups {
             if id == self.active || u.verified < MIN_VERIFIED {
                 continue;
@@ -354,7 +371,16 @@ impl Core {
                     stall_best = Some((id, lead, n, first_at));
                 }
             }
-            if dwell_ok {
+            if dwell_ok && u.preferred && !active_preferred {
+                let lead = u.median_lead().unwrap_or(i64::MIN);
+                if preferred_best.is_none_or(|(_, bl)| lead > bl) {
+                    preferred_best = Some((id, lead));
+                }
+            }
+            // a priority active is only left for speed by another priority peer (otherwise a
+            // slightly faster pool standby and the preferred switch would trade the node back and
+            // forth every dwell); stall/dead switches above still go wherever the chain continues
+            if dwell_ok && (u.preferred || !active_preferred) {
                 if let Some(m) = u.median_lead() {
                     if m >= self.lag.as_millis() as i64 && lag_best.is_none_or(|(_, bm)| m > bm) {
                         lag_best = Some((id, m));
@@ -369,6 +395,9 @@ impl Core {
                 SwitchReason::Stall
             };
             return Some((id, reason));
+        }
+        if let Some((id, _)) = preferred_best {
+            return Some((id, SwitchReason::Preferred));
         }
         lag_best.map(|(id, _)| (id, SwitchReason::Lag))
     }
@@ -458,8 +487,9 @@ impl Core {
             .iter()
             .map(|(_, u)| {
                 format!(
-                    "{{\"ip\":\"{}\",\"verified\":{},\"lead_ms_p50\":{},\"lead_samples\":{},\"ahead\":{},\"last_rx_ms\":{}}}",
+                    "{{\"ip\":\"{}\",\"preferred\":{},\"verified\":{},\"lead_ms_p50\":{},\"lead_samples\":{},\"ahead\":{},\"last_rx_ms\":{}}}",
                     redact(&u.ip),
+                    u.preferred,
                     u.verified,
                     u.median_lead().map(|m| m.to_string()).unwrap_or_else(|| "null".into()),
                     u.leads.len(),
@@ -679,6 +709,73 @@ mod tests {
         c.on_standby_block(1, 111, 110, 999, t0, f(111));
         c.on_standby_block(1, 112, 111, 112, t0, f(112));
         assert_eq!(c.pick_switch(t0 + 5000 * MS, true), None);
+    }
+
+    #[test]
+    fn a_pool_active_returns_to_a_verified_priority_standby() {
+        let t0 = Instant::now();
+        let mut c = core();
+        c.add_standby(1, "prio".into());
+        c.mark_preferred(1);
+        // a verified priority standby, a little slower than the pool active
+        feed(&mut c, 100, 110, t0, 1, 20);
+        let now = t0 + 11 * 70 * MS;
+        assert_eq!(
+            c.pick_switch(now, false),
+            None,
+            "nothing continues the chain yet"
+        );
+        c.on_standby_block(1, 111, 110, 111, now, f(111));
+        // a dead active is still a dead-active switch (no dwell), the preference comes after
+        assert_eq!(
+            c.pick_switch(now, true),
+            Some((1, SwitchReason::ActiveDead))
+        );
+        assert_eq!(
+            c.pick_switch(now, false),
+            Some((1, SwitchReason::Preferred))
+        );
+        let (frames, _) = c.switch_to(1, now).unwrap();
+        assert_eq!(frames, vec![f(111)]);
+        // on the priority peer, a faster POOL standby is no reason to leave...
+        c.add_standby(2, "pool".into());
+        let t1 = now + 20_000 * MS; // past the dwell
+        feed(&mut c, 112, 140, t1, 2, -300);
+        let t2 = t1 + 29 * 70 * MS;
+        c.on_standby_block(2, 141, 140, 141, t2, f(141));
+        assert_eq!(c.pick_switch(t2, false), None);
+        // ...but a priority active that stalls still is
+        assert_eq!(
+            c.pick_switch(t2 + 500 * MS, false),
+            Some((2, SwitchReason::Stall))
+        );
+    }
+
+    #[test]
+    fn the_return_to_priority_waits_out_the_dwell() {
+        let t0 = Instant::now();
+        let mut c = core();
+        c.add_standby(1, "prio".into());
+        c.mark_preferred(1);
+        feed(&mut c, 100, 110, t0, 1, 20);
+        let now = t0 + 11 * 70 * MS;
+        c.on_standby_block(1, 111, 110, 111, now, f(111));
+        // just switched (to this pool active): the preference waits like a lag switch does
+        c.last_switch = Some(now);
+        assert_eq!(c.pick_switch(now + 100 * MS, false), None);
+        c.last_switch = Some(now - 10_000 * MS);
+        assert_eq!(
+            c.pick_switch(now, false),
+            Some((1, SwitchReason::Preferred))
+        );
+        // the active already being a priority peer: nothing to return to
+        let mut c = core();
+        c.mark_preferred(0);
+        c.add_standby(1, "prio2".into());
+        c.mark_preferred(1);
+        feed(&mut c, 100, 110, t0, 1, 20);
+        c.on_standby_block(1, 111, 110, 111, now, f(111));
+        assert_eq!(c.pick_switch(now, false), None);
     }
 
     #[test]

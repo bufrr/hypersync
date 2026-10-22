@@ -61,10 +61,13 @@ pub(super) struct NodeState {
     pub(super) rpc_peer: Mutex<Option<String>>,
     // a cache replay to this node is running (see ReplayInFlight)
     pub(super) replay_in_flight: AtomicBool,
+    // when this node last probed a priority peer to leave a pool session (see
+    // select::wait_priority_return); kept across reconnects so re-pins stay rate-limited
+    last_repin_attempt: Mutex<Option<Instant>>,
 }
 
 impl NodeState {
-    fn new(ip: IpAddr, now: u64) -> Self {
+    pub(super) fn new(ip: IpAddr, now: u64) -> Self {
         Self {
             ip,
             active: Mutex::new(None),
@@ -76,6 +79,7 @@ impl NodeState {
             lazy_active: AtomicBool::new(false),
             rpc_peer: Mutex::new(None),
             replay_in_flight: AtomicBool::new(false),
+            last_repin_attempt: Mutex::new(None),
         }
     }
 
@@ -142,6 +146,21 @@ impl NodeState {
         let mut active = lock(&self.active);
         unpin_blacklisted(&mut active);
         active.is_some() && !self.lazy_active.load(Ordering::Acquire)
+    }
+
+    // An attempt that never probed (the slot was gone): doesn't count against the node.
+    pub(super) fn forget_repin_attempt(&self) {
+        *lock(&self.last_repin_attempt) = None;
+    }
+
+    // One re-pin attempt per `retry` per node: true (and the attempt is recorded) if allowed now.
+    pub(super) fn claim_repin_attempt(&self, now: Instant, retry: Duration) -> bool {
+        let mut last = lock(&self.last_repin_attempt);
+        if last.is_some_and(|t| now.saturating_duration_since(t) < retry) {
+            return false;
+        }
+        *last = Some(now);
+        true
     }
 }
 
@@ -389,6 +408,19 @@ mod tests {
         // number of concurrently open connections)
         let entries = vec![(ip("10.0.0.1"), now, true), (ip("10.0.0.2"), now, true)];
         assert!(node_state_evict_keys(&entries, now, 2, 3600).is_empty());
+    }
+
+    #[test]
+    fn repin_attempts_are_rate_limited_per_node() {
+        let node = NodeState::new("10.0.0.1".parse().unwrap(), 1);
+        let t0 = Instant::now();
+        let retry = Duration::from_secs(300);
+        assert!(node.claim_repin_attempt(t0, retry));
+        assert!(!node.claim_repin_attempt(t0 + Duration::from_secs(299), retry));
+        assert!(node.claim_repin_attempt(t0 + retry, retry));
+        // an attempt that never probed (lost the slot race) doesn't count
+        node.forget_repin_attempt();
+        assert!(node.claim_repin_attempt(t0 + retry, retry));
     }
 
     #[test]

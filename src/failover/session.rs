@@ -298,6 +298,9 @@ pub(crate) async fn serve_failover(
         fo.lag,
         fo.min_dwell,
     );
+    if fctx.priority.contains(&active_ip) {
+        core.mark_preferred(0);
+    }
     let mut next_id: u64 = 1;
     let mut lives: HashMap<u64, Live> = HashMap::new();
     let mut cooldown: HashMap<String, Instant> = HashMap::new();
@@ -469,6 +472,9 @@ pub(crate) async fn serve_failover(
                         let (r, w) = stream.into_split();
                         lives.insert(id, Live { reader: spawn_reader(id, r, ev_tx.clone()), writer: w, prio });
                         core.add_standby(id, ip.clone());
+                        if fctx.priority.contains(&ip) {
+                            core.mark_preferred(id);
+                        }
                         gwlog!("[gw] [{node_label}] failover standby {ip} connected ({}/{})", core.standby_count(), fo.standbys);
                     }
                     Event::ConnectFailed => {
@@ -723,6 +729,7 @@ mod tests {
             live_floor: Arc::new(AtomicU32::new(0)),
             net_round_tip: Arc::new(AtomicU32::new(0)),
             superseded: None,
+            end_when: None,
         };
         let fctx = FailoverCtx {
             node_label: "test".into(),
@@ -770,6 +777,7 @@ mod tests {
             live_floor: Arc::new(AtomicU32::new(0)),
             net_round_tip: Arc::new(AtomicU32::new(0)),
             superseded: None,
+            end_when: None,
         };
         let fctx = FailoverCtx {
             node_label: "test".into(),

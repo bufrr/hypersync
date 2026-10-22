@@ -31,7 +31,7 @@ async fn serve_push_repinned(
     // the priority slot live selection already took for this peer (None: take one here)
     prio_session: Option<PrioritySession>,
     mode: &str,
-    cfg: PushConfig,
+    mut cfg: PushConfig,
 ) {
     let active_ip = cfg.hosts[cfg.active_idx].clone();
     let active_peer = node.pin_active(&active_ip);
@@ -51,7 +51,18 @@ async fn serve_push_repinned(
         mode,
         priority.sessions(&active_ip)
     );
-    if FailoverConfig::get().standbys > 0 {
+    // a session that landed on a pool peer moves back once a priority peer serves again (with hot
+    // standbys the failover session switches to a priority standby on the same connection instead)
+    let standbys = FailoverConfig::get().standbys;
+    if standbys == 0 && !priority.is_empty() && !priority.contains(&active_ip) {
+        cfg.end_when = Some(Box::pin(wait_priority_return(
+            node.clone(),
+            priority.clone(),
+            cfg.net_round_tip.clone(),
+            REPIN,
+        )));
+    }
+    if standbys > 0 {
         // hot-standby session: the active upstream can change mid-session, so the 4002 pin and the
         // priority session accounting follow every switch
         let pin = Arc::new(Mutex::new((active_peer, _prio_session)));
@@ -209,6 +220,7 @@ async fn serve_push_4001_fallback(
             live_floor: node.live_floor.clone(),
             net_round_tip: ctx.net_round_tip.clone(),
             superseded: None,
+            end_when: None,
         },
     )
     .await;
@@ -336,6 +348,7 @@ async fn replay_cache_then_live(
                 live_floor: node.live_floor.clone(),
                 net_round_tip: ctx.net_round_tip.clone(),
                 superseded: None,
+                end_when: None,
             },
         )
         .await;
@@ -533,6 +546,7 @@ pub(super) async fn handle_4001_live(
                     live_floor: node.live_floor.clone(),
                     net_round_tip: ctx.net_round_tip.clone(),
                     superseded: None,
+                    end_when: None,
                 },
             )
             .await;

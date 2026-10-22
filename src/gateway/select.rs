@@ -3,8 +3,9 @@ use crate::protocol::{
     block_round, is_plausible_mainnet_round, read_live_frame_with_timeout, response_is_peer_full,
     round_lag_from_tip, ACTIVE_ROUND_MAX_LAG, GREET_FALSE, MAX_LIVE_FRAME,
 };
-use crate::push::MAX_ACTIVE_ROUND_JUMP;
+use crate::push::{MAX_ACTIVE_ROUND_JUMP, RETURNING_TO_PRIORITY};
 use crate::util::lock;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -676,6 +677,73 @@ pub(super) fn bootstrap_source_list(
     }
 }
 
+// ---- returning to the priority tier ----
+//
+// A node session on a POOL peer never re-selects while it stays healthy, e.g. one the unvetted
+// fallback picked while a network-wide pause had every priority peer cooling down. Without hot
+// standbys it can't switch upstream mid-stream either (the new peer's stream starts at its own
+// tip), so it ends itself once a priority peer is demonstrably serving again, and the node's
+// reconnect re-selects (priority first). That reconnect costs the node a few seconds of blocks,
+// hence the session-age floor and the per-node attempt limit.
+pub(super) struct RepinTiming {
+    // never during the node's catch-up burst right after a (re)connect
+    pub(super) min_session: Duration,
+    pub(super) check_every: Duration,
+    // at most one probe per node this often, whatever its outcome (a failed probe also cools the
+    // priority peer down like a failed selection)
+    pub(super) retry: Duration,
+}
+
+pub(super) const REPIN: RepinTiming = RepinTiming {
+    min_session: Duration::from_secs(60),
+    check_every: Duration::from_secs(15),
+    retry: Duration::from_secs(5 * 60),
+};
+
+// Resolves with the session's exit reason once the node should move back to a priority peer: a
+// priority candidate (not cooling, below its session cap) passes the same first-block vetting as
+// live selection. The probe takes the candidate's session slot and releases it with the probe
+// connection when it returns (or when this future is dropped), before the node reconnects.
+pub(super) async fn wait_priority_return(
+    node: Arc<NodeState>,
+    priority: Arc<PriorityTier>,
+    net_tip: Arc<AtomicU32>,
+    timing: RepinTiming,
+) -> String {
+    tokio::time::sleep(timing.min_session).await;
+    loop {
+        if let Some(ip) = priority.candidates().into_iter().next() {
+            if node.claim_repin_attempt(Instant::now(), timing.retry) {
+                let tip = net_tip.load(Ordering::Acquire);
+                let (_, _, probe) = live_attempt(
+                    priority.clone(),
+                    ip.clone(),
+                    true,
+                    GREET_FALSE,
+                    LIVE_SELECT_WAIT,
+                    0,
+                    tip,
+                )
+                .await;
+                match probe {
+                    Ok(_serving) => return format!("{RETURNING_TO_PRIORITY} ({ip} is serving)"),
+                    // another session took its last slot since candidates(): nothing wrong with
+                    // the peer, and no probe happened, so this node may try again next check
+                    Err(e) if e.to_string() == PRIORITY_CAP_REACHED => node.forget_repin_attempt(),
+                    Err(e) => {
+                        gwlog!(
+                            "[gw] [{}] priority peer {ip} still not serving: {e}",
+                            node.ip
+                        );
+                        priority.mark_failed(&ip);
+                    }
+                }
+            }
+        }
+        tokio::time::sleep(timing.check_every).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1027,5 +1095,96 @@ mod tests {
         ] {
             assert!(s.contains(part), "missing {part} in {s}");
         }
+    }
+
+    fn fast_repin() -> RepinTiming {
+        RepinTiming {
+            min_session: Duration::from_millis(150),
+            check_every: Duration::from_millis(50),
+            retry: Duration::from_secs(10),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pool_session_returns_once_a_priority_peer_serves() {
+        let (p, h) = fake_live_peer(FakePeer::Healthy).await;
+        let tier = test_tier_capped(&[&p], 300, 1);
+        let node = Arc::new(NodeState::new("10.0.0.9".parse().unwrap(), 1));
+        let t0 = Instant::now();
+        let reason = timeout(
+            Duration::from_secs(5),
+            wait_priority_return(
+                node.clone(),
+                tier.clone(),
+                Arc::new(AtomicU32::new(0)),
+                fast_repin(),
+            ),
+        )
+        .await
+        .expect("the session ends once the priority peer serves");
+        assert!(
+            t0.elapsed() >= Duration::from_millis(150),
+            "not before the age floor"
+        );
+        assert!(reason.starts_with(RETURNING_TO_PRIORITY), "{reason}");
+        assert!(
+            !crate::push::push_exit_is_upstream_fault(&reason),
+            "the pool peer it leaves did nothing wrong"
+        );
+        assert_eq!(
+            tier.sessions(&p),
+            0,
+            "probe slot released before the reconnect"
+        );
+        h.abort();
+    }
+
+    #[tokio::test]
+    async fn no_return_while_priority_peers_are_unavailable_or_failing() {
+        let tip = || Arc::new(AtomicU32::new(0));
+        let node = || Arc::new(NodeState::new("10.0.0.9".parse().unwrap(), 1));
+        let (p, h) = fake_live_peer(FakePeer::Healthy).await;
+        // cooling down: no candidate, no probe, the session goes on
+        let cooling = test_tier(&[&p], 300);
+        cooling.mark_failed(&p);
+        let n = node();
+        assert!(timeout(
+            Duration::from_millis(600),
+            wait_priority_return(n.clone(), cooling, tip(), fast_repin())
+        )
+        .await
+        .is_err());
+        assert!(
+            n.claim_repin_attempt(Instant::now(), fast_repin().retry),
+            "no attempt spent"
+        );
+        // full (other nodes hold its session cap): same
+        let full = test_tier_capped(&[&p], 300, 1);
+        let _held = full.try_acquire(&p).unwrap();
+        assert!(timeout(
+            Duration::from_millis(600),
+            wait_priority_return(node(), full.clone(), tip(), fast_repin())
+        )
+        .await
+        .is_err());
+        assert_eq!(full.sessions(&p), 1, "the probe never took the last slot");
+        h.abort();
+        // a candidate that doesn't serve: one probe, then it cools down like a failed selection
+        // and this node won't probe again within the retry period
+        let (refuses, h2) = fake_live_peer(FakePeer::Full).await;
+        let tier = test_tier(&[&refuses], 300);
+        let n = node();
+        assert!(timeout(
+            Duration::from_millis(800),
+            wait_priority_return(n.clone(), tier.clone(), tip(), fast_repin())
+        )
+        .await
+        .is_err());
+        assert!(
+            tier.candidates().is_empty(),
+            "a failed probe cools the peer down"
+        );
+        assert!(!n.claim_repin_attempt(Instant::now(), fast_repin().retry));
+        h2.abort();
     }
 }
