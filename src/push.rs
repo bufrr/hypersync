@@ -4,13 +4,14 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::OwnedReadHalf;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tokio::time::timeout;
 
 use crate::priority::gwlog;
 use crate::protocol::{
     block_round, is_plausible_mainnet_round, read_live_frame_with_timeout, response_is_peer_full,
     round_lag_from_tip, RoundDedup, RoundForwardGate, ACTIVE_ROUND_MAX_LAG, GREET_FALSE,
+    MAX_LIVE_FRAME,
 };
 
 pub(crate) async fn serve(mut down: TcpStream, upstreams: Vec<String>) -> std::io::Result<()> {
@@ -124,7 +125,9 @@ pub(crate) async fn splice(down: TcpStream, upc: TcpStream) -> (u64, u64) {
     let (mut dr, mut dw) = down.into_split();
     let (mut ur, mut uw) = upc.into_split();
     let to_node = Arc::new(AtomicU64::new(0));
-    let mut h = {
+    // aborted on drop: a caller that cancels this future (e.g. a proxy failover) must not leave
+    // the upstream->node copy running and writing the old peer's bytes into the node
+    let mut h = AbortOnDrop({
         let to_node = to_node.clone();
         tokio::spawn(async move {
             let mut buf = vec![0u8; 256 * 1024];
@@ -140,13 +143,22 @@ pub(crate) async fn splice(down: TcpStream, upc: TcpStream) -> (u64, u64) {
                 to_node.fetch_add(n as u64, Ordering::Relaxed);
             }
         })
-    };
+    });
     let to_peer = tokio::select! {
         r = tokio::io::copy(&mut dr, &mut uw) => r.unwrap_or(0),
-        _ = &mut h => 0,
+        _ = &mut h.0 => 0,
     };
-    h.abort();
+    drop(h);
     (to_node.load(Ordering::Relaxed), to_peer)
+}
+
+// A spawned task that is aborted when its owner is dropped (a plain JoinHandle detaches).
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 // Pick the next non-bad upstream after `cur` (skips peers in cooldown). None => no healthy alternative.
@@ -168,6 +180,9 @@ struct ProxyState {
     generation: Arc<AtomicU64>,
     bad_until: Vec<AtomicU64>,
     base: std::time::Instant,
+    // last upstream->node byte on a raw splice (non-push stall monitor); restarted on a switch so
+    // a new upstream isn't judged by the silence of the one it replaced
+    last_data_ms: Arc<AtomicU64>,
 }
 
 impl ProxyState {
@@ -187,6 +202,7 @@ impl ProxyState {
             Some(j) => {
                 self.active.store(j, Ordering::Relaxed);
                 self.generation.fetch_add(1, Ordering::Relaxed);
+                self.last_data_ms.store(now, Ordering::Relaxed);
                 gwlog!(
                     "[proxy] {why} on {} -> failover -> {}",
                     self.hosts[idx],
@@ -225,17 +241,18 @@ pub(crate) async fn run_proxy(upstreams: Vec<String>, push: bool) {
         return;
     }
     let n = hosts.len();
+    // last upstream->node byte on a raw splice; only meaningful without --push (with --push the
+    // 4001 stream goes through serve_push and never stamps it, so a stall monitor on it would be
+    // blind to the main stream and fire on quiet side ports instead)
+    let last_data_ms = Arc::new(AtomicU64::new(0));
     let st = Arc::new(ProxyState {
         hosts: Arc::new(hosts),
         active: AtomicUsize::new(0),
         generation: Arc::new(AtomicU64::new(0)),
         bad_until: (0..n).map(|_| AtomicU64::new(0)).collect(),
         base: std::time::Instant::now(),
+        last_data_ms: last_data_ms.clone(),
     });
-    // last upstream->node byte on a raw splice; only meaningful without --push (with --push the
-    // 4001 stream goes through serve_push and never stamps it, so a stall monitor on it would be
-    // blind to the main stream and fire on quiet side ports instead)
-    let last_data_ms = Arc::new(AtomicU64::new(0));
     gwlog!(
         "[proxy] upstreams={:?}, active={}, push={}",
         st.hosts,
@@ -343,14 +360,14 @@ async fn proxy_conn(
         } else {
             PUSH_GREETING_WAIT
         };
-        match read_first_frame(&mut upc, wait).await {
+        match read_first_frame(&mut upc, wait, bootstrap).await {
             Ok(f) if response_is_peer_full(&f) => {
                 st.fail_over(idx, "peer full");
                 return;
             }
             Ok(f) => first = f,
             Err(e) => {
-                st.fail_over(idx, &format!("no greeting ({e})"));
+                st.fail_over(idx, &format!("first frame: {e}"));
                 return;
             }
         }
@@ -397,24 +414,30 @@ async fn proxy_conn(
     if push {
         // bootstrap (send_abci:true) or a side port under --push: transparent, and never stamped
         // into the (disabled) raw-splice stall monitor. Mid-bootstrap multi-source injection can't
-        // help (the abci_state/EVM-KV boundaries aren't detectable).
-        splice(down, upc).await;
+        // help (the abci_state/EVM-KV boundaries aren't detectable). It still follows failovers,
+        // like the 4001 push session, so the node's 4002 never talks to a different peer than
+        // its live stream.
+        tokio::select! {
+            _ = splice(down, upc) => {}
+            _ = wait_superseded(Some((st.generation.clone(), cur_gen))) => {}
+        }
         return;
     }
     let (mut dr, mut dw) = down.into_split();
     let (mut ur, mut uw) = upc.into_split();
     let ld = last_data_ms.clone();
     let base = st.base;
-    let up2 = tokio::spawn(async move {
+    // ends true when the UPSTREAM ended the stream, false when the node stopped taking it
+    let mut up2 = tokio::spawn(async move {
         let mut buf = vec![0u8; 262144];
         loop {
             match ur.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
+                Ok(0) | Err(_) => break true,
                 Ok(nb) => {
                     ld.store(base.elapsed().as_millis() as u64, Ordering::Relaxed);
                     match timeout(NODE_WRITE_TIMEOUT, dw.write_all(&buf[..nb])).await {
                         Ok(Ok(())) => {}
-                        _ => break,
+                        _ => break false,
                     }
                 }
             }
@@ -432,22 +455,55 @@ async fn proxy_conn(
         }
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
+    // the upstream ended the live stream while the node was still connected and reading: rotate
+    // it out (a node that stopped reading is not the upstream's fault; side ports are left alone
+    // — an RPC peer may close after answering)
+    if p == 4001 && up2.is_finished() && !n2u.is_finished() && (&mut up2).await.unwrap_or(false) {
+        st.fail_over(idx, "upstream closed the stream");
+    }
     up2.abort();
     n2u.abort();
 }
 
-// The upstream's first 4001 frame after the node's greeting: the whole frame when small (a live
-// greeting or a refusal status), else just its 5-byte header (the start of a multi-GB abci_state
-// frame, relayed as-is by the splice that follows).
-async fn read_first_frame(upc: &mut TcpStream, wait: Duration) -> std::io::Result<Vec<u8>> {
+// The upstream's first 4001 frame after the node's greeting. Live: the whole frame, at most 1000
+// bytes (a greeting or a refusal status). Bootstrap: just the 5-byte header of the abci_state
+// frame (relayed as-is by the splice that follows), which must be a real state frame — anything
+// up to 4MB is a status/decline (rate limit, not serving), as the gateway treats it.
+async fn read_first_frame(
+    upc: &mut TcpStream,
+    wait: Duration,
+    bootstrap: bool,
+) -> std::io::Result<Vec<u8>> {
     let mut hdr = [0u8; 5];
     timeout(wait, upc.read_exact(&mut hdr)).await??;
     let len = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as usize;
     let mut frame = hdr.to_vec();
-    if len <= 1000 {
-        let mut payload = vec![0u8; len];
-        timeout(wait, upc.read_exact(&mut payload)).await??;
-        frame.extend_from_slice(&payload);
+    if bootstrap && len > 4_000_000 {
+        if len > 1_500_000_000 {
+            return Err(std::io::Error::other(format!(
+                "implausible abci_state len={len}"
+            )));
+        }
+        return Ok(frame);
+    }
+    if bootstrap && len > 1000 {
+        // a longer status / decline text (rate limited, not serving) — not state either
+        return Err(std::io::Error::other(format!(
+            "not serving abci_state (status frame len={len})"
+        )));
+    }
+    if len > 1000 {
+        return Err(std::io::Error::other(format!(
+            "live first frame too large len={len}"
+        )));
+    }
+    let mut payload = vec![0u8; len];
+    timeout(wait, upc.read_exact(&mut payload)).await??;
+    frame.extend_from_slice(&payload);
+    if bootstrap && !response_is_peer_full(&frame) {
+        return Err(std::io::Error::other(format!(
+            "not serving abci_state (status frame len={len})"
+        )));
     }
     Ok(frame)
 }
@@ -473,16 +529,66 @@ const PUSH_GREETING_WAIT: Duration = Duration::from_secs(4);
 // - a stream that keeps sending frames (control / mempool / no-round data) but no higher block
 //   round for ACTIVE_BLOCK_STALL is stalled: the per-read IDLE timeout never fires on it, and
 //   hl-node's own read deadline doesn't either, so without this the node would never reconnect.
-const MAX_ACTIVE_ROUND_JUMP: u32 = 20_000;
-const ACTIVE_BLOCK_STALL: Duration = Duration::from_secs(30);
+pub(crate) const MAX_ACTIVE_ROUND_JUMP: u32 = 20_000;
+pub(crate) const ACTIVE_BLOCK_STALL: Duration = Duration::from_secs(30);
 
-struct BlockProgress {
-    last_round: u32,
+// Frames queued toward one node are bounded in BYTES, not count: a peer sending maximum-size
+// frames would otherwise park PUSH_MERGE_QUEUE_FRAMES x MAX_LIVE_FRAME in memory per session. Each
+// queued frame holds permits for its size until the writer has sent it to the node.
+pub(crate) const NODE_QUEUE_BYTES: usize = 64 << 20;
+pub(crate) type QueuedFrame = (Vec<u8>, OwnedSemaphorePermit);
+
+pub(crate) fn node_queue_budget() -> Arc<Semaphore> {
+    Arc::new(Semaphore::new(NODE_QUEUE_BYTES))
+}
+
+// Wait for budget for `frame`, then queue it. Err = the session's writer is gone.
+pub(crate) async fn queue_frame(
+    tx: &mpsc::Sender<QueuedFrame>,
+    budget: &Arc<Semaphore>,
+    frame: Vec<u8>,
+) -> Result<(), ()> {
+    let n = frame.len().clamp(1, NODE_QUEUE_BYTES) as u32;
+    let permit = budget.clone().acquire_many_owned(n).await.map_err(|_| ())?;
+    tx.send((frame, permit)).await.map_err(|_| ())
+}
+
+// The node-bound queue of one push session: frames plus their byte budget, sent like an mpsc
+// Sender (send(frame) waits for budget, then for a queue slot).
+#[derive(Clone)]
+pub(crate) struct NodeQueue {
+    tx: mpsc::Sender<QueuedFrame>,
+    budget: Arc<Semaphore>,
+}
+
+impl NodeQueue {
+    pub(crate) fn new(frames: usize) -> (Self, mpsc::Receiver<QueuedFrame>) {
+        let (tx, rx) = mpsc::channel(frames);
+        (
+            NodeQueue {
+                tx,
+                budget: node_queue_budget(),
+            },
+            rx,
+        )
+    }
+
+    pub(crate) async fn send(&self, frame: Vec<u8>) -> Result<(), ()> {
+        queue_frame(&self.tx, &self.budget, frame).await
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.tx.is_closed()
+    }
+}
+
+pub(crate) struct BlockProgress {
+    pub(crate) last_round: u32,
     at: Instant,
 }
 
 impl BlockProgress {
-    fn new(last_round: u32, now: Instant) -> Self {
+    pub(crate) fn new(last_round: u32, now: Instant) -> Self {
         BlockProgress {
             last_round,
             at: now,
@@ -490,7 +596,7 @@ impl BlockProgress {
     }
 
     // Record a decoded, plausible block round from the active stream.
-    fn on_round(&mut self, rnd: u32, now: Instant) -> Result<(), String> {
+    pub(crate) fn on_round(&mut self, rnd: u32, now: Instant) -> Result<(), String> {
         if self.last_round != 0 && rnd > self.last_round.saturating_add(MAX_ACTIVE_ROUND_JUMP) {
             return Err(format!(
                 "active block round jump round={rnd} prev={} max_jump={MAX_ACTIVE_ROUND_JUMP}",
@@ -506,7 +612,7 @@ impl BlockProgress {
 
     // Armed only once a block round has been seen, so a wire-format change that breaks
     // block_round (reported by no_block_rounds_alarm) doesn't tear every session down.
-    fn stalled(&self, now: Instant) -> bool {
+    pub(crate) fn stalled(&self, now: Instant) -> bool {
         self.last_round != 0 && now.duration_since(self.at) > ACTIVE_BLOCK_STALL
     }
 }
@@ -634,7 +740,7 @@ enum FrameKindSeen {
 
 fn spawn_active_pump(
     act_r: OwnedReadHalf,
-    tx: mpsc::Sender<Vec<u8>>,
+    tx: NodeQueue,
     forward_gate: Arc<tokio::sync::Mutex<RoundForwardGate>>,
     live_floor: Arc<AtomicU32>,
     net_round_tip: Arc<AtomicU32>,
@@ -660,9 +766,10 @@ pub(crate) async fn serve_push(node: TcpStream, active_conn: TcpStream, cfg: Pus
     let forward_gate = Arc::new(tokio::sync::Mutex::new(
         RoundForwardGate::with_last_forwarded(16_384, cfg.initial_last_forwarded),
     ));
-    // Each queued item is a complete block/control frame. Keep this small enough that a slow node
-    // writer backpressures upstream readers instead of allowing multi-GB queued Vecs.
-    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(PUSH_MERGE_QUEUE_FRAMES);
+    // Each queued item is a complete block/control frame, bounded by count AND bytes
+    // (NODE_QUEUE_BYTES): a slow node writer backpressures the upstream reader instead of letting
+    // queued frames grow to GBs.
+    let (tx, mut rx) = NodeQueue::new(PUSH_MERGE_QUEUE_FRAMES);
     let (node_r, mut node_w) = node.into_split();
     let (mut act_r, act_w) = active_conn.into_split();
     let active_round = Arc::new(AtomicU32::new(cfg.initial_last_forwarded));
@@ -836,7 +943,8 @@ pub(crate) async fn serve_push(node: TcpStream, active_conn: TcpStream, cfg: Pus
                 // Bounded like the node -> peer direction: a half-open node (no RST) would
                 // otherwise park write_all until the kernel gives up (~15 min), holding the
                 // active pin and the priority session the whole time.
-                Some(buf) => match timeout(NODE_WRITE_TIMEOUT, node_w.write_all(&buf)).await {
+                // the frame's budget permit is released when this arm ends, after the write
+                Some((buf, _permit)) => match timeout(NODE_WRITE_TIMEOUT, node_w.write_all(&buf)).await {
                     Ok(Ok(())) => {}
                     Ok(Err(e)) => break format!("node write failed: {e}"),
                     Err(_) => break "node write timeout".to_string(),
@@ -871,7 +979,7 @@ pub(crate) async fn serve_push(node: TcpStream, active_conn: TcpStream, cfg: Pus
 #[allow(clippy::too_many_arguments)]
 async fn pump_merge(
     mut r: tokio::net::tcp::OwnedReadHalf,
-    tx: mpsc::Sender<Vec<u8>>,
+    tx: NodeQueue,
     forward_gate: Arc<tokio::sync::Mutex<RoundForwardGate>>,
     live_floor: Arc<AtomicU32>,
     net_round_tip: Arc<AtomicU32>,
@@ -899,8 +1007,8 @@ async fn pump_merge(
         };
         let len = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as usize;
         let typ = hdr[4];
-        if len > 60_000_000 {
-            // Legit frames on a live (send_abci:false) channel are <=~1MB (greeting + blocks).
+        if len > MAX_LIVE_FRAME {
+            // Legit frames on a live (send_abci:false) channel are ~200KB (greeting + blocks).
             // From the ACTIVE peer an oversized length is a broken/hostile stream — error out so
             // the session tears down (never allocate a peer-controlled multi-GB buffer). From a
             // shadow, drain to stay frame-aligned and keep the accelerator alive.
@@ -992,7 +1100,7 @@ async fn pump_merge(
 #[allow(clippy::too_many_arguments)]
 async fn process_live_frame(
     frame: Vec<u8>,
-    tx: &mpsc::Sender<Vec<u8>>,
+    tx: &NodeQueue,
     forward_gate: &Arc<tokio::sync::Mutex<RoundForwardGate>>,
     live_floor: &Arc<AtomicU32>,
     net_round_tip: &Arc<AtomicU32>,
@@ -1121,6 +1229,79 @@ pub(crate) async fn run_relay(upstream: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn proxy_first_frame_rejects_status_frames_and_oversize() {
+        async fn upstream(reply: Vec<u8>) -> TcpStream {
+            let l = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let addr = l.local_addr().unwrap();
+            tokio::spawn(async move {
+                let (mut s, _) = l.accept().await.unwrap();
+                let _ = s.write_all(&reply).await;
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            });
+            TcpStream::connect(addr).await.unwrap()
+        }
+        let wait = Duration::from_secs(2);
+        // live: a greeting passes, a peer-full refusal is returned for the caller to rotate on
+        let mut c = upstream(vec![0, 0, 0, 1, 0, 3]).await;
+        assert_eq!(
+            read_first_frame(&mut c, wait, false).await.unwrap(),
+            [0, 0, 0, 1, 0, 3]
+        );
+        let mut c = upstream(vec![0, 0, 0, 1, 0, 4]).await;
+        assert!(response_is_peer_full(
+            &read_first_frame(&mut c, wait, false).await.unwrap()
+        ));
+        // live: an oversized first frame is refused without reading it
+        let mut c = upstream(vec![0, 0x10, 0, 0, 1]).await;
+        assert!(read_first_frame(&mut c, wait, false).await.is_err());
+        // bootstrap: a small status frame (rate limited / not serving) is a refusal, not state
+        let mut c = upstream(vec![0, 0, 0, 2, 0, 9, 9]).await;
+        assert!(read_first_frame(&mut c, wait, true).await.is_err());
+        // bootstrap: a real abci_state frame header is returned (body relayed by the splice)
+        let big = 1_300_000_000u32.to_be_bytes();
+        let mut c = upstream(vec![big[0], big[1], big[2], big[3], 1]).await;
+        assert_eq!(read_first_frame(&mut c, wait, true).await.unwrap().len(), 5);
+    }
+
+    #[tokio::test]
+    async fn cancelled_splice_stops_relaying_the_old_upstream() {
+        // a node connection and an upstream connection, each as a connected TCP pair
+        async fn pair() -> (TcpStream, TcpStream) {
+            let l = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let c = TcpStream::connect(l.local_addr().unwrap()).await.unwrap();
+            (c, l.accept().await.unwrap().0)
+        }
+        let (mut node, node_gw) = pair().await;
+        let (mut up_peer, up_gw) = pair().await;
+        // the old upstream keeps streaming
+        tokio::spawn(async move {
+            while up_peer.write_all(&[7u8; 1024]).await.is_ok() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+        // a failover cancels the relay, as proxy_conn's select! does
+        tokio::select! {
+            _ = splice(node_gw, up_gw) => panic!("splice ended on its own"),
+            _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+        }
+        // the node must see the relay close, not keep receiving the old peer's bytes
+        let mut buf = [0u8; 4096];
+        let eof = timeout(Duration::from_secs(2), async {
+            loop {
+                match node.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        })
+        .await;
+        assert!(
+            eof.is_ok(),
+            "upstream->node copy kept running after the splice was dropped"
+        );
+    }
 
     #[test]
     fn block_progress_detects_jumps_and_stalls() {

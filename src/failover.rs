@@ -10,10 +10,14 @@
 //     saw. A switch therefore replays the standby's buffered blocks starting EXACTLY at the block
 //     whose parent is the last block the node received, following parent links; if the standby
 //     cannot continue the chain gap-free, no switch happens.
-//   - live blocks are byte-identical across peers for the same round (verified on mainnet
-//     2026-10-20: 429/429 rounds across 6 peers, identical wire bytes). Each standby is checked
-//     block-by-block against what the active peer delivered; one mismatch drops it, and only a
-//     standby with a run of matching blocks may become active.
+//   - live blocks are identical across peers for the same round (verified on mainnet 2026-10-20:
+//     429/429 rounds across 6 peers, identical wire bytes). Each standby is checked block-by-block
+//     against what the active peer delivered, comparing the DECOMPRESSED block (a peer that
+//     re-compresses the same block still matches); a mismatch resets its verification and
+//     MAX_MISMATCHES in a row drop it (one bad block from the active can't evict every standby),
+//     and only a standby with MIN_VERIFIED matching blocks since may become active.
+//   - the active stream has the plain push session's progress guards (push::BlockProgress): a
+//     round jump or no higher block for ACTIVE_BLOCK_STALL marks it dead like a closed stream.
 //   - only one upstream feeds the node at a time; standby frames are never interleaved.
 //
 // Switch triggers:
@@ -24,8 +28,9 @@
 //   - dead:    the active stream errored/closed/idled — switch at once if a standby can continue,
 //              else end the session after ACTIVE_DEAD_GRACE (the node then reconnects as before).
 
+use std::collections::hash_map::RandomState;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::hash::Hasher;
+use std::hash::{BuildHasher, Hasher};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -34,16 +39,20 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
-use crate::priority::{gwlog, redact, PriorityTier};
+use crate::priority::{gwlog, redact, PrioritySession, PriorityTier};
 use crate::protocol::{
-    block_round_parent, is_plausible_mainnet_round, round_lag_from_tip, unix_secs,
-    ACTIVE_ROUND_MAX_LAG, GREET_FALSE,
+    block_round_parent, decompress_block, is_plausible_mainnet_round, read_live_frame_with_timeout,
+    response_is_peer_full, round_lag_from_tip, unix_secs, ACTIVE_ROUND_MAX_LAG, GREET_FALSE,
+    MAX_LIVE_FRAME,
 };
-use crate::push::PushConfig;
+use crate::push::{
+    node_queue_budget, queue_frame, BlockProgress, PushConfig, QueuedFrame, ACTIVE_BLOCK_STALL,
+    NODE_WRITE_TIMEOUT,
+};
 
 // ---- configuration ----
 
@@ -79,6 +88,14 @@ impl FailoverConfig {
                 .map(PathBuf::from),
         };
         if cfg.standbys > 0 {
+            if let Some(dir) = &cfg.status_dir {
+                if let Err(e) = std::fs::create_dir_all(dir) {
+                    gwlog!(
+                        "[gw] failover: status dir {} not usable: {e}",
+                        dir.display()
+                    );
+                }
+            }
             gwlog!(
                 "[gw] failover: standbys={} stall={}ms lag={}ms dwell={}ms rotate>{}ms/{}s status_dir={}",
                 cfg.standbys,
@@ -102,23 +119,31 @@ impl FailoverConfig {
     }
 }
 
-// A standby must match the active on this many blocks before it may take over (one is enough when
-// the active is already dead — waiting for more would only lengthen the outage).
+// A standby must match the active on this many blocks (since its last mismatch) before it may take
+// over, also when the active is dead: a standby connected for even a second has far more.
 const MIN_VERIFIED: u32 = 3;
+// Consecutive blocks a standby may disagree with the active on before it is dropped. One mismatch
+// only resets its verification: the active may be the one that is wrong.
+const MAX_MISMATCHES: u32 = 3;
 // Lead samples (active arrival - standby arrival, per common round) kept per standby.
 const LEAD_WINDOW: usize = 40;
 const LEAD_MIN_SAMPLES: usize = 20;
 // Forwarded-round hashes kept for verifying slower standbys (~70s of blocks).
 const FORWARDED_KEEP: usize = 1024;
-// Blocks a standby may hold ahead of the node before its oldest are discarded.
+// Blocks (and bytes) a standby may hold ahead of the node. Past either, its HIGHEST rounds are
+// discarded: the lowest ones continue the node's chain, which is what a switch replays.
 const AHEAD_KEEP: usize = 512;
+const AHEAD_BYTES: usize = 32 << 20;
+// Bytes of read-but-unprocessed frames each upstream reader may have queued to the event loop.
+const EVENT_BYTES_PER_READER: usize = 2 * MAX_LIVE_FRAME;
+// The active's answer to our live greeting (when live selection didn't already read it).
+const GREETING_WAIT: Duration = Duration::from_secs(4);
 const ACTIVE_DEAD_GRACE: Duration = Duration::from_secs(3);
 // After a switch away from a peer, or a dropped standby, don't reuse it for a while.
 const BAD_PEER_COOLDOWN: Duration = Duration::from_secs(120);
 const TICK: Duration = Duration::from_millis(25);
 // Upstream read deadline: blocks arrive ~14/s; a silent stream is closed and replaced.
 const UPSTREAM_IDLE: Duration = Duration::from_secs(5);
-const NODE_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const STANDBY_CONNECT_TIMEOUT: Duration = Duration::from_millis(1500);
 const STANDBY_RETRY: Duration = Duration::from_secs(2);
 // Candidates dialed at once when filling a standby slot: the first to accept wins, which favours
@@ -157,9 +182,13 @@ struct Ahead {
 
 struct Upstream {
     ip: String,
+    // blocks matched since the last mismatch
     verified: u32,
+    // consecutive blocks that differed from the active's
+    mismatches: u32,
     // blocks this upstream delivered that the node has not received yet, by round
     ahead: BTreeMap<u32, Ahead>,
+    ahead_bytes: usize,
     // ms the active was later than this standby, per common round (negative = standby later)
     leads: VecDeque<i64>,
     last_rx: Option<Instant>,
@@ -170,9 +199,59 @@ impl Upstream {
         Self {
             ip,
             verified: 0,
+            mismatches: 0,
             ahead: BTreeMap::new(),
+            ahead_bytes: 0,
             leads: VecDeque::new(),
             last_rx: None,
+        }
+    }
+
+    // Record one comparison against the active's block. Returns true once the standby has
+    // disagreed MAX_MISMATCHES times in a row (drop it).
+    fn compared(&mut self, matched: bool, lead_ms: i64) -> bool {
+        if matched {
+            self.verified += 1;
+            self.mismatches = 0;
+            self.push_lead(lead_ms);
+            false
+        } else {
+            self.verified = 0;
+            self.mismatches += 1;
+            self.mismatches >= MAX_MISMATCHES
+        }
+    }
+
+    // Buffer a block, then trim the highest rounds back under AHEAD_KEEP / AHEAD_BYTES.
+    fn insert_ahead(&mut self, round: u32, a: Ahead) {
+        self.ahead_bytes += a.frame.len();
+        if let Some(old) = self.ahead.insert(round, a) {
+            self.ahead_bytes -= old.frame.len();
+        }
+        while self.ahead.len() > AHEAD_KEEP || self.ahead_bytes > AHEAD_BYTES {
+            let Some((_, a)) = self.ahead.pop_last() else {
+                break;
+            };
+            self.ahead_bytes -= a.frame.len();
+        }
+    }
+
+    fn take_ahead(&mut self, round: u32) -> Option<Ahead> {
+        let a = self.ahead.remove(&round)?;
+        self.ahead_bytes -= a.frame.len();
+        Some(a)
+    }
+
+    // Discard buffered blocks at/below `floor` (the node already has that round).
+    fn trim_ahead(&mut self, floor: u32) {
+        while self
+            .ahead
+            .first_key_value()
+            .is_some_and(|(&r, _)| r <= floor)
+        {
+            if let Some((_, a)) = self.ahead.pop_first() {
+                self.ahead_bytes -= a.frame.len();
+            }
         }
     }
 
@@ -272,7 +351,7 @@ impl Core {
     }
 
     // Check every standby's buffered copy of a just-forwarded round against it, and drop buffered
-    // blocks the node already has. Returns standbys that delivered a different block.
+    // blocks the node already has. Returns standbys that disagreed MAX_MISMATCHES times in a row.
     fn settle_standbys(&mut self, round: u32, hash: u64, at: Instant) -> Vec<(u64, u32)> {
         let mut bad = Vec::new();
         let floor = self.last_forwarded;
@@ -280,18 +359,14 @@ impl Core {
             if id == self.active {
                 continue;
             }
-            if let Some(a) = u.ahead.remove(&round) {
-                if a.hash == hash {
-                    u.verified += 1;
-                    u.push_lead(at.saturating_duration_since(a.at).as_millis() as i64);
-                } else {
+            if let Some(a) = u.take_ahead(round) {
+                let lead = at.saturating_duration_since(a.at).as_millis() as i64;
+                if u.compared(a.hash == hash, lead) {
                     bad.push((id, round));
                 }
             }
             // anything at/below the node's tip that we didn't match is no longer useful
-            while u.ahead.first_key_value().is_some_and(|(&r, _)| r <= floor) {
-                u.ahead.pop_first();
-            }
+            u.trim_ahead(floor);
         }
         bad
     }
@@ -333,15 +408,14 @@ impl Core {
         u.last_rx = Some(at);
         if round <= last {
             if let Some((h, fat)) = fwd {
-                if h != hash {
+                let lead = -(at.saturating_duration_since(fat).as_millis() as i64);
+                if u.compared(h == hash, lead) {
                     return StandbyVerdict::Mismatch(round);
                 }
-                u.verified += 1;
-                u.push_lead(-(at.saturating_duration_since(fat).as_millis() as i64));
             }
             return StandbyVerdict::Ok;
         }
-        u.ahead.insert(
+        u.insert_ahead(
             round,
             Ahead {
                 parent,
@@ -350,9 +424,6 @@ impl Core {
                 frame,
             },
         );
-        while u.ahead.len() > AHEAD_KEEP {
-            u.ahead.pop_first();
-        }
         StandbyVerdict::Ok
     }
 
@@ -365,7 +436,6 @@ impl Core {
         if self.last_forwarded == 0 {
             return None;
         }
-        let min_verified = if active_dead { 1 } else { MIN_VERIFIED };
         // stall candidates rank by measured speed (median lead over the active), then by how much
         // of the chain they already hold — a momentarily long buffer alone can come from a peer
         // that is steadily slower than the others
@@ -375,7 +445,7 @@ impl Core {
             .last_switch
             .is_none_or(|t| now.saturating_duration_since(t) >= self.min_dwell);
         for (&id, u) in &self.ups {
-            if id == self.active || u.verified < min_verified {
+            if id == self.active || u.verified < MIN_VERIFIED {
                 continue;
             }
             let (n, first_at) = u.chain_len(self.last_forwarded);
@@ -423,7 +493,7 @@ impl Core {
             if a.parent != cur {
                 break;
             }
-            let a = u.ahead.remove(&r).expect("present");
+            let a = u.take_ahead(r).expect("present");
             chain.push((r, a));
             cur = r;
         }
@@ -520,6 +590,8 @@ enum Event {
         // (round, parent, hash) when the frame is a live block
         block: Option<(u32, u32, u64)>,
         at: Instant,
+        // the reader's EVENT_BYTES_PER_READER budget for this frame, held until it's handled
+        _budget: OwnedSemaphorePermit,
     },
     Closed {
         id: u64,
@@ -528,23 +600,44 @@ enum Event {
     Connected {
         ip: String,
         stream: TcpStream,
+        // the priority slot this standby holds (priority peers only)
+        prio: Option<PrioritySession>,
     },
     ConnectFailed,
     NodeBytes(Vec<u8>),
     NodeClosed(String),
 }
 
+// Called on every switch with the new active's ip and the priority slot it held as a standby.
+pub(crate) type OnSwitch = Box<dyn Fn(&str, Option<PrioritySession>) + Send + Sync>;
+
 pub(crate) struct FailoverCtx {
     pub(crate) node_label: String,
     pub(crate) pool: Arc<Mutex<Vec<String>>>,
     pub(crate) priority: Arc<PriorityTier>,
     // repin the node's active peer (4002 RPC routing) to this ip
-    pub(crate) on_switch: Box<dyn Fn(&str) + Send + Sync>,
+    // called with the new active's ip and the priority slot it held as a standby (moved, so the
+    // peer's session count never exceeds the cap or dips during a switch)
+    pub(crate) on_switch: OnSwitch,
 }
 
-fn frame_hash(frame: &[u8]) -> u64 {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    h.write(frame);
+// Hash of a live block's DECOMPRESSED content, so peers that compress the same block differently
+// still match. Keyed per process: a peer can't precompute a block that collides with another.
+// A payload that doesn't decompress is hashed as sent (identical bytes still match).
+fn block_hash(frame: &[u8]) -> u64 {
+    static KEYS: OnceLock<RandomState> = OnceLock::new();
+    let mut h = KEYS.get_or_init(RandomState::new).build_hasher();
+    let payload = &frame[5..];
+    match decompress_block(payload) {
+        Some(dec) => {
+            h.write_u8(1);
+            h.write(&dec);
+        }
+        None => {
+            h.write_u8(0);
+            h.write(frame);
+        }
+    }
     h.finish()
 }
 
@@ -553,11 +646,12 @@ fn classify(frame: &[u8]) -> Option<(u32, u32, u64)> {
         return None;
     }
     let (r, p) = block_round_parent(&frame[5..])?;
-    Some((r, p, frame_hash(frame)))
+    Some((r, p, block_hash(frame)))
 }
 
 fn spawn_reader(id: u64, mut r: OwnedReadHalf, ev: mpsc::Sender<Event>) -> JoinHandle<()> {
     tokio::spawn(async move {
+        let budget = Arc::new(Semaphore::new(EVENT_BYTES_PER_READER));
         let reason = loop {
             let mut hdr = [0u8; 5];
             match timeout(UPSTREAM_IDLE, r.read_exact(&mut hdr)).await {
@@ -566,9 +660,13 @@ fn spawn_reader(id: u64, mut r: OwnedReadHalf, ev: mpsc::Sender<Event>) -> JoinH
                 Err(_) => break format!("idle {}s", UPSTREAM_IDLE.as_secs()),
             }
             let len = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as usize;
-            if len > 60_000_000 {
+            if len > MAX_LIVE_FRAME {
                 break format!("oversized frame len={len}");
             }
+            // wait until the event loop has handled enough of this reader's earlier frames
+            let Ok(permit) = budget.clone().acquire_many_owned((5 + len) as u32).await else {
+                return;
+            };
             let mut frame = vec![0u8; 5 + len];
             frame[..5].copy_from_slice(&hdr);
             match timeout(UPSTREAM_IDLE, r.read_exact(&mut frame[5..])).await {
@@ -584,6 +682,7 @@ fn spawn_reader(id: u64, mut r: OwnedReadHalf, ev: mpsc::Sender<Event>) -> JoinH
                     frame,
                     block,
                     at,
+                    _budget: permit,
                 })
                 .await
                 .is_err()
@@ -595,11 +694,27 @@ fn spawn_reader(id: u64, mut r: OwnedReadHalf, ev: mpsc::Sender<Event>) -> JoinH
     })
 }
 
-// Dial candidates in order until one accepts a live (send_abci:false) stream.
+// A priority peer is dialed only with one of its HYPERSYNC_PRIORITY_MAX_SESSIONS slots, held for
+// the standby connection's lifetime. Outer None = skip (priority peer full); inner None = pool peer.
+fn standby_slot(priority: &Arc<PriorityTier>, ip: &str) -> Option<Option<PrioritySession>> {
+    if priority.contains(ip) {
+        priority.try_acquire(ip).map(Some)
+    } else {
+        Some(None)
+    }
+}
+
 // Dial candidates STANDBY_RACE at a time; the first to accept a live (send_abci:false) stream
-// wins and the rest are dropped.
-async fn connect_standby(candidates: Vec<String>, ev: mpsc::Sender<Event>) {
-    async fn attempt(ip: String) -> Option<(String, TcpStream)> {
+// wins and the rest are dropped (with any priority slots they took).
+async fn connect_standby(
+    candidates: Vec<String>,
+    priority: Arc<PriorityTier>,
+    ev: mpsc::Sender<Event>,
+) {
+    async fn attempt(
+        ip: String,
+        prio: Option<PrioritySession>,
+    ) -> Option<(String, TcpStream, Option<PrioritySession>)> {
         let dial = async {
             let mut s = TcpStream::connect((ip.as_str(), 4001)).await.ok()?;
             s.set_nodelay(true).ok();
@@ -612,17 +727,20 @@ async fn connect_standby(candidates: Vec<String>, ev: mpsc::Sender<Event>) {
             .await
             .ok()
             .flatten()
-            .map(|s| (ip, s))
+            .map(|s| (ip, s, prio))
     }
     for batch in candidates.chunks(STANDBY_RACE) {
         let mut set = tokio::task::JoinSet::new();
         for ip in batch {
-            set.spawn(attempt(ip.clone()));
+            let Some(prio) = standby_slot(&priority, ip) else {
+                continue;
+            };
+            set.spawn(attempt(ip.clone(), prio));
         }
         while let Some(joined) = set.join_next().await {
-            if let Ok(Some((ip, stream))) = joined {
+            if let Ok(Some((ip, stream, prio))) = joined {
                 set.abort_all();
-                let _ = ev.send(Event::Connected { ip, stream }).await;
+                let _ = ev.send(Event::Connected { ip, stream, prio }).await;
                 return;
             }
         }
@@ -638,9 +756,23 @@ async fn write_status(dir: &std::path::Path, node: &str, body: String) {
     }
 }
 
+// Writes the latest status snapshot off the event loop; ends when the session drops the sender.
+fn spawn_status_writer(dir: PathBuf, node: String) -> watch::Sender<String> {
+    let (stx, mut srx) = watch::channel(String::new());
+    tokio::spawn(async move {
+        while srx.changed().await.is_ok() {
+            let body = srx.borrow_and_update().clone();
+            write_status(&dir, &node, body).await;
+        }
+    });
+    stx
+}
+
 struct Live {
     reader: JoinHandle<()>,
     writer: OwnedWriteHalf,
+    // a standby's priority slot; handed to the gateway's pin (on_switch) when it becomes active
+    prio: Option<PrioritySession>,
 }
 
 // Serve a node's 4001 live stream from the active peer with hot standbys (see module docs).
@@ -660,18 +792,13 @@ pub(crate) async fn serve_failover(
     let greeting = match cfg.prefetched_greeting {
         Some(g) => g,
         None => {
-            let mut hdr = [0u8; 5];
-            if let Err(e) = act_r.read_exact(&mut hdr).await {
-                return format!("active greeting header read failed: {e}");
-            }
-            let len = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as usize;
-            if len > 1000 {
-                return format!("active greeting oversized len={len}");
-            }
-            let mut g = hdr.to_vec();
-            g.resize(5 + len, 0);
-            if let Err(e) = act_r.read_exact(&mut g[5..]).await {
-                return format!("active greeting payload read failed: {e}");
+            // bounded: nothing else watches the session (or the node leaving) until this returns
+            let g = match read_live_frame_with_timeout(&mut act_r, GREETING_WAIT, 1000).await {
+                Ok(g) => g,
+                Err(e) => return format!("active greeting read failed: {e}"),
+            };
+            if response_is_peer_full(&g) {
+                return "active peer full".to_string();
             }
             g
         }
@@ -682,9 +809,12 @@ pub(crate) async fn serve_failover(
         Err(_) => return "node greeting write failed: timeout".to_string(),
     }
 
-    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(256);
+    // node-bound frames are bounded in bytes (push::NODE_QUEUE_BYTES); each holds its permit
+    // until the writer has sent it
+    let budget = node_queue_budget();
+    let (tx, mut rx) = mpsc::channel::<QueuedFrame>(1024);
     let mut writer = tokio::spawn(async move {
-        while let Some(buf) = rx.recv().await {
+        while let Some((buf, _permit)) = rx.recv().await {
             match timeout(NODE_WRITE_TIMEOUT, node_w.write_all(&buf)).await {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => return format!("node write failed: {e}"),
@@ -693,32 +823,26 @@ pub(crate) async fn serve_failover(
         }
         "node writer closed".to_string()
     });
+    // event counts are a backstop; frame bytes are bounded per reader (EVENT_BYTES_PER_READER)
     let (ev_tx, mut ev_rx) = mpsc::channel::<Event>(1024);
     let node_reader = {
         let ev = ev_tx.clone();
         tokio::spawn(async move {
             let mut buf = vec![0u8; 65536];
-            loop {
+            let reason = loop {
                 match node_r.read(&mut buf).await {
                     Ok(0) => break "node outbound ended".to_string(),
                     Err(e) => break format!("node outbound read failed: {e}"),
                     Ok(n) => {
                         if ev.send(Event::NodeBytes(buf[..n].to_vec())).await.is_err() {
-                            break String::new();
+                            return;
                         }
                     }
                 }
-            }
+            };
+            let _ = ev.send(Event::NodeClosed(reason)).await;
         })
     };
-    let node_reader_ev = ev_tx.clone();
-    let node_reader = tokio::spawn(async move {
-        if let Ok(reason) = node_reader.await {
-            if !reason.is_empty() {
-                let _ = node_reader_ev.send(Event::NodeClosed(reason)).await;
-            }
-        }
-    });
 
     let mut core = Core::new(
         0,
@@ -737,6 +861,12 @@ pub(crate) async fn serve_failover(
     let mut switches: u64 = 0;
     let mut last_switch_desc = String::new();
     let mut last_status = Instant::now() - Duration::from_secs(10);
+    let status_tx = fo
+        .status_dir
+        .clone()
+        .map(|dir| spawn_status_writer(dir, fctx.node_label.clone()));
+    // the active stream's own round progress (jump / no-higher-block guards); re-based on a switch
+    let mut progress = BlockProgress::new(cfg.initial_last_forwarded, Instant::now());
     let mut last_summary = Instant::now();
     let mut last_rotate = Instant::now();
     let rot = Arc::new(AtomicUsize::new(0));
@@ -752,14 +882,14 @@ pub(crate) async fn serve_failover(
                 let (fwd, bad) = core.on_active_block($round, $hash, $at);
                 for (id, r) in bad {
                     if let Some(ip) = core.remove(id) {
-                        gwlog!("[gw] [{node_label}] failover standby {ip} dropped: block mismatch at round {r}");
+                        gwlog!("[gw] [{node_label}] failover standby {ip} dropped: {MAX_MISMATCHES} block mismatches in a row, last at round {r}");
                         cooldown.insert(ip, Instant::now() + BAD_PEER_COOLDOWN);
                     }
                     if let Some(l) = lives.remove(&id) {
                         l.reader.abort();
                     }
                 }
-                if fwd && tx.send($frame).await.is_err() {
+                if fwd && queue_frame(&tx, &budget, $frame).await.is_err() {
                     break "node writer closed".to_string();
                 }
             }
@@ -771,6 +901,8 @@ pub(crate) async fn serve_failover(
         Live {
             reader: spawn_reader(0, act_r, ev_tx.clone()),
             writer: act_w,
+            // the gateway holds the first active's slot
+            prio: None,
         },
     );
     // prefetched frames (the live-selection vetting read) come first, in order
@@ -788,17 +920,23 @@ pub(crate) async fn serve_failover(
                             failed = Some(format!("implausible prefetched round {r}"));
                             break;
                         }
+                        let now = Instant::now();
+                        // no standby is connected yet: a jump ends the session like a dead active
+                        if let Err(e) = progress.on_round(r, now) {
+                            failed = Some(format!("prefetched {e}"));
+                            break;
+                        }
                         let floor = live_floor.load(Ordering::Acquire);
                         if r > floor
-                            && core.on_active_block(r, h, Instant::now()).0
-                            && tx.send(frame).await.is_err()
+                            && core.on_active_block(r, h, now).0
+                            && queue_frame(&tx, &budget, frame).await.is_err()
                         {
                             failed = Some("node writer closed".to_string());
                             break;
                         }
                     }
                     None => {
-                        if tx.send(frame).await.is_err() {
+                        if queue_frame(&tx, &budget, frame).await.is_err() {
                             failed = Some("node writer closed".to_string());
                             break;
                         }
@@ -813,7 +951,7 @@ pub(crate) async fn serve_failover(
             ev = ev_rx.recv() => {
                 let Some(ev) = ev else { break "event channel closed".to_string() };
                 match ev {
-                    Event::Frame { id, frame, block, at } => {
+                    Event::Frame { id, frame, block, at, _budget } => {
                         if !lives.contains_key(&id) {
                             continue; // already dropped
                         }
@@ -840,11 +978,16 @@ pub(crate) async fn serve_failover(
                                 }
                                 if is_active {
                                     if active_dead.is_none() {
-                                        forward_active_block!(frame, r, h, at);
+                                        // a round jump would advance last_forwarded past every
+                                        // real block: never forward it, treat the active as dead
+                                        match progress.on_round(r, at) {
+                                            Ok(()) => forward_active_block!(frame, r, h, at),
+                                            Err(e) => active_dead = Some((Instant::now(), e)),
+                                        }
                                     }
                                 } else if let StandbyVerdict::Mismatch(mr) = core.on_standby_block(id, r, p, h, at, frame) {
                                     if let Some(ip) = core.remove(id) {
-                                        gwlog!("[gw] [{node_label}] failover standby {ip} dropped: block mismatch at round {mr}");
+                                        gwlog!("[gw] [{node_label}] failover standby {ip} dropped: {MAX_MISMATCHES} block mismatches in a row, last at round {mr}");
                                         cooldown.insert(ip, Instant::now() + BAD_PEER_COOLDOWN);
                                     }
                                     if let Some(l) = lives.remove(&id) { l.reader.abort(); }
@@ -852,7 +995,7 @@ pub(crate) async fn serve_failover(
                             }
                             None => {
                                 // control / non-block data: transparent from the active only
-                                if is_active && active_dead.is_none() && tx.send(frame).await.is_err() {
+                                if is_active && active_dead.is_none() && queue_frame(&tx, &budget, frame).await.is_err() {
                                     break "node writer closed".to_string();
                                 }
                             }
@@ -871,12 +1014,12 @@ pub(crate) async fn serve_failover(
                             }
                         }
                     }
-                    Event::Connected { ip, stream } => {
+                    Event::Connected { ip, stream, prio } => {
                         connecting = false;
                         let id = next_id;
                         next_id += 1;
                         let (r, w) = stream.into_split();
-                        lives.insert(id, Live { reader: spawn_reader(id, r, ev_tx.clone()), writer: w });
+                        lives.insert(id, Live { reader: spawn_reader(id, r, ev_tx.clone()), writer: w, prio });
                         core.add_standby(id, ip.clone());
                         gwlog!("[gw] [{node_label}] failover standby {ip} connected ({}/{})", core.standby_count(), fo.standbys);
                     }
@@ -901,6 +1044,15 @@ pub(crate) async fn serve_failover(
             }
             _ = tick.tick() => {
                 let now = Instant::now();
+                // an active that keeps sending (control / no-round frames) never idles out, so it
+                // must also deliver a higher block every ACTIVE_BLOCK_STALL
+                if active_dead.is_none() && progress.stalled(now) {
+                    active_dead = Some((now, format!(
+                        "no block above round {} for {}s",
+                        progress.last_round,
+                        ACTIVE_BLOCK_STALL.as_secs()
+                    )));
+                }
                 if let Some((id, reason)) = core.pick_switch(now, active_dead.is_some()) {
                     let old = core.active();
                     let old_ip = core.ip_of(old).unwrap_or("?").to_string();
@@ -909,7 +1061,7 @@ pub(crate) async fn serve_failover(
                         let n = frames.len();
                         let mut send_failed = false;
                         for f in frames {
-                            if tx.send(f).await.is_err() {
+                            if queue_frame(&tx, &budget, f).await.is_err() {
                                 send_failed = true;
                                 break;
                             }
@@ -925,7 +1077,10 @@ pub(crate) async fn serve_failover(
                             reason.as_str(),
                             core.last_forwarded
                         );
-                        (fctx.on_switch)(&new_ip);
+                        progress = BlockProgress::new(core.last_forwarded, now);
+                        // the standby's own priority slot moves to the gateway's pin
+                        let slot = lives.get_mut(&id).and_then(|l| l.prio.take());
+                        (fctx.on_switch)(&new_ip, slot);
                         core.remove(old);
                         if let Some(l) = lives.remove(&old) {
                             l.reader.abort();
@@ -933,7 +1088,7 @@ pub(crate) async fn serve_failover(
                         cooldown.insert(old_ip, now + BAD_PEER_COOLDOWN);
                         for (bid, r) in bad {
                             if let Some(ip) = core.remove(bid) {
-                                gwlog!("[gw] [{node_label}] failover standby {ip} dropped: block mismatch at round {r}");
+                                gwlog!("[gw] [{node_label}] failover standby {ip} dropped: {MAX_MISMATCHES} block mismatches in a row, last at round {r}");
                                 cooldown.insert(ip, now + BAD_PEER_COOLDOWN);
                             }
                             if let Some(l) = lives.remove(&bid) { l.reader.abort(); }
@@ -982,13 +1137,13 @@ pub(crate) async fn serve_failover(
                         next_connect = now + STANDBY_RETRY;
                     } else {
                         connecting = true;
-                        tokio::spawn(connect_standby(cands, ev_tx.clone()));
+                        tokio::spawn(connect_standby(cands, fctx.priority.clone(), ev_tx.clone()));
                     }
                 }
-                if let Some(dir) = &fo.status_dir {
+                if let Some(stx) = &status_tx {
                     if now.saturating_duration_since(last_status) >= Duration::from_secs(1) {
                         last_status = now;
-                        write_status(dir, &node_label, core.status_json(&node_label, switches, &last_switch_desc, now)).await;
+                        stx.send_replace(core.status_json(&node_label, switches, &last_switch_desc, now));
                     }
                 }
                 if now.saturating_duration_since(last_summary) >= Duration::from_secs(60) {
@@ -1123,7 +1278,7 @@ mod tests {
     }
 
     #[test]
-    fn unverified_standby_cannot_take_over_a_live_active() {
+    fn unverified_standby_cannot_take_over_even_a_dead_active() {
         let mut c = core();
         c.add_standby(1, "b".into());
         let t0 = Instant::now();
@@ -1131,24 +1286,59 @@ mod tests {
         c.on_standby_block(1, 100, 99, 100, t0, f(100)); // 1 verification
         c.on_standby_block(1, 101, 100, 101, t0, f(101));
         assert_eq!(c.pick_switch(t0 + 5000 * MS, false), None);
-        // ...but one verified block is enough once the active is dead
+        assert_eq!(c.pick_switch(t0, true), None, "MIN_VERIFIED also when dead");
+        // the active delivers 101 (settling the buffered copy: 2 verified) and then dies
+        assert!(c.on_active_block(101, 101, t0).0);
+        c.on_standby_block(1, 102, 101, 102, t0, f(102));
+        assert_eq!(c.pick_switch(t0, true), None, "2 < MIN_VERIFIED");
+        assert!(c.on_active_block(102, 102, t0).0);
+        c.on_standby_block(1, 103, 102, 103, t0, f(103));
+        assert_eq!(c.ups[&1].verified, MIN_VERIFIED);
         assert_eq!(c.pick_switch(t0, true), Some((1, SwitchReason::ActiveDead)));
     }
 
     #[test]
-    fn mismatching_standby_is_reported() {
+    fn standby_is_dropped_only_after_consecutive_mismatches() {
         let mut c = core();
         c.add_standby(1, "b".into());
         let t0 = Instant::now();
-        assert!(c.on_active_block(100, 100, t0).0);
-        assert_eq!(
-            c.on_standby_block(1, 100, 99, 999, t0, f(100)),
-            StandbyVerdict::Mismatch(100)
-        );
-        // ahead-of-active copy that later disagrees
-        c.on_standby_block(1, 101, 100, 555, t0, f(101));
-        let (_, bad) = c.on_active_block(101, 101, t0);
-        assert_eq!(bad, vec![(1, 101)]);
+        // standby behind the active: compared against the forwarded hashes
+        let standby = |c: &mut Core, r: u32, h: u64| {
+            assert!(c.on_active_block(r, r as u64, t0).0);
+            c.on_standby_block(1, r, r - 1, h, t0, f(r))
+        };
+        assert_eq!(standby(&mut c, 100, 100), StandbyVerdict::Ok);
+        assert_eq!(standby(&mut c, 101, 999), StandbyVerdict::Ok);
+        assert_eq!(c.ups[&1].verified, 0, "a mismatch resets verification");
+        assert_eq!(standby(&mut c, 102, 102), StandbyVerdict::Ok);
+        assert_eq!(c.ups[&1].mismatches, 0, "a match resets the run");
+        assert_eq!(standby(&mut c, 103, 999), StandbyVerdict::Ok);
+        assert_eq!(standby(&mut c, 104, 999), StandbyVerdict::Ok);
+        assert_eq!(standby(&mut c, 105, 999), StandbyVerdict::Mismatch(105));
+
+        // same rule for ahead-of-active copies settled when the active delivers the round
+        let mut c = core();
+        c.add_standby(1, "b".into());
+        for r in 100..=101 {
+            c.on_standby_block(1, r, r - 1, 555, t0, f(r));
+            let (_, bad) = c.on_active_block(r, r as u64, t0);
+            assert!(bad.is_empty());
+        }
+        c.on_standby_block(1, 102, 101, 555, t0, f(102));
+        let (_, bad) = c.on_active_block(102, 102, t0);
+        assert_eq!(bad, vec![(1, 102)]);
+    }
+
+    #[test]
+    fn a_mismatch_blocks_switching_until_reverified() {
+        let mut c = core();
+        c.add_standby(1, "b".into());
+        let t0 = Instant::now();
+        feed(&mut c, 100, 110, t0, 1, 30);
+        assert!(c.on_active_block(111, 111, t0).0);
+        c.on_standby_block(1, 111, 110, 999, t0, f(111));
+        c.on_standby_block(1, 112, 111, 112, t0, f(112));
+        assert_eq!(c.pick_switch(t0 + 5000 * MS, true), None);
     }
 
     #[test]
@@ -1225,5 +1415,201 @@ mod tests {
         feed(&mut c, 100, 130, t0, 1, 200);
         assert_eq!(c.ups[&1].median_lead(), Some(-200));
         assert_eq!(c.pick_switch(t0 + 10_000 * MS, false), None);
+    }
+
+    #[test]
+    fn ahead_buffer_keeps_the_lowest_rounds_within_its_byte_budget() {
+        let big = |r: u32| {
+            let mut v = vec![0u8; 8 << 20];
+            v[..4].copy_from_slice(&r.to_le_bytes());
+            v
+        };
+        let t0 = Instant::now();
+        // highest rounds first (e.g. a peer pushing far-ahead rounds): later, lower ones win
+        let mut c = core();
+        c.add_standby(1, "b".into());
+        for r in (101..=105).rev() {
+            c.on_standby_block(1, r, r - 1, r as u64, t0, big(r));
+        }
+        let u = &c.ups[&1];
+        assert_eq!(
+            u.ahead.keys().copied().collect::<Vec<_>>(),
+            vec![101, 102, 103, 104]
+        );
+        assert_eq!(u.ahead_bytes, 4 * (8 << 20));
+        // in order: the chain start a switch needs is kept, the newest is dropped
+        let mut c = core();
+        c.add_standby(1, "b".into());
+        for r in 101..=105 {
+            c.on_standby_block(1, r, r - 1, r as u64, t0, big(r));
+        }
+        assert_eq!(
+            c.ups[&1].ahead.keys().copied().collect::<Vec<_>>(),
+            vec![101, 102, 103, 104]
+        );
+        // settling / trimming / replay keep the byte count in step
+        c.last_forwarded = 100;
+        assert!(c.on_active_block(101, 101, t0).0);
+        assert_eq!(c.ups[&1].ahead_bytes, 3 * (8 << 20));
+        assert!(c.on_active_block(102, 999, t0).0);
+        assert_eq!(c.ups[&1].ahead_bytes, 2 * (8 << 20));
+        c.ups.get_mut(&1).unwrap().verified = MIN_VERIFIED;
+        let (frames, _) = c.switch_to(1, t0).unwrap();
+        assert_eq!(frames.len(), 2);
+        assert_eq!((c.ups[&1].ahead.len(), c.ups[&1].ahead_bytes), (0, 0));
+        // and a frame-count cap for small frames
+        let mut c = core();
+        c.add_standby(1, "b".into());
+        for r in 1..=AHEAD_KEEP as u32 + 50 {
+            c.on_standby_block(1, r, r - 1, r as u64, t0, f(r));
+        }
+        let u = &c.ups[&1];
+        assert_eq!(u.ahead.len(), AHEAD_KEEP);
+        assert_eq!(
+            u.ahead.last_key_value().map(|(&r, _)| r),
+            Some(AHEAD_KEEP as u32)
+        );
+    }
+
+    // a live block frame for `round`, as `compress` encodes the decompressed bytes
+    fn block_frame(round: u32, body: u8, compress: fn(&[u8]) -> Vec<u8>) -> Vec<u8> {
+        let mut dec = vec![0xaa; 16];
+        for r in [round, round - 1, round - 2] {
+            dec.push(0xfc);
+            dec.extend_from_slice(&r.to_le_bytes());
+        }
+        dec.extend(std::iter::repeat_n(body, 4000));
+        let payload = compress(&dec);
+        let mut frame = (payload.len() as u32).to_be_bytes().to_vec();
+        frame.push(1);
+        frame.extend_from_slice(&payload);
+        frame
+    }
+
+    // an LZ4 block of literals only: valid, but encoded differently than lz4_flex would
+    fn literals_only(dec: &[u8]) -> Vec<u8> {
+        let mut out = (dec.len() as u32).to_le_bytes().to_vec();
+        out.push(0xf0);
+        let mut n = dec.len() - 15;
+        while n >= 255 {
+            out.push(255);
+            n -= 255;
+        }
+        out.push(n as u8);
+        out.extend_from_slice(dec);
+        out
+    }
+
+    #[test]
+    fn block_hash_ignores_how_the_block_was_compressed() {
+        const R: u32 = 1_500_000_000;
+        let a = block_frame(R, 7, lz4_flex::block::compress_prepend_size);
+        let b = block_frame(R, 7, literals_only);
+        assert_ne!(a, b, "different wire bytes");
+        let (ra, pa, ha) = classify(&a).expect("block");
+        let (rb, pb, hb) = classify(&b).expect("block");
+        assert_eq!((ra, pa), (R, R - 1));
+        assert_eq!((rb, pb, hb), (ra, pa, ha));
+        let other = block_frame(R, 8, lz4_flex::block::compress_prepend_size);
+        assert_ne!(classify(&other).unwrap().2, ha, "different content");
+    }
+
+    #[test]
+    fn priority_standbys_need_a_free_slot() {
+        let tier = Arc::new(PriorityTier::new(
+            vec!["1.2.3.4".into()],
+            1,
+            Duration::from_millis(1500),
+            crate::priority::BootstrapPolicy::Fallback,
+        ));
+        assert!(
+            matches!(standby_slot(&tier, "9.9.9.9"), Some(None)),
+            "pool peer"
+        );
+        let held = standby_slot(&tier, "1.2.3.4").expect("free slot");
+        assert!(held.is_some());
+        assert_eq!(tier.sessions("1.2.3.4"), 1);
+        assert!(standby_slot(&tier, "1.2.3.4").is_none(), "full: skip it");
+        drop(held);
+        assert_eq!(tier.sessions("1.2.3.4"), 0);
+        assert!(standby_slot(&tier, "1.2.3.4").is_some());
+    }
+
+    #[tokio::test]
+    async fn reader_refuses_frames_over_max_live_frame() {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let (mut s, _) = l.accept().await.unwrap();
+            s.write_all(&[0, 0, 0, 2, 0, 9, 9]).await.unwrap();
+            let mut hdr = ((MAX_LIVE_FRAME + 1) as u32).to_be_bytes().to_vec();
+            hdr.push(1);
+            s.write_all(&hdr).await.unwrap();
+            s // keep the connection open: the reader must stop on the header alone
+        });
+        let (r, _w) = TcpStream::connect(addr).await.unwrap().into_split();
+        let (ev_tx, mut ev_rx) = mpsc::channel(8);
+        let _reader = spawn_reader(7, r, ev_tx);
+        match ev_rx.recv().await {
+            Some(Event::Frame {
+                id, frame, block, ..
+            }) => {
+                assert_eq!((id, frame, block), (7, vec![0, 0, 0, 2, 0, 9, 9], None));
+            }
+            _ => panic!("expected the small frame"),
+        }
+        match ev_rx.recv().await {
+            Some(Event::Closed { id, reason }) => {
+                assert_eq!(id, 7);
+                assert!(reason.contains("oversized"), "{reason}");
+            }
+            _ => panic!("expected Closed"),
+        }
+        drop(peer.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn active_peer_full_greeting_ends_the_session() {
+        let up = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = up.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = up.accept().await.unwrap();
+            s.write_all(&[0, 0, 0, 1, 0, 4]).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        });
+        let nl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let node_client = TcpStream::connect(nl.local_addr().unwrap()).await.unwrap();
+        let (node, _) = nl.accept().await.unwrap();
+        let active = TcpStream::connect(up_addr).await.unwrap();
+        let cfg = PushConfig {
+            hosts: Arc::new(vec!["127.0.0.1".into()]),
+            active_idx: 0,
+            port: 4001,
+            prefetched_greeting: None,
+            prefetched_frames: Vec::new(),
+            initial_last_forwarded: 0,
+            live_floor: Arc::new(AtomicU32::new(0)),
+            net_round_tip: Arc::new(AtomicU32::new(0)),
+            superseded: None,
+        };
+        let fctx = FailoverCtx {
+            node_label: "test".into(),
+            pool: Arc::new(Mutex::new(Vec::new())),
+            priority: Arc::new(PriorityTier::new(
+                Vec::new(),
+                0,
+                Duration::from_millis(1500),
+                crate::priority::BootstrapPolicy::Fallback,
+            )),
+            on_switch: Box::new(|_, _| {}),
+        };
+        let reason = timeout(
+            Duration::from_secs(5),
+            serve_failover(node, active, cfg, fctx),
+        )
+        .await
+        .expect("bounded");
+        assert_eq!(reason, "active peer full");
+        drop(node_client);
     }
 }

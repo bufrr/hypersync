@@ -8,6 +8,10 @@ use crate::gateway::{MIN_COMPLETE_BOOTSTRAP_BYTES, MIN_COMPLETE_BOOTSTRAP_FRAMES
 pub(crate) const GREET_FALSE: [u8; 8] = [0, 0, 0, 3, 0, 0, 0, 0]; // send_abci:false (live blocks; no rate-limited state)
 pub(crate) const GREET_TRUE: [u8; 8] = [0, 0, 0, 3, 0, 1, 0, 0]; // send_abci:true (full bootstrap stream)
 pub(crate) const MIN_PLAUSIBLE_MAINNET_ROUND: u32 = 1_000_000_000;
+// Largest frame accepted on a live (send_abci:false) 4001 stream. Live blocks average ~200KB
+// (2026-10); a bigger frame is a broken or hostile peer, and every queue that holds live frames is
+// also bounded in bytes (push::NODE_QUEUE_BYTES), so this only has to be generous for real blocks.
+pub(crate) const MAX_LIVE_FRAME: usize = 8_000_000;
 // Active-session freshness guard. peerd keeps a wider pool-level lag window so it does not churn the
 // whole candidate set, but a peer actively serving one node should not trail the multi-peer clustered
 // tip by minutes. 1500 rounds is ~100 seconds at the current mainnet rate, but the reference tip is
@@ -95,7 +99,7 @@ pub(crate) fn block_round_full(payload: &[u8]) -> Option<u32> {
 }
 
 // Full decode of a live-block payload, refusing a declared size no block can have.
-fn decompress_block(payload: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn decompress_block(payload: &[u8]) -> Option<Vec<u8>> {
     let declared = u32::from_le_bytes(payload.get(..4)?.try_into().ok()?) as usize;
     if declared > MAX_DECOMPRESSED_BLOCK {
         return None;
@@ -328,7 +332,6 @@ pub(crate) fn complete_frame_count(buf: &[u8]) -> Option<u64> {
 }
 
 pub(crate) fn max_block_round_in_frames(blob: &[u8]) -> Option<u32> {
-    const MAX_LIVE_BLOCK_FRAME: usize = 2_000_000;
     const MIN_ROUND_CLUSTER: usize = 4;
     const MAX_ROUND_CLUSTER_GAP: u32 = 10_000;
     let mut off = 0usize;
@@ -342,7 +345,7 @@ pub(crate) fn max_block_round_in_frames(blob: &[u8]) -> Option<u32> {
             break;
         }
         let payload = &blob[off..off + len];
-        if typ == 1 && len <= MAX_LIVE_BLOCK_FRAME {
+        if typ == 1 && len <= MAX_LIVE_FRAME {
             if let Some(round) = block_round(payload) {
                 // floor-only prefilter (no tip available here); the cluster scan below rejects
                 // isolated high artifacts
@@ -364,15 +367,16 @@ pub(crate) fn max_clustered_round(
     best_round_cluster(rounds, min_cluster, max_gap).map(|c| c[c.len() - 1])
 }
 
-// The second-highest round of the best cluster: the top of the cluster has to be backed by a
-// second peer, so one outlier inside the gap window (e.g. a peer reporting tip + 49_999) cannot
-// raise the result. Needs min_cluster >= 2.
+// The (lower) median round of the best cluster: as long as honest peers are the majority of
+// the cluster, the result is an honest round, so a minority inside the gap window (one peer, or
+// two colluding peers reporting tip + 49_999 and tip + 49_998) cannot raise it. With two members
+// this is the lower one, so a lone outlier is never the answer. Needs min_cluster >= 2.
 pub(crate) fn corroborated_clustered_round(
     rounds: &mut [u32],
     min_cluster: usize,
     max_gap: u32,
 ) -> Option<u32> {
-    best_round_cluster(rounds, min_cluster.max(2), max_gap).map(|c| c[c.len() - 2])
+    best_round_cluster(rounds, min_cluster.max(2), max_gap).map(|c| c[(c.len() - 1) / 2])
 }
 
 // The longest run of sorted rounds whose neighbours are within `max_gap` (ties go to the higher
@@ -587,6 +591,32 @@ mod tests {
             outlier.extend_from_slice(&make_frame(1, &make_block(round)));
         }
         assert_eq!(max_block_round_in_frames(&outlier), Some(1_055_000_023));
+    }
+
+    #[test]
+    fn live_tail_scan_counts_big_blocks_up_to_max_live_frame() {
+        // four 3MB live blocks: above the old 2MB scan cap, under MAX_LIVE_FRAME
+        let mut blob = Vec::new();
+        for r in 0..4u32 {
+            let mut dec = lz4_flex::block::decompress_size_prepended(&test_block_payload(
+                1_490_000_000 + r,
+                3,
+            ))
+            .unwrap();
+            let mut x = 0x9e37_79b9_7f4a_7c15u64 ^ u64::from(r);
+            dec.extend((0..3_000_000).map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            }));
+            let payload = lz4_flex::block::compress_prepend_size(&dec);
+            assert!(payload.len() > 2_000_000 && payload.len() <= MAX_LIVE_FRAME);
+            blob.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            blob.push(1);
+            blob.extend_from_slice(&payload);
+        }
+        assert_eq!(max_block_round_in_frames(&blob), Some(1_490_000_003));
     }
 
     #[test]

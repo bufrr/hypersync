@@ -102,7 +102,7 @@ async fn main() {
         let upstreams: Vec<String> = args
             .iter()
             .skip(2)
-            .find(|a| a.as_str() != "--push")
+            .find(|a| !a.starts_with("--"))
             .map(|s| split_csv(s))
             .unwrap_or_default();
         run_proxy(upstreams, push).await;
@@ -158,7 +158,12 @@ async fn main() {
     // Anything else must be a port (or nothing): an unknown subcommand or a typo would otherwise
     // silently start this testing-only mode on :4001 against hard-coded upstreams.
     let port: u16 = match args.get(1) {
-        None => 4001,
+        None => {
+            eprintln!(
+                "usage: hypersync <gateway|peerd|proxy|relay|cache|mock|fakenode|bench> ... | hypersync <port> [peers]"
+            );
+            std::process::exit(2);
+        }
         Some(a) => match a.parse() {
             Ok(p) => p,
             Err(_) => {

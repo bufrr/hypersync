@@ -530,10 +530,10 @@ pub(crate) fn extract_round_tip(contents: &str) -> Option<u32> {
 
 // Probe rounds are floor-only validated, so clustering is the only thing standing between a high
 // decode artifact and the published tip. The gateway rejects peers that trail the tip, so a tip
-// raised by one peer would starve every honest peer: publish the cluster's SECOND-highest round,
-// so the top has to be corroborated by another peer (a lone artifact, or one peer reporting up to
-// MAX_LIVE_ROUND_LAG above the rest, can't move it). No tip (null) is safe by comparison: the
-// gateway keeps its last reading and, if none comes for a while, drops to floor-only checks.
+// raised by a few peers would starve every honest peer: publish the cluster's MEDIAN round, so a
+// minority of the cluster (one artifact, or a couple of peers reporting up to MAX_LIVE_ROUND_LAG
+// above the rest) can't move it. No tip (null) is safe by comparison: the gateway keeps its last
+// reading and, if none comes for a while, drops to floor-only checks.
 fn clustered_probe_tip(probes: &[(String, LiveProbe)]) -> Option<u32> {
     let mut rounds: Vec<u32> = probes
         .iter()
@@ -1185,6 +1185,25 @@ mod tests {
         let (live, failed) = split_live_by_tip(probes, tip);
         assert_eq!(live.len(), 2);
         assert_eq!(failed, vec!["3.3.3.3".to_string()]);
+    }
+
+    #[test]
+    fn peerd_tip_resists_a_colluding_minority() {
+        let mk = |round: u32| LiveProbe {
+            blocks: 2,
+            max_round: Some(round),
+            ..LiveProbe::default()
+        };
+        let honest = 1_490_000_000u32;
+        let probes = vec![
+            ("1.1.1.1".to_string(), mk(honest)),
+            ("2.2.2.2".to_string(), mk(honest + 20)),
+            ("3.3.3.3".to_string(), mk(honest + 40)),
+            // two colluding peers inside the 50k cluster gap
+            ("4.4.4.4".to_string(), mk(honest + 49_998)),
+            ("5.5.5.5".to_string(), mk(honest + 49_999)),
+        ];
+        assert_eq!(clustered_probe_tip(&probes), Some(honest + 40));
     }
 
     #[test]

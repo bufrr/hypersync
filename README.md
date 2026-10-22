@@ -49,7 +49,7 @@ Point each node at the gateway in `override_gossip_config.json` and restart it:
 Gateway flags:
 
 - **`--push`** (recommended): live blocks pass through the gateway's checks (below) instead of a raw splice, and a bad upstream ends the session so the node reconnects to a fresh one.
-- **`--cache`**: keep the full bootstrap (~5.8 GB) in memory and on disk and replay it to cold-starting nodes, avoiding the per-IP abci_state rate limit. Costs ~6-19 GB of RAM, which pushed a 64 GB host shared with an hl-node past hl-visor's low-memory restart threshold — so it is off by default. Without it, a node restart bootstraps from a peer that is serving state right now (the gateway remembers recent state servers).
+- **`--cache`**: keep the full bootstrap (~5.8 GB) in memory and on disk and replay it to cold-starting nodes, avoiding the per-IP abci_state rate limit. Holds up to ~3 bootstraps at once (~17 GB: the cache plus a refresh capture and a fallback tap), which pushed a 64 GB host shared with an hl-node past hl-visor's low-memory restart threshold — so it is off by default. Without it, a node restart bootstraps from a peer that is serving state right now (the gateway remembers recent state servers).
 - **`--live N`**: reserved for multi-source push (disabled).
 
 ## Configuration
@@ -75,7 +75,7 @@ Set in `.env`; compose passes them through.
 
 **Picking a peer** (on every node 4001 connect):
 
-- Priority peers race first, each reserving a session slot before dialing; a full peer is skipped without penalty. The pool joins after the stage delay, 4 at a time.
+- Priority peers race first. Every connection to a priority peer — live, fallback, bootstrap, 4002 prewarm, hot standby — reserves one of its `HYPERSYNC_PRIORITY_MAX_SESSIONS` slots before dialing; a full peer is skipped without penalty. The pool joins after the stage delay, 4 at a time.
 - The first peer whose first live block is plausible and within 1,500 rounds of the network tip wins — all within 3.5 s, because hl-node abandons a connect ~5 s after greeting. If none qualifies, a fallback races up to 8 peers in the time left.
 - A priority peer that errors, refuses (`peer full`) or hangs is cooled down for 30 s.
 
@@ -86,9 +86,9 @@ Set in `.env`; compose passes them through.
 - falls more than 1,500 rounds behind the network tip, or sends an implausible round;
 - stops reading the node's outbound traffic for 5 s.
 
-Writes to a node are bounded to 30 s, so a stuck node can't hold a session open.
+Live frames over 8 MB end the session (blocks average ~200 KB), at most 64 MB of frames are queued per node, and writes to a node are bounded to 30 s, so neither a hostile peer nor a stuck node can make a session hold more.
 
-**Network round tip.** peerd publishes the second-highest round of the largest cluster of probed peers, so one peer can't move it. The gateway replaces its tip with each fresh reading and resets it to unknown (with a `WARN`) if none arrives for 15 minutes, rather than freezing on a stale value.
+**Network round tip.** peerd publishes the median round of the largest cluster of probed peers, so a minority of peers (even a few colluding ones) can't move it; a majority of the probed peers lying still could. The gateway replaces its tip with each fresh reading and resets it to unknown (with a `WARN`) if none arrives for 15 minutes, rather than freezing on a stale value.
 
 **Pool.** Re-read every 30 s; a missing or empty `peers.json` keeps the previous pool.
 
@@ -98,8 +98,8 @@ Writes to a node are bounded to 30 s, so a stuck node can't hold a session open.
 
 With `HYPERSYNC_FAILOVER_STANDBYS=N` (needs `--push`), each node session also streams live blocks from N standby peers into a buffer. When the active peer fails or falls behind, the gateway switches the node to a standby **on the same TCP connection**, instead of ending the session (which took ~11 s from last block to next).
 
-- **Safe switch:** the gateway replays the standby's buffered blocks starting from the block whose parent is the node's last block, following parent links; a standby with a gap isn't used. Every standby block is hashed and checked against the active's block for the same round (identical on all peers); one mismatch drops the standby, and a standby needs 3 matches before it can take over. Only one upstream feeds the node at a time.
-- **When:** the active errors, closes or is silent for 5 s; a verified standby has held the next block for `STALL_MS`; or a standby's median lead over the last 40 blocks exceeds `LAG_MS` (at most once per `DWELL_MS`).
+- **Safe switch:** the gateway replays the standby's buffered blocks starting from the block whose parent is the node's last block, following parent links; a standby with a gap isn't used. Every standby block is hashed after decompression and checked against the active's block for the same round (identical on all peers). A mismatch resets the standby's verification and 3 in a row drop it; a standby needs 3 matches before it can take over, even when the active has died. The active stays the reference, so an active that sends wrong blocks can still push its standbys out. Only one upstream feeds the node at a time.
+- **When:** the active errors, closes or is silent for 5 s, sends no higher block for 30 s, or jumps more than 20,000 rounds; a verified standby has held the next block for `STALL_MS`; or a standby's median lead over the last 40 blocks exceeds `LAG_MS` (at most once per `DWELL_MS`).
 - **After a switch:** 4002 is repinned to the new active, the old one is dropped for 120 s and a replacement standby is dialed (up to 4 at once, priority first). If no standby can continue within 3 s, the session ends as without standbys.
 
 | Variable | Default | Effect |
@@ -112,7 +112,7 @@ With `HYPERSYNC_FAILOVER_STANDBYS=N` (needs `--push`), each node session also st
 | `HYPERSYNC_FAILOVER_ROTATE_SECS` | `60` | Rotation check interval. |
 | `HYPERSYNC_FAILOVER_STATUS_DIR` | unset | Write `failover-<node-ip>.json` status there every second. |
 
-Each standby is one more live stream (~1-2 MB/s) from the gateway's IP.
+Each standby is one more live stream (~1-2 MB/s) from the gateway's IP, buffers at most 32 MB, and on a priority peer takes one of its session slots. `HYPERSYNC_FAILOVER_STATUS_DIR` is created if missing.
 
 ## HL P2P protocol notes
 

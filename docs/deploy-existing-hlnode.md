@@ -327,7 +327,7 @@ cat data/peers.json
 
 默认 compose 不开 `--cache`，不会生成 `data/bootstrap.cache`，可以直接跳过本节：node 冷启动时由 gateway
 透明转发一个正在提供 abci_state 的真实 peer。之所以默认关闭：内存 snapshot cache 加上它的 refresh race
-会占用 6-19GB，和约 34-40GB 的 hl-node 同机时，2026-10-12 把主机内存推过了 hl-visor 约 95% 的低内存
+当时会占用 6-19GB（现在最多同时约 3 份 bootstrap，约 17GB），和约 34-40GB 的 hl-node 同机时，2026-10-12 把主机内存推过了 hl-visor 约 95% 的低内存
 重启阈值，导致 hl-node 子进程反复重启。
 
 只有主机有足够内存余量、并且希望 node 重启时不依赖外部 peer 提供 abci_state 时，才开启 `--cache`：在

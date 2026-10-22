@@ -39,10 +39,10 @@ services:
     build: .
     container_name: hypersync-gw
     restart: unless-stopped
-    # worst case: cache blob ~6G + refresh transient ~6G + one (single-flight) fallback tap ~6G
-    # ≈ 18G (bootstrap was 5.8G on 2026-10, 4.5G in mid-2026; capture cap 9G); a cold-cache
-    # start can instead race up to 3 capture buffers. Concurrent
-    # replays to N nodes share one Arc'd blob — no extra memory per node.
+    # only matters with --cache: worst case ~3 bootstraps in memory (~5.8G each in 2026-10) =
+    # cache blob + 1 refresh capture + the single-flight fallback tap, or 2 cold captures + tap,
+    # ≈ 17.4G. Concurrent replays to N nodes share one Arc'd blob. Without --cache the gateway
+    # uses a few MB (+64MB per in-flight bootstrap).
     mem_limit: 24g
     stop_grace_period: 30s
     networks:

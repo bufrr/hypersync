@@ -16,7 +16,7 @@
 # restarted node appear to move backwards.
 #
 # Tier/mempool columns (QuickNode upgrade plan): tier = the node's current upstream tier from the
-# gateway's latest 60s stats line (prio = Tier P, pool = Tier O); starts = session starts per tier
+# gateway's latest active_peer= log field (prio = Tier P, pool = Tier O); starts = session starts per tier
 # in the window; mp_mb = mempool_txs bytes the node wrote in the window; drops/alert = --push
 # round-gate drops (sampled) and the wire-format alarm.
 #
@@ -58,9 +58,11 @@ for i in $(seq 1 "$N"); do
   NRC=$(sudo docker inspect -f '{{.RestartCount}}' "$NODE" 2>/dev/null)
   GWMEM=$(sudo docker stats --no-stream --format '{{.MemUsage}}' "$GW" 2>/dev/null | awk '{print $1}')
   NMEM=$(sudo docker stats --no-stream --format '{{.MemUsage}}' "$NODE" 2>/dev/null | awk '{print $1}')
-  LAST_STATS=$(printf '%s\n' "$GLOG" | grep -a 'active peer round lag' | tail -1)
-  case "$LAST_STATS" in
-    *active_peer=prio-*) TIER=prio ;;
+  # the node's current upstream: the last active_peer= the gateway logged for it, from the 60s
+  # serve_push stats line or, with hot standbys (no stats line), the session start/switch lines
+  LAST_ACTIVE=$(sudo docker logs "$GW" 2>&1 | grep -aoE 'active_peer=[^ ]+' | tail -1)
+  case "$LAST_ACTIVE" in
+    active_peer=prio-*) TIER=prio ;;
     "") TIER=none ;;
     *) TIER=pool ;;
   esac

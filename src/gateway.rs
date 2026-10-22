@@ -18,6 +18,7 @@ use crate::protocol::{
     finish_header_after_partial, is_plausible_mainnet_round, max_block_round_in_frames,
     read_header_or_timeout, read_live_frame_with_timeout, response_is_peer_full,
     round_lag_from_tip, unix_secs, HeaderRead, ACTIVE_ROUND_MAX_LAG, GREET_FALSE, GREET_TRUE,
+    MAX_LIVE_FRAME,
 };
 use crate::push::{serve_push, splice, PushConfig, NODE_WRITE_TIMEOUT};
 
@@ -50,7 +51,22 @@ struct CacheSink {
     disk_cache_path: Option<PathBuf>,
 }
 
+// A complete bootstrap ends in the live block stream (the capture stops only once the bulk
+// transfer has given way to the live trickle), so its tail has decodable block rounds. A capture
+// cut off inside the EVM-KV bulk has none, however close to MIN_COMPLETE_BOOTSTRAP_BYTES it is:
+// replaying it would fail the node's state load and loop every cooldown.
+fn has_live_tail(blob: &[u8]) -> bool {
+    max_block_round_in_frames(blob).is_some()
+}
+
 fn install_bootstrap_cache(blob: Vec<u8>, source: &str, sink: &CacheSink) {
+    if !has_live_tail(&blob) {
+        gwlog!(
+            "[gw] bootstrap capture from {source} rejected: {} MB but no live-block tail (cut off mid-bulk)",
+            blob.len() / 1_000_000
+        );
+        return;
+    }
     let blob = Arc::new(blob);
     gwlog!(
         "[gw] bootstrap captured from {source}: {} MB",
@@ -131,10 +147,16 @@ async fn splice_bootstrap_capture(
                     Ok(HeaderRead::TimedOut(off)) => {
                         install_bootstrap_cache(std::mem::take(&mut blob), source, &sink);
                         capture = false;
-                        if finish_header_after_partial(&mut ur, &mut hdr, off)
-                            .await
-                            .is_err()
-                        {
+                        // bounded: a stalled upstream must not hold this task (and the tap
+                        // permit) forever after the 20s header gap
+                        if !matches!(
+                            timeout(
+                                Duration::from_secs(10),
+                                finish_header_after_partial(&mut ur, &mut hdr, off)
+                            )
+                            .await,
+                            Ok(Ok(()))
+                        ) {
                             break;
                         }
                     }
@@ -244,6 +266,8 @@ struct BootstrapPeerSelection {
     payload_prefix: Vec<u8>,
     ip: String,
     abci_len: usize,
+    // a multi-GB relay holds a connection on the peer: its priority slot (None for pool peers)
+    prio_session: Option<PrioritySession>,
 }
 
 // Stage-labels a timeout+io result so selection failures can be summarized by cause instead of
@@ -373,10 +397,12 @@ async fn try_fast_bootstrap_peer(
         payload_prefix,
         ip,
         abci_len: len,
+        prio_session: None,
     })
 }
 
 async fn select_fast_bootstrap_peer(
+    priority: &Arc<PriorityTier>,
     peers: &[String],
     start: usize,
     greet: [u8; 8],
@@ -396,7 +422,25 @@ async fn select_fast_bootstrap_peer(
     loop {
         while launched < limit && in_flight < BOOTSTRAP_SELECT_MAX_INFLIGHT {
             let ip = peers[(start + launched) % n].clone();
-            set.spawn(try_fast_bootstrap_peer(ip, greet));
+            // a priority peer is only dialed with a free slot (HYPERSYNC_PRIORITY_MAX_SESSIONS)
+            let slot = if priority.contains(&ip) {
+                match priority.try_acquire(&ip) {
+                    Some(s) => Some(s),
+                    None => {
+                        launched += 1;
+                        fails.push(PRIORITY_CAP_REACHED.to_string());
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+            set.spawn(async move {
+                try_fast_bootstrap_peer(ip, greet).await.map(|mut s| {
+                    s.prio_session = slot;
+                    s
+                })
+            });
             launched += 1;
             in_flight += 1;
         }
@@ -476,7 +520,7 @@ async fn open_live_peer_session_with_greet(
             if remaining.is_zero() {
                 return Err(std::io::Error::other("no live block before deadline"));
             }
-            let frame = read_live_frame_with_timeout(&mut s, remaining, 8_000_000).await?;
+            let frame = read_live_frame_with_timeout(&mut s, remaining, MAX_LIVE_FRAME).await?;
             let round = if frame.len() >= 5 && frame[4] == 1 {
                 block_round(&frame[5..])
             } else {
@@ -762,9 +806,9 @@ async fn serve_push_repinned(
             let node = node.clone();
             let priority = priority.clone();
             let pin = pin.clone();
-            Box::new(move |ip: &str| {
+            Box::new(move |ip: &str, slot: Option<PrioritySession>| {
                 let p = node.pin_active(ip);
-                let s = priority.acquire(ip);
+                let s = slot.or_else(|| priority.try_acquire(ip));
                 *pin.lock().unwrap() = (p, s);
             })
         };
@@ -838,21 +882,33 @@ const FALLBACK_WAIT: Duration = NODE_LIVE_CONNECT_DEADLINE
     .saturating_sub(Duration::from_millis(200));
 const FALLBACK_MAX_PARALLEL: usize = 8;
 
+// The winner of a fallback race: (ip, connection, its greeting, its priority slot).
+type FallbackUpstream = (String, TcpStream, Vec<u8>, Option<PrioritySession>);
+
 // Race connect+greet against the first FALLBACK_MAX_PARALLEL candidates (priority first) and keep
 // the first that answers. Sequential dials can't fit the node's remaining budget: one hung peer
 // alone would take all of it. Priority peers that error are cooled down.
 async fn race_fallback_upstream(
-    priority: &PriorityTier,
+    priority: &Arc<PriorityTier>,
     candidates: Vec<String>,
     greet: [u8; 8],
     wait: Duration,
-) -> Option<(String, TcpStream, Vec<u8>)> {
+) -> Option<FallbackUpstream> {
     let deadline = Instant::now() + wait;
     let mut set = tokio::task::JoinSet::new();
     for ip in candidates.into_iter().take(FALLBACK_MAX_PARALLEL) {
+        // a priority peer is only dialed with a free slot, held by the winning connection
+        let slot = if priority.contains(&ip) {
+            match priority.try_acquire(&ip) {
+                Some(s) => Some(s),
+                None => continue,
+            }
+        } else {
+            None
+        };
         set.spawn(async move {
             let r = connect_and_greet_4001(&ip, greet, wait).await;
-            (ip, r)
+            (ip, r, slot)
         });
     }
     let mut won = None;
@@ -863,11 +919,11 @@ async fn race_fallback_upstream(
     .await
     {
         match joined {
-            Ok((ip, Ok((upc, greeting)))) => {
-                won = Some((ip, upc, greeting));
+            Ok((ip, Ok((upc, greeting)), slot)) => {
+                won = Some((ip, upc, greeting, slot));
                 break;
             }
-            Ok((ip, Err(e))) if priority.contains(&ip) => {
+            Ok((ip, Err(e), _)) if priority.contains(&ip) => {
                 priority.mark_failed(&ip);
                 gwlog!("[gw] 4001 fallback priority {ip} failed: {e}");
             }
@@ -896,7 +952,7 @@ async fn serve_push_4001_fallback(
 ) {
     let candidates = tiered_peers(&ctx.priority, peers, start);
     let tried = candidates.len().min(FALLBACK_MAX_PARALLEL);
-    let Some((ip, upc, greeting)) =
+    let Some((ip, upc, greeting, slot)) =
         race_fallback_upstream(&ctx.priority, candidates, greet, FALLBACK_WAIT).await
     else {
         gwlog!(
@@ -917,7 +973,7 @@ async fn serve_push_4001_fallback(
         &node,
         &ctx.priority,
         &ctx.pool,
-        None,
+        slot,
         "fallback",
         PushConfig {
             hosts: Arc::new(vec![ip.clone()]),
@@ -1082,25 +1138,35 @@ async fn fetch_client_blocks_from_peer(
         let mut rh = [0u8; 5];
         timeout(Duration::from_secs(6), upc.read_exact(&mut rh)).await??;
         let rl = u32::from_be_bytes([rh[0], rh[1], rh[2], rh[3]]) as usize;
-        // A client-block batch is a handful of blocks (~100 rounds/request); cap well above that
-        // but far below a memory hazard.
-        if rl > 64_000_000 {
+        // A client-block batch is ~100 rounds (mostly 8-20MB, 57MB seen); cap well above that but
+        // far below a memory hazard.
+        if rl > MAX_CLIENT_BLOCK_RESPONSE {
             return Err(std::io::Error::other("oversized client-block response"));
         }
-        let mut rp = vec![0u8; rl];
-        timeout(Duration::from_secs(12), upc.read_exact(&mut rp)).await??;
-        let mut frame = rh.to_vec();
-        frame.extend_from_slice(&rp);
-        if response_is_peer_only(&rp) {
+        // Every in-flight response buffer draws on one gateway-wide byte budget: up to 8 fetches
+        // x 9 attempts could otherwise buffer ~4.6GB at once.
+        let _bytes = timeout(
+            Duration::from_secs(6),
+            CLIENT_BLOCK_RESPONSE_BYTES.acquire_many((5 + rl) as u32),
+        )
+        .await
+        .map_err(|_| std::io::Error::other("client-block response byte budget exhausted"))?
+        .map_err(|_| std::io::Error::other("client-block response budget closed"))?;
+        // read straight into the frame that is forwarded (no second copy)
+        let mut frame = vec![0u8; 5 + rl];
+        frame[..5].copy_from_slice(&rh);
+        timeout(Duration::from_secs(12), upc.read_exact(&mut frame[5..])).await??;
+        let rp = &frame[5..];
+        if response_is_peer_only(rp) {
             return Ok(ClientBlockUpstreamResponse::PeerOnly);
         }
-        if response_has_no_client_blocks(&rp) {
+        if response_has_no_client_blocks(rp) {
             return Ok(ClientBlockUpstreamResponse::TerminalError(frame));
         }
-        if response_has_client_block_round_too_large(&rp) {
+        if response_has_client_block_round_too_large(rp) {
             return Ok(ClientBlockUpstreamResponse::TerminalError(frame));
         }
-        if response_has_client_block_round_too_small(&rp) {
+        if response_has_client_block_round_too_small(rp) {
             return Ok(ClientBlockUpstreamResponse::RangeTooSmall(frame));
         }
         Ok(ClientBlockUpstreamResponse::Frames(frame))
@@ -1211,7 +1277,7 @@ fn log_client_blocks(
 
 async fn fetch_client_blocks_raced(
     node: &NodeState,
-    priority: &PriorityTier,
+    priority: &Arc<PriorityTier>,
     peers: &[String],
     rr: &AtomicUsize,
     req: Arc<Vec<u8>>,
@@ -1224,9 +1290,20 @@ async fn fetch_client_blocks_raced(
     } else {
         wait_active_session(node, ACTIVE_4002_PIN_WAIT).await
     };
+    // A prewarmed attempt opens its own live relationship, i.e. one more connection on that
+    // peer: a priority peer is only used with a free slot, held for the attempt.
+    let prewarm_slot = |ip: &str| -> Option<Option<PrioritySession>> {
+        if priority.contains(ip) {
+            priority.try_acquire(ip).map(Some)
+        } else {
+            Some(None)
+        }
+    };
     let first = match (&active, &remembered) {
-        (Some(peer), _) => Some((Some(peer.clone()), peer.ip.clone(), false, "active")),
-        (None, Some(ip)) => Some((None, ip.clone(), true, "remembered")),
+        (Some(peer), _) => Some((Some(peer.clone()), peer.ip.clone(), false, "active", None)),
+        (None, Some(ip)) => {
+            prewarm_slot(ip).map(|slot| (None, ip.clone(), true, "remembered", slot))
+        }
         (None, None) => None,
     };
     let mut attempts = tokio::task::JoinSet::new();
@@ -1237,9 +1314,11 @@ async fn fetch_client_blocks_raced(
     // Stage 1: the pinned active (or the remembered RPC peer) ALONE within a grace budget (one
     // upstream connection in the common case; no candidate can outrace it with a cross-peer
     // response).
-    if let Some((tag, ip, prewarm, stage)) = first.clone() {
+    let first_ip = first.as_ref().map(|f| f.1.clone());
+    if let Some((tag, ip, prewarm, stage, slot)) = first {
         let req_for_first = req.clone();
         attempts.spawn(async move {
+            let _slot = slot;
             let result = fetch_client_blocks_from_peer(ip.clone(), req_for_first, prewarm)
                 .await
                 .1;
@@ -1269,14 +1348,15 @@ async fn fetch_client_blocks_raced(
     // Stage 2: hedge across pool candidates — only reached when the active is absent, failed,
     // or slow. Each candidate opens its own temporary live relationship (prewarm) first.
     for ip in client_block_peer_candidates(priority.candidates(), peers, rr, 8) {
-        if first
-            .as_ref()
-            .is_some_and(|(_, first_ip, _, _)| *first_ip == ip)
-        {
+        if first_ip.as_deref() == Some(ip.as_str()) {
             continue;
         }
+        let Some(slot) = prewarm_slot(&ip) else {
+            continue; // priority peer at its session cap
+        };
         let req = req.clone();
         attempts.spawn(async move {
+            let _slot = slot;
             let result = fetch_client_blocks_from_peer(ip.clone(), req, true).await.1;
             (None, ip, result)
         });
@@ -1398,6 +1478,9 @@ async fn serve_client_blocks(
 // few seconds (median ~2s, 20MB batches); past this the node is better off retrying.
 const CLIENT_BLOCK_FETCH_DEADLINE: Duration = Duration::from_secs(15);
 static CLIENT_BLOCK_FETCH_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(8);
+const MAX_CLIENT_BLOCK_RESPONSE: usize = 64_000_000;
+static CLIENT_BLOCK_RESPONSE_BYTES: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(512_000_000);
 
 // Capture a full bootstrap (abci_state + EVM KVs) VERBATIM from a serving state-server, frame-aligned,
 // stopping when the bulk transfer ends (byte rate collapses from the bulk's tens-of-MB/s to the
@@ -1425,6 +1508,8 @@ fn bootstrap_capture_err(
 pub(crate) const MIN_COMPLETE_BOOTSTRAP_BYTES: usize = 5_200_000_000;
 pub(crate) const MIN_COMPLETE_BOOTSTRAP_FRAMES: u64 = 4_000;
 const CACHE_REPLAY_COOLDOWN_SECS: u64 = 30;
+// How long a cache replay's live floor stays in force (it only covers the replay's backlog).
+const CACHE_FLOOR_TTL: Duration = Duration::from_secs(10 * 60);
 // hl-node's live/bootstrap reader times out in roughly five minutes once it sees the live
 // stream's first block. A very old cache forces too much client-block catch-up before that
 // first live round can be processed, so keep the replay window intentionally short.
@@ -1434,8 +1519,11 @@ const CACHE_REFRESH_RETRY_SECS: u64 = 30;
 const CACHE_REFRESH_FORCE_BEFORE_EXPIRY_SECS: u64 = 90;
 const MIN_BOOTSTRAP_RATE_BYTES_PER_SEC: f64 = 5_000_000.0;
 const MIN_LIVE_PEERS_FOR_CACHE_REFRESH: usize = 4;
-const FRESH_CACHE_REFRESH_MAX_INFLIGHT: usize = 2;
-const COLD_CACHE_REFRESH_MAX_INFLIGHT: usize = 3;
+// Concurrent capture buffers (~5.8GB each in 2026-10). Peak = these + the single-flight fallback
+// tap + the current blob (fresh case; a stale blob is freed first): 1 + 1 + 1 fresh, 2 + 1 cold,
+// i.e. ~3 bootstraps (~17.4GB) either way, inside compose's 24g mem_limit.
+const FRESH_CACHE_REFRESH_MAX_INFLIGHT: usize = 1;
+const COLD_CACHE_REFRESH_MAX_INFLIGHT: usize = 2;
 // The full bootstrap was ~4.5GB in mid-2026 and 5.8GB by 2026-10; keep headroom so growth does
 // not silently stop cache capture. Reserved as virtual memory only (see the capture loop).
 const MAX_BOOTSTRAP_CAPTURE_BYTES: usize = 9_000_000_000;
@@ -1545,6 +1633,12 @@ fn load_bootstrap_cache(path: &Path, now: u64) -> std::io::Result<Option<(Vec<u8
             "disk cache incomplete: {} bytes, {} frames",
             blob.len(),
             frames
+        )));
+    }
+    if !has_live_tail(&blob) {
+        return Err(std::io::Error::other(format!(
+            "disk cache has no live-block tail (cut off mid-bulk): {} bytes",
+            blob.len()
         )));
     }
     Ok(Some((blob, cached_at)))
@@ -2150,6 +2244,16 @@ fn live_greeting_for(greet: [u8; 8]) -> [u8; 8] {
     g
 }
 
+// The live floor a cache replay may set: the blob's tail round, unless the network tip is known
+// and the blob claims rounds beyond it (0 = no floor).
+fn bounded_cache_floor(cache_floor: u32, net_tip: u32) -> u32 {
+    if net_tip != 0 && cache_floor > net_tip.saturating_add(ACTIVE_ROUND_MAX_LAG) {
+        0
+    } else {
+        cache_floor
+    }
+}
+
 // Held for the duration of one cache replay to a node (set by cache_replay_blob): the replay can
 // outlast CACHE_REPLAY_COOLDOWN_SECS, and has_active_session() stays false until the live session
 // after it, so without this a second greet mid-replay would start a second full replay.
@@ -2259,14 +2363,30 @@ async fn replay_cache_then_live(
             .ok()
             .flatten()
             .unwrap_or(0);
-    if cache_floor != 0 {
-        raise_round_floor(&ctx.net_round_tip, cache_floor);
-        if raise_round_floor(&node.live_floor, cache_floor) {
-            gwlog!(
-                "[gw] [{}] cache replay live floor round={cache_floor}",
-                node.ip
-            );
-        }
+    // The floor only has to drop the live backlog the node already got from the blob, i.e. for
+    // the minutes right after this replay. It comes from the cache's own tail, so it must not
+    // outrank the network tip (a blob ending in fake high rounds would otherwise make this node
+    // drop every real block): bounded by the tip when known, never raises the tip, and cleared
+    // after CACHE_FLOOR_TTL.
+    let net_tip = ctx.net_round_tip.load(Ordering::Acquire);
+    let scanned_floor = cache_floor;
+    let cache_floor = bounded_cache_floor(scanned_floor, net_tip);
+    if scanned_floor != 0 && cache_floor == 0 {
+        gwlog!(
+            "[gw] [{}] cache replay floor {scanned_floor} ignored: above network tip {net_tip}",
+            node.ip
+        );
+    }
+    if cache_floor != 0 && raise_round_floor(&node.live_floor, cache_floor) {
+        gwlog!(
+            "[gw] [{}] cache replay live floor round={cache_floor}",
+            node.ip
+        );
+        let floor = node.live_floor.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(CACHE_FLOOR_TTL).await;
+            let _ = floor.compare_exchange(cache_floor, 0, Ordering::AcqRel, Ordering::Acquire);
+        });
     }
     let start = ctx.rr.fetch_add(1, Ordering::Relaxed);
     if let Some(live) = select_live_peer(
@@ -2337,6 +2457,8 @@ async fn transparent_bootstrap(
     greet: [u8; 8],
     ctx: GatewayCtx,
 ) {
+    // the node is getting fresh state from a peer: no earlier cache replay's floor applies
+    node.live_floor.store(0, Ordering::Release);
     // Advance rr by the whole scan window: retries during an incident sweep fresh pool peers
     // instead of re-dialing the same ~32 decliners (and their rate limits) shifted by one.
     let start = ctx
@@ -2350,7 +2472,8 @@ async fn transparent_bootstrap(
         &peers,
         start,
     );
-    let Some(selected) = select_fast_bootstrap_peer(&candidates, 0, greet).await else {
+    let Some(selected) = select_fast_bootstrap_peer(&ctx.priority, &candidates, 0, greet).await
+    else {
         gwlog!("[gw] [{}] no peer serving abci_state right now", node.ip);
         return;
     };
@@ -2360,6 +2483,7 @@ async fn transparent_bootstrap(
         payload_prefix,
         ip,
         abci_len,
+        prio_session: _prio_session,
     } = selected;
     gwlog!(
         "[gw] [{}] node bootstrap via {ip} tier={} (abci_state {} bytes, prefetched {} MB); active set",
@@ -2378,8 +2502,6 @@ async fn transparent_bootstrap(
         node: node.clone(),
         peer: active_peer,
     };
-    // a multi-GB relay holds a connection on the peer; count it against the per-peer session cap
-    let _prio_session = ctx.priority.acquire(&ip);
     let tap_permit = if ctx.cache_coldstart {
         ctx.capture_tap.clone().try_acquire_owned().ok()
     } else {
@@ -2522,7 +2644,7 @@ async fn handle_4001_live(
     let t0 = Instant::now();
     let candidates = tiered_peers(&ctx.priority, &peers, start);
     let tried = candidates.len().min(FALLBACK_MAX_PARALLEL);
-    let Some((ip, upc, greeting)) =
+    let Some((ip, upc, greeting, slot)) =
         race_fallback_upstream(&ctx.priority, candidates, greet, LIVE_SELECT_WAIT).await
     else {
         gwlog!(
@@ -2535,7 +2657,7 @@ async fn handle_4001_live(
         node: node.clone(),
         peer: node.pin_active(&ip),
     };
-    let _prio_session = ctx.priority.acquire(&ip);
+    let _prio_session = slot;
     gwlog!(
         "[gw] [{}] 4001 splice start peer={} tier={} connect_ms={} prio_sessions={}",
         node.ip,
@@ -2830,6 +2952,16 @@ pub(crate) async fn run_gateway(
                             None
                         }
                     };
+                    let raced = raced.filter(|(blob, ip)| {
+                        let ok = has_live_tail(blob);
+                        if !ok {
+                            gwlog!(
+                                "[gw] bootstrap capture via {ip} rejected: {} MB but no live-block tail (cut off mid-bulk)",
+                                blob.len() / 1_000_000
+                            );
+                        }
+                        ok
+                    });
                     let got = if let Some((blob, ip)) = raced {
                         gwlog!(
                             "[gw] bootstrap captured: {} MB via {} (raced)",
@@ -3173,6 +3305,54 @@ mod tests {
             vec!["bootstrap.cache", "bootstrap.tmpx", "peers.json"]
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn cache_floor_never_outranks_a_known_tip() {
+        let tip = 1_490_000_000;
+        assert_eq!(bounded_cache_floor(tip - 7_000, tip), tip - 7_000);
+        assert_eq!(
+            bounded_cache_floor(tip + ACTIVE_ROUND_MAX_LAG, tip),
+            tip + ACTIVE_ROUND_MAX_LAG
+        );
+        assert_eq!(
+            bounded_cache_floor(u32::MAX - 5, tip),
+            0,
+            "fake high tail rounds are ignored"
+        );
+        assert_eq!(
+            bounded_cache_floor(tip, 0),
+            tip,
+            "unknown tip: kept (cleared after its TTL)"
+        );
+    }
+
+    #[test]
+    fn a_capture_without_a_live_tail_is_not_installed() {
+        let sink = CacheSink {
+            boot_blob: Arc::new(Mutex::new(None)),
+            boot_blob_cached_at: Arc::new(AtomicU64::new(0)),
+            disk_cache_path: None,
+        };
+        // bulk-only frames (type 0 / undecodable) and no block rounds: cut off mid-bulk
+        let mut blob = Vec::new();
+        for _ in 0..8 {
+            blob.extend_from_slice(&1_000u32.to_be_bytes());
+            blob.push(1);
+            blob.extend(std::iter::repeat_n(0x5a, 1_000));
+        }
+        assert!(!has_live_tail(&blob));
+        install_bootstrap_cache(blob, "test", &sink);
+        assert!(sink.boot_blob.lock().unwrap().is_none());
+        // the same bulk followed by a few live blocks is a complete capture
+        let mut complete = Vec::new();
+        for r in 0..6u32 {
+            let payload = crate::protocol::test_block_payload(1_490_000_000 + r, 3);
+            complete.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            complete.push(1);
+            complete.extend_from_slice(&payload);
+        }
+        assert!(has_live_tail(&complete));
     }
 
     #[test]
@@ -3588,7 +3768,7 @@ mod tests {
         let refused = refused_addr().await;
         let tier = test_tier(&[&refused, &full], 300);
         let t0 = Instant::now();
-        let (ip, _, greeting) = race_fallback_upstream(
+        let (ip, _, greeting, _) = race_fallback_upstream(
             &tier,
             vec![refused.clone(), full.clone(), silent.clone(), ok.clone()],
             GREET_FALSE,
