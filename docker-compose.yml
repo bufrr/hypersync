@@ -60,6 +60,8 @@ services:
       HYPERSYNC_IP_BLACKLIST: "${HYPERSYNC_IP_BLACKLIST:-}"
       # hot-standby failover (README "Hot-standby failover"); 0 standbys = off
       HYPERSYNC_FAILOVER_STANDBYS: "${HYPERSYNC_FAILOVER_STANDBYS:-0}"
+      # pace reference stream for the lagging-peer guard (README "Dropping a peer"); 0 = off
+      HYPERSYNC_REFERENCE_STREAM: "${HYPERSYNC_REFERENCE_STREAM:-1}"
       HYPERSYNC_FAILOVER_STALL_MS: "${HYPERSYNC_FAILOVER_STALL_MS:-400}"
       HYPERSYNC_FAILOVER_LAG_MS: "${HYPERSYNC_FAILOVER_LAG_MS:-150}"
       HYPERSYNC_FAILOVER_STATUS_DIR: "${HYPERSYNC_FAILOVER_STATUS_DIR:-}"

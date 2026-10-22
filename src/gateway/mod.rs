@@ -1,13 +1,14 @@
 mod cache;
 mod client_blocks;
 mod node;
+mod pace;
 mod select;
 mod session;
 
 use crate::peerd::{extract_round_tip, read_node_peers};
 use crate::priority::{gwlog, PriorityTier};
 use crate::protocol::unix_secs;
-use crate::push::splice;
+use crate::push::{splice, FreshestRound, FRESHEST_STALE, PEER_LAG_GRACE, PEER_LAG_ROUNDS};
 use crate::util::lock;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -19,7 +20,7 @@ use tokio::time::timeout;
 
 // every submodule `use super::*`s: its siblings' pub(super) items resolve through these globs
 #[allow(unused_imports)]
-use self::{cache::*, client_blocks::*, node::*, select::*, session::*};
+use self::{cache::*, client_blocks::*, node::*, pace::*, select::*, session::*};
 
 // ---- full P2P gateway ----
 
@@ -90,6 +91,9 @@ struct GatewayCtx {
     pool: Arc<Mutex<Vec<String>>>,
     // pool peers whose last node session ended on an upstream fault, skipped for a while
     cooldown: Arc<PeerCooldown>,
+    // the freshest round any upstream stream of this gateway delivered (push sessions and the
+    // pace reference stream feed it; a session lagging it ends — see push::FreshestRound)
+    freshest: Arc<FreshestRound>,
     cache_coldstart: bool,
     push: bool,
 }
@@ -443,14 +447,36 @@ pub(crate) async fn run_gateway(node_peer_file: String, push: bool, cache_coldst
         boot_blob_cached_at,
         disk_cache_path,
         capture_tap,
-        net_round_tip,
+        net_round_tip: net_round_tip.clone(),
         state_servers: Arc::new(Mutex::new(Vec::new())),
         priority: priority.clone(),
         pool: pool.clone(),
         cooldown: Arc::new(PeerCooldown::default()),
+        freshest: Arc::new(FreshestRound::new(
+            PEER_LAG_ROUNDS,
+            PEER_LAG_GRACE,
+            FRESHEST_STALE,
+            net_round_tip.clone(),
+        )),
         cache_coldstart,
         push,
     };
+    // pace reference streams, so a lagging upstream is caught even with a single node session
+    // (HYPERSYNC_REFERENCE_STREAM=0 turns them off)
+    if push && std::env::var("HYPERSYNC_REFERENCE_STREAM").map_or(true, |v| v.trim() != "0") {
+        let in_use = Arc::new(Mutex::new(std::collections::HashSet::new()));
+        let cooled = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        for start in 0..PACE_REFERENCES {
+            tokio::spawn(run_pace_reference(
+                ctx.pool.clone(),
+                ctx.freshest.clone(),
+                ctx.net_round_tip.clone(),
+                in_use.clone(),
+                cooled.clone(),
+                start,
+            ));
+        }
+    }
 
     // listeners on 4000-4010. The node connects ONLY here; the gateway transparently relays each
     // connection to a real upstream peer. For the heavy channel (4001) bootstrap (send_abci:true)

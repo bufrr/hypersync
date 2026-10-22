@@ -349,7 +349,7 @@ async fn open_live_peer_session_with_greet(
 
 // Connect to a peer's 4001, send `greet`, and read+vet its greeting (peer-full rejected).
 // The single shared prefix for every live-relationship opener.
-async fn connect_and_greet_4001(
+pub(super) async fn connect_and_greet_4001(
     ip: &str,
     greet: [u8; 8],
     wait: Duration,

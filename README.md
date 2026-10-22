@@ -64,6 +64,7 @@ Set in `.env`; compose passes them through.
 | `HYPERSYNC_PRIORITY_STAGE_MS` | `1500` | How long priority peers race alone before the pool joins. |
 | `HYPERSYNC_PRIORITY_BOOTSTRAP` | `fallback` | Bootstrap from priority peers: `fallback` (after the pool), `prefer`, or `never`. |
 | `HYPERSYNC_FAILOVER_STANDBYS` | `0` | Hot standbys per node session (see below). |
+| `HYPERSYNC_REFERENCE_STREAM` | `1` | `0` turns off the two pace reference streams: extra live streams from pool peers (~1-2 MB/s each, nothing forwarded) that let even a single node session notice its peer falling behind. |
 | `HYPERSYNC_BOOT_CACHE` | next to peers.json | Disk path for `--cache`. |
 | `HYPERSYNC_DATA` | `./data` | peerd's data dir (`peers.json`, candidates). |
 | `HL_STATS_DIR` | – | Optional, comma-separated `tcp_lz4_stats` dirs of co-located nodes (extra discovery source). |
@@ -84,6 +85,7 @@ Set in `.env`; compose passes them through.
 - sends nothing for 10 s, or no higher block for 30 s;
 - sends a block more than 20,000 rounds above its previous one;
 - falls more than 1,500 rounds behind the network tip, or sends an implausible round;
+- stays more than 150 rounds (~10 s) behind the freshest round the gateway's live streams agree on, for 15 s — a peer that still sends, just slowly. "Agree" means streams from at least two different peers (other node sessions, two pace reference streams) have reached it, so one bad peer can't make honest sessions look lagging, and rounds more than ~20 min past peerd's network tip never count (nor any while that tip is unknown). Time when the node itself isn't taking blocks counts against the peer neither here nor for the 30 s stall;
 - stops reading the node's outbound traffic for 5 s.
 
 The peer is then skipped for 30 s (priority peers via their own cooldown), so the reconnect lands on a different one unless every peer is cooling down.

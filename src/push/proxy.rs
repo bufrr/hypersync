@@ -247,6 +247,7 @@ async fn proxy_conn(
                 net_round_tip: Arc::new(AtomicU32::new(0)),
                 superseded: Some((st.generation.clone(), cur_gen)),
                 end_when: None,
+                freshest: None,
             },
         )
         .await;

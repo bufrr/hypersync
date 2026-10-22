@@ -64,7 +64,9 @@ async fn serve_push_repinned(
     }
     if standbys > 0 {
         // hot-standby session: the active upstream can change mid-session, so the 4002 pin and the
-        // priority session accounting follow every switch
+        // priority session accounting follow every switch. Its standbys already race the active
+        // (a lagging one is switched away from), so the freshest-round guard isn't used.
+        cfg.freshest = None;
         let pin = Arc::new(Mutex::new((active_peer, _prio_session)));
         let on_switch = {
             let node = node.clone();
@@ -128,7 +130,7 @@ const SESSION_FAULT_COOLDOWN: Duration = Duration::from_secs(30);
 pub(super) struct PeerCooldown(Mutex<HashMap<String, Instant>>);
 
 impl PeerCooldown {
-    fn mark(&self, ip: &str, now: Instant) {
+    pub(super) fn mark(&self, ip: &str, now: Instant) {
         let mut m = lock(&self.0);
         m.retain(|_, until| *until > now);
         m.insert(ip.to_string(), now + SESSION_FAULT_COOLDOWN);
@@ -221,6 +223,7 @@ async fn serve_push_4001_fallback(
             net_round_tip: ctx.net_round_tip.clone(),
             superseded: None,
             end_when: None,
+            freshest: Some(ctx.freshest.clone()),
         },
     )
     .await;
@@ -349,6 +352,7 @@ async fn replay_cache_then_live(
                 net_round_tip: ctx.net_round_tip.clone(),
                 superseded: None,
                 end_when: None,
+                freshest: Some(ctx.freshest.clone()),
             },
         )
         .await;
@@ -547,6 +551,7 @@ pub(super) async fn handle_4001_live(
                     net_round_tip: ctx.net_round_tip.clone(),
                     superseded: None,
                     end_when: None,
+                    freshest: Some(ctx.freshest.clone()),
                 },
             )
             .await;

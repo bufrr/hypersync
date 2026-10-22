@@ -730,6 +730,7 @@ mod tests {
             net_round_tip: Arc::new(AtomicU32::new(0)),
             superseded: None,
             end_when: None,
+            freshest: None,
         };
         let fctx = FailoverCtx {
             node_label: "test".into(),
@@ -778,6 +779,7 @@ mod tests {
             net_round_tip: Arc::new(AtomicU32::new(0)),
             superseded: None,
             end_when: None,
+            freshest: None,
         };
         let fctx = FailoverCtx {
             node_label: "test".into(),
