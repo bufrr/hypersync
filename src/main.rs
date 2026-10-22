@@ -9,6 +9,7 @@
 // Upstreams may be "ip" (=> :4001) or "ip:port" (for local mock peers / custom ports).
 // Subcommand `mock <bind:port> <dir> <start> <end>` replays captured blocks[start..end] for testing.
 
+mod blacklist;
 mod failover;
 mod gateway;
 mod peerd;
@@ -55,6 +56,14 @@ async fn main() {
     // Priority (Tier P) IPs are redacted to prio-N in every log line of every mode (a sentry IP
     // can also be given to proxy/relay as a plain upstream).
     priority::init_redaction(&priority::priority_peers_from_env());
+    // Upstream IP blacklist for the modes that dial out but never reload it (proxy/relay/cache and
+    // the merge mode); gateway and peerd read it from their own data dir on every refresh.
+    if !matches!(args.get(1).map(String::as_str), Some("gateway" | "peerd")) {
+        blacklist::reload(
+            "main",
+            std::path::Path::new(&env::var("HYPERSYNC_DATA").unwrap_or_else(|_| "./data".into())),
+        );
+    }
     if args.get(1).map(|s| s.as_str()) == Some("bench") {
         let dir = args.get(2).cloned().unwrap_or_else(|| ".".into());
         let iters: usize = args
@@ -105,7 +114,7 @@ async fn main() {
             .find(|a| !a.starts_with("--"))
             .map(|s| split_csv(s))
             .unwrap_or_default();
-        run_proxy(upstreams, push).await;
+        run_proxy(blacklist::filtered(upstreams), push).await;
         return;
     }
     if args.get(1).map(|s| s.as_str()) == Some("cache") {

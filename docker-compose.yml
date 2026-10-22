@@ -55,6 +55,9 @@ services:
       HYPERSYNC_PRIORITY_BOOTSTRAP: "${HYPERSYNC_PRIORITY_BOOTSTRAP:-fallback}"
       HYPERSYNC_PRIORITY_MAX_SESSIONS: "${HYPERSYNC_PRIORITY_MAX_SESSIONS:-0}"
       HYPERSYNC_PRIORITY_STAGE_MS: "${HYPERSYNC_PRIORITY_STAGE_MS:-1500}"
+      # IPs never dialed; also read from /pd/ip_blacklist.txt (= ./data/ip_blacklist.txt, re-read
+      # every 30s)
+      HYPERSYNC_IP_BLACKLIST: "${HYPERSYNC_IP_BLACKLIST:-}"
       # hot-standby failover (README "Hot-standby failover"); 0 standbys = off
       HYPERSYNC_FAILOVER_STANDBYS: "${HYPERSYNC_FAILOVER_STANDBYS:-0}"
       HYPERSYNC_FAILOVER_STALL_MS: "${HYPERSYNC_FAILOVER_STALL_MS:-400}"
@@ -84,6 +87,8 @@ services:
       HL_SELF_IP: "${HL_SELF_IP:-}"
       # priority peers are excluded from discovery/probing (the gateway judges them itself)
       HYPERSYNC_PRIORITY_PEERS: "${HYPERSYNC_PRIORITY_PEERS:-}"
+      # never queried, probed or published (plus /pd/ip_blacklist.txt, re-read every cycle)
+      HYPERSYNC_IP_BLACKLIST: "${HYPERSYNC_IP_BLACKLIST:-}"
       # optional, comma-separated tcp_lz4_stats dirs (co-located only; see the colocated overlay)
       HL_STATS_DIR: "${HL_STATS_DIR:-}"
       # trim the steady-state pool: ~90 live peers is plenty of rotation headroom for cache refresh

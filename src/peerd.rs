@@ -3,7 +3,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::time::timeout;
 
 use crate::protocol::{
@@ -165,7 +164,7 @@ async fn probe_live(ip: &str) -> LiveProbe {
     let deadline = Instant::now() + Duration::from_secs(6);
     let mut s = match timeout(
         Duration::from_secs(4),
-        TcpStream::connect(format!("{ip}:4001")),
+        crate::blacklist::connect(&format!("{ip}:4001")),
     )
     .await
     {
@@ -352,7 +351,7 @@ async fn query_peers(ip: &str) -> Vec<String> {
     let fut = async {
         let mut s = timeout(
             Duration::from_secs(4),
-            TcpStream::connect(format!("{ip}:4002")),
+            crate::blacklist::connect(&format!("{ip}:4002")),
         )
         .await
         .ok()?
@@ -685,6 +684,29 @@ pub(crate) fn split_csv(v: &str) -> Vec<String> {
         .collect()
 }
 
+// Forget candidates (and their failure counts) that are now excluded — a newly blacklisted IP.
+// Returns how many candidates went.
+fn drop_excluded(
+    candidates: &mut HashSet<String>,
+    fail_counts: &mut std::collections::HashMap<String, u32>,
+    excluded: &HashSet<String>,
+) -> usize {
+    let before = candidates.len();
+    candidates.retain(|ip| !excluded.contains(ip));
+    fail_counts.retain(|ip, _| !excluded.contains(ip));
+    before - candidates.len()
+}
+
+// The previous peers.json's live servers minus excluded IPs, and whether any were excluded: a
+// previous pool naming a now-blacklisted IP is rewritten rather than kept.
+fn previous_live_pool(contents: &str, excluded: &HashSet<String>) -> (Vec<String>, bool) {
+    let mut ips = extract_ipv4(contents);
+    let before = ips.len();
+    ips.retain(|ip| !excluded.contains(ip));
+    let tainted = ips.len() < before;
+    (ips, tainted)
+}
+
 pub(crate) async fn run_peerd(interval: u64) {
     use std::collections::{HashMap, HashSet};
     let data_dir = std::env::var("HYPERSYNC_DATA").unwrap_or_else(|_| "./data".to_string());
@@ -738,6 +760,15 @@ pub(crate) async fn run_peerd(interval: u64) {
 
     loop {
         let cycle_start = Instant::now();
+        // Our own nodes, the priority peers and the blacklist (re-read every cycle) are never
+        // queried, probed or published. Candidates already held for a newly blacklisted IP go now.
+        crate::blacklist::reload("peerd", std::path::Path::new(&data_dir));
+        let mut excluded = self_ips.clone();
+        excluded.extend(crate::blacklist::ips());
+        let dropped = drop_excluded(&mut candidates, &mut fail_counts, &excluded);
+        if dropped > 0 {
+            eprintln!("[peerd] blacklist: dropped {dropped} candidate(s)");
+        }
         // 1. discover. Primary source: the gossipRootIps API (seed) + a query_peers crawl of the
         // gossip peer graph (self-contained, no co-located node needed). tcp_lz4_stats stays as an
         // optional supplementary source. Shelling out to curl (rather than an HTTPS client) keeps
@@ -770,7 +801,7 @@ pub(crate) async fn run_peerd(interval: u64) {
 
         if let Ok(Ok(o)) = roots {
             for ip in gossip_root_ips(&o) {
-                if !self_ips.contains(ip.as_str()) {
+                if !excluded.contains(ip.as_str()) {
                     candidates.insert(ip);
                 }
             }
@@ -780,7 +811,7 @@ pub(crate) async fn run_peerd(interval: u64) {
         let seeds: Vec<String> = candidates.iter().cloned().collect();
         let discovered = crawl_peers(
             seeds,
-            &self_ips,
+            &excluded,
             crawl_depth,
             crawl_max_queries,
             crawl_concurrency,
@@ -789,7 +820,7 @@ pub(crate) async fn run_peerd(interval: u64) {
         let mut crawl_new = 0usize;
         let mut crawl_capped = 0usize;
         for ip in discovered {
-            if self_ips.contains(&ip) || candidates.contains(&ip) {
+            if excluded.contains(&ip) || candidates.contains(&ip) {
                 continue;
             }
             if candidates.len() >= MAX_CANDIDATES {
@@ -803,7 +834,7 @@ pub(crate) async fn run_peerd(interval: u64) {
             // read_node_peers handles a directory (every <date> file) and applies the same
             // routable-IPv4 extraction; the files are a few KB each, sync read is fine here.
             for ip in read_node_peers(dir) {
-                if !self_ips.contains(ip.as_str()) {
+                if !excluded.contains(ip.as_str()) {
                     candidates.insert(ip);
                 }
             }
@@ -817,7 +848,8 @@ pub(crate) async fn run_peerd(interval: u64) {
         let previous_contents = tokio::fs::read_to_string(&out_path)
             .await
             .unwrap_or_default();
-        let previous_live_ips = extract_ipv4(&previous_contents);
+        let (previous_live_ips, previous_tainted) =
+            previous_live_pool(&previous_contents, &excluded);
         let mut all_candidates: Vec<String> = candidates.iter().cloned().collect();
         all_candidates.sort();
         let total_candidates = all_candidates.len();
@@ -883,8 +915,8 @@ pub(crate) async fn run_peerd(interval: u64) {
 
         let previous_live = previous_live_ips.len();
         let previous_trusted = previous_peer_pool_is_trusted(&previous_contents);
-        let kept_previous =
-            should_keep_previous_peer_pool(ranked.len(), previous_live, previous_trusted);
+        let kept_previous = !previous_tainted
+            && should_keep_previous_peer_pool(ranked.len(), previous_live, previous_trusted);
         // 3. write peers.json (hand-rolled: content is plain IPv4 strings, no escaping needed)
         let round_tip_json = round_tip
             .map(|round| round.to_string())
@@ -1506,6 +1538,30 @@ mod tests {
         );
         // only the non-self seed is queried
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn excluded_ips_leave_candidates_and_taint_the_previous_pool() {
+        let excluded: HashSet<String> = ["5.5.5.5".to_string()].into();
+        let mut candidates: HashSet<String> = ["5.5.5.5", "6.6.6.6"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mut fails: std::collections::HashMap<String, u32> =
+            [("5.5.5.5".to_string(), 3), ("6.6.6.6".to_string(), 1)].into();
+        assert_eq!(drop_excluded(&mut candidates, &mut fails, &excluded), 1);
+        assert_eq!(candidates, ["6.6.6.6".to_string()].into());
+        assert!(!fails.contains_key("5.5.5.5") && fails.contains_key("6.6.6.6"));
+
+        let prev = r#"{"live_servers":["6.6.6.6","5.5.5.5"],"round_tip":1}"#;
+        assert_eq!(
+            previous_live_pool(prev, &excluded),
+            (vec!["6.6.6.6".to_string()], true)
+        );
+        assert_eq!(
+            previous_live_pool(prev, &HashSet::new()),
+            (vec!["6.6.6.6".to_string(), "5.5.5.5".to_string()], false)
+        );
     }
 
     #[test]

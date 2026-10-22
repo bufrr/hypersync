@@ -49,7 +49,7 @@ Point each node at the gateway in `override_gossip_config.json` and restart it:
 Gateway flags:
 
 - **`--push`** (recommended): live blocks pass through the gateway's checks (below) instead of a raw splice, and a bad upstream ends the session so the node reconnects to a fresh one.
-- **`--cache`**: keep the full bootstrap (~5.8 GB) in memory and on disk and replay it to cold-starting nodes, avoiding the per-IP abci_state rate limit. Holds up to ~3 bootstraps at once (~17 GB: the cache plus a refresh capture and a fallback tap), which pushed a 64 GB host shared with an hl-node past hl-visor's low-memory restart threshold — so it is off by default. Without it, a node restart bootstraps from a peer that is serving state right now (the gateway remembers recent state servers).
+- **`--cache`**: keep the full bootstrap (~5.8 GB) in memory and on disk and replay it to cold-starting nodes, avoiding the per-IP abci_state rate limit. Holds up to ~3 bootstraps at once (~17 GB: the cache plus a refresh capture and a fallback tap), which pushed a 64 GB host shared with an hl-node past hl-visor's low-memory restart threshold — so it is off by default. A capture is installed only if it ends in live blocks, but a hostile state peer could still append a few fake ones to an incomplete state; enable it only with state peers you trust. Without it, a node restart bootstraps from a peer that is serving state right now (the gateway remembers recent state servers).
 - **`--live N`**: reserved for multi-source push (disabled).
 
 ## Configuration
@@ -59,6 +59,7 @@ Set in `.env`; compose passes them through.
 | Variable | Default | Meaning |
 |---|---|---|
 | `HL_SELF_IP` | – | Comma-separated public IPs of **all** your nodes; never used as upstreams. |
+| `HYPERSYNC_IP_BLACKLIST` | – | Comma-separated IPs never connected to (see [IP blacklist](#ip-blacklist)). |
 | `HYPERSYNC_PRIORITY_PEERS` | – | Comma-separated priority peer IPs. Logged as `prio-N`, never by IP. |
 | `HYPERSYNC_PRIORITY_MAX_SESSIONS` | `0` | Max node sessions per priority peer (`0` = unlimited). |
 | `HYPERSYNC_PRIORITY_STAGE_MS` | `1500` | How long priority peers race alone before the pool joins. |
@@ -75,7 +76,7 @@ Set in `.env`; compose passes them through.
 
 **Picking a peer** (on every node 4001 connect):
 
-- Priority peers race first. Every connection to a priority peer — live, fallback, bootstrap, 4002 prewarm, hot standby — reserves one of its `HYPERSYNC_PRIORITY_MAX_SESSIONS` slots before dialing; a full peer is skipped without penalty. The pool joins after the stage delay, 4 at a time.
+- Priority peers race first. Every upstream session the gateway opens on a priority peer — live, fallback, bootstrap, 4002 prewarm, hot standby — reserves one of its `HYPERSYNC_PRIORITY_MAX_SESSIONS` slots before dialing; a full peer is skipped without penalty. A node's own side connections (4000, 4002-4010) to its active peer belong to that session and take no extra slot. The pool joins after the stage delay, 4 at a time.
 - The first peer whose first live block is plausible and within 1,500 rounds of the network tip wins — all within 3.5 s, because hl-node abandons a connect ~5 s after greeting. If none qualifies, a fallback races up to 8 peers in the time left.
 - A priority peer that errors, refuses (`peer full`) or hangs is cooled down for 30 s.
 
@@ -93,6 +94,15 @@ Live frames over 8 MB end the session (blocks average ~200 KB), at most 64 MB of
 **Pool.** Re-read every 30 s; a missing or empty `peers.json` keeps the previous pool.
 
 **Client blocks (4002).** The node's active peer answers alone for 2 s, then up to 8 others are hedged in. 15 s per request, at most 8 requests at once.
+
+## IP blacklist
+
+IPv4 addresses hypersync never connects to, however they are advertised (gossip roots, the crawl, `peers.json`, the priority list, a CLI upstream). Exact match only.
+
+- Sources: `HYPERSYNC_IP_BLACKLIST` plus `ip_blacklist.txt` in the data dir (`data/ip_blacklist.txt` in compose, shared by gateway and peerd): one IP per line, `#` comments allowed.
+- The gateway re-reads the file every 30 s and peerd every cycle, so edits apply without a restart (`proxy`/`relay`/`cache` read `$HYPERSYNC_DATA` once at start).
+- Every upstream dial goes through the check. Candidates are also filtered so selection never wastes a dial or a priority slot on them.
+- A session already on a newly blacklisted peer ends within ~5 s of the reload (with hot standbys, it switches to a standby instead). peerd drops it from its candidates and rewrites `peers.json`.
 
 ## Hot-standby failover
 

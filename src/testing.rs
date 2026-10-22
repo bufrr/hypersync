@@ -140,7 +140,7 @@ async fn feed_state(
     btx: &tokio::sync::broadcast::Sender<Arc<Vec<u8>>>,
     cap: usize,
 ) -> std::io::Result<()> {
-    let mut s = TcpStream::connect(upstream).await?;
+    let mut s = crate::blacklist::connect(upstream).await?;
     s.set_nodelay(true).ok();
     s.write_all(&GREET_TRUE).await?;
     loop {
@@ -182,7 +182,7 @@ async fn feed_live(
     btx: &tokio::sync::broadcast::Sender<Arc<Vec<u8>>>,
     cap: usize,
 ) -> std::io::Result<()> {
-    let mut s = TcpStream::connect(upstream).await?;
+    let mut s = crate::blacklist::connect(upstream).await?;
     s.set_nodelay(true).ok();
     s.write_all(&GREET_FALSE).await?; // send_abci:false: continuous live blocks
                                       // a silent upstream must end the feed (so the caller reconnects) instead of freezing it
@@ -416,10 +416,16 @@ async fn fakenode_bootstrap(
 }
 
 // Read the live stream for `live_secs`, parsing block rounds. This live/resume connection is
-// what pins this fakenode's active peer on the gateway.
-async fn fakenode_live(gw_ip: &str, port: u16, live_secs: u64) -> (bool, u64, usize, u32, String) {
+// what pins this fakenode's active peer on the gateway, so the still-open socket is returned to
+// the caller (as the last tuple element) and kept alive across the follow-up 4002 RPC — closing
+// it before the RPC would drop the pinned session and make the RPC time out.
+async fn fakenode_live(
+    gw_ip: &str,
+    port: u16,
+    live_secs: u64,
+) -> (bool, u64, usize, u32, String, Option<TcpStream>) {
     let Some((mut c, src)) = fk_connect(gw_ip, port, &GREET_FALSE).await else {
-        return (false, 0, 0, 0, "?".to_string());
+        return (false, 0, 0, 0, "?".to_string(), None);
     };
     let deadline = Instant::now() + Duration::from_secs(live_secs);
     let mut buf = vec![0u8; 4_194_304];
@@ -445,7 +451,23 @@ async fn fakenode_live(gw_ip: &str, port: u16, live_secs: u64) -> (bool, u64, us
         frames += 1;
     }
     let pass = frames >= 10 && !rounds.is_empty();
-    (pass, frames, rounds.len(), max_round, src)
+    (pass, frames, rounds.len(), max_round, src, Some(c))
+}
+
+// Run the 4002 client-block RPC while the live 4001 connection stays open. Real HL nodes issue
+// 4002 queries with their 4001 live stream still up, and the gateway pins the per-source-IP
+// session to that live connection; taking `live_conn` by value and dropping it only after the RPC
+// returns holds the pinned session open for the whole query, then closes both sockets.
+async fn fakenode_rpc_with_live_held(
+    live_conn: Option<TcpStream>,
+    gw_ip: &str,
+    rpc_port: u16,
+    max_round: u32,
+    label: &str,
+) -> bool {
+    let result = fakenode_rpc(gw_ip, rpc_port, max_round, label).await;
+    drop(live_conn); // close the held-open live 4001 socket now that the RPC has completed
+    result
 }
 
 // Send a real client-block range query and classify the response. Any well-framed answer proves
@@ -544,12 +566,15 @@ pub(crate) async fn run_fakenode(args: &[String]) -> i32 {
 
     let (boot_pass, boot_bytes, boot_frames, boot_secs, src) =
         fakenode_bootstrap(&gw_ip, base_port, &label).await;
-    let (live_pass, live_frames, live_rounds, max_round, live_src) =
+    let (live_pass, live_frames, live_rounds, max_round, live_src, live_conn) =
         fakenode_live(&gw_ip, base_port, live_secs).await;
     let src = if src == "?" { live_src } else { src };
     let rpc = if do_rpc {
-        Some(fakenode_rpc(&gw_ip, base_port + 1, max_round, &label).await)
+        // Keep the live 4001 connection open for the duration of the 4002 RPC so the gateway's
+        // per-source-IP pinned session survives the query; the socket is closed right after.
+        Some(fakenode_rpc_with_live_held(live_conn, &gw_ip, base_port + 1, max_round, &label).await)
     } else {
+        drop(live_conn); // no RPC: close the live connection now
         None
     };
 
@@ -592,6 +617,73 @@ mod tests {
                 0x00, 0x00, 0x00, 0x0b, 0x00, 0x00, 0xfc, 0x8e, 0x26, 0x81, 0x50, 0xfc, 0xf1, 0x26,
                 0x81, 0x50
             ]
+        );
+    }
+
+    // Phase-overlap regression: the live 4001 socket must stay open until the 4002 RPC finishes.
+    // A stand-in gateway records (a) when it serves the RPC response and (b) when the live socket
+    // closes; `fakenode_rpc_with_live_held` must close the live socket only AFTER the RPC returns.
+    // Under the old sequential behavior (close live, then RPC) the live socket would close first
+    // and this ordering assertion would fail.
+    #[tokio::test]
+    async fn live_connection_held_open_until_rpc_completes() {
+        use tokio::sync::oneshot;
+
+        let live_l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live_port = live_l.local_addr().unwrap().port();
+        let rpc_l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let rpc_port = rpc_l.local_addr().unwrap().port();
+
+        let (live_eof_tx, live_eof_rx) = oneshot::channel::<Instant>();
+        let (rpc_done_tx, rpc_done_rx) = oneshot::channel::<Instant>();
+
+        // Stand-in gateway 4001: read the greeting, then read until the client closes the socket;
+        // stamp the moment the live connection is torn down.
+        tokio::spawn(async move {
+            let (mut s, _) = live_l.accept().await.unwrap();
+            let mut greet = [0u8; 8];
+            let _ = s.read_exact(&mut greet).await;
+            let mut buf = [0u8; 1024];
+            loop {
+                match s.read(&mut buf).await {
+                    Ok(0) | Err(_) => break, // EOF: fakenode closed the live socket
+                    _ => {}
+                }
+            }
+            let _ = live_eof_tx.send(Instant::now());
+        });
+
+        // Stand-in gateway 4002: read the 16-byte range request, reply with a well-framed
+        // non-"Peer-only" type-0 response so `fakenode_rpc` returns true; stamp the serve time.
+        tokio::spawn(async move {
+            let (mut s, _) = rpc_l.accept().await.unwrap();
+            let mut req = [0u8; 16];
+            s.read_exact(&mut req).await.unwrap();
+            let payload = b"ok";
+            let mut resp = (payload.len() as u32).to_be_bytes().to_vec();
+            resp.push(0u8); // type=0
+            resp.extend_from_slice(payload);
+            s.write_all(&resp).await.unwrap();
+            s.flush().await.unwrap();
+            let _ = rpc_done_tx.send(Instant::now());
+            // Hold the RPC socket briefly so the client-side read completes cleanly.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+
+        // Open the live 4001 connection exactly as the live phase does, then run the RPC while
+        // holding it open.
+        let (live_conn, _src) = fk_connect("127.0.0.1", live_port, &GREET_FALSE)
+            .await
+            .expect("live connect");
+        let ok =
+            fakenode_rpc_with_live_held(Some(live_conn), "127.0.0.1", rpc_port, 1, "test").await;
+        assert!(ok, "rpc should succeed against the stand-in gateway");
+
+        let rpc_done = rpc_done_rx.await.unwrap();
+        let live_eof = live_eof_rx.await.unwrap();
+        assert!(
+            live_eof >= rpc_done,
+            "live 4001 socket must close only after the 4002 RPC completes",
         );
     }
 }

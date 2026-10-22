@@ -131,8 +131,8 @@ impl PriorityTier {
         )
     }
 
-    // Priority peers worth trying now: not in cooldown and below the session cap, least-loaded
-    // first (ties keep the configured order).
+    // Priority peers worth trying now: not blacklisted, not in cooldown and below the session
+    // cap, least-loaded first (ties keep the configured order).
     pub(crate) fn candidates(&self) -> Vec<String> {
         self.candidates_at(Instant::now())
     }
@@ -141,7 +141,7 @@ impl PriorityTier {
         let cooldown = self.cooldown_until.lock().unwrap();
         let mut out: Vec<(usize, usize)> = Vec::new();
         for (i, until) in cooldown.iter().enumerate() {
-            if until.is_some_and(|t| now < t) {
+            if until.is_some_and(|t| now < t) || crate::blacklist::contains(&self.peers[i]) {
                 continue;
             }
             let load = self.sessions[i].load(Ordering::Acquire);
@@ -320,6 +320,16 @@ mod tests {
             Duration::from_millis(1500),
             BootstrapPolicy::Fallback,
         ))
+    }
+
+    #[test]
+    fn blacklisted_priority_peers_are_not_candidates() {
+        let _g = crate::blacklist::TEST_LOCK.blocking_lock();
+        let t = tier(&["192.0.2.50", "192.0.2.51"], 0);
+        crate::blacklist::install(&["192.0.2.50"]);
+        assert_eq!(t.candidates(), ["192.0.2.51"]);
+        crate::blacklist::install(&[]);
+        assert_eq!(t.candidates(), ["192.0.2.50", "192.0.2.51"]);
     }
 
     #[test]

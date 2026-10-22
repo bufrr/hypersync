@@ -20,7 +20,7 @@ use crate::protocol::{
     round_lag_from_tip, unix_secs, HeaderRead, ACTIVE_ROUND_MAX_LAG, GREET_FALSE, GREET_TRUE,
     MAX_LIVE_FRAME,
 };
-use crate::push::{serve_push, splice, PushConfig, NODE_WRITE_TIMEOUT};
+use crate::push::{serve_push, splice, PushConfig, MAX_ACTIVE_ROUND_JUMP, NODE_WRITE_TIMEOUT};
 
 // ---- full P2P gateway ----
 
@@ -35,7 +35,7 @@ fn bootstrap_capture_peers(
     let mut seen: HashSet<String> = live_peers.iter().cloned().collect();
     let mut out = live_peers;
     let candidates = peer_candidates_path(node_peer_file);
-    for ip in read_node_peers(candidates.to_string_lossy().as_ref()) {
+    for ip in crate::blacklist::filtered(read_node_peers(candidates.to_string_lossy().as_ref())) {
         if seen.insert(ip.clone()) {
             out.push(ip);
         }
@@ -110,6 +110,10 @@ async fn splice_bootstrap_capture(
     sink: CacheSink,
     capture_permit: tokio::sync::OwnedSemaphorePermit,
 ) {
+    let up_ip = upc
+        .peer_addr()
+        .map(|a| a.ip().to_string())
+        .unwrap_or_default();
     let (mut dr, mut dw) = down.into_split();
     let (mut ur, mut uw) = upc.into_split();
     let h = tokio::spawn(async move {
@@ -248,7 +252,11 @@ async fn splice_bootstrap_capture(
             }
         }
     });
-    let _ = tokio::io::copy(&mut dr, &mut uw).await;
+    // like splice: a source blacklisted mid-relay ends it (an unfinished capture is discarded)
+    tokio::select! {
+        _ = tokio::io::copy(&mut dr, &mut uw) => {}
+        _ = crate::blacklist::wait_blacklisted(&up_ip) => {}
+    }
     h.abort();
 }
 
@@ -352,7 +360,7 @@ async fn try_fast_bootstrap_peer(
     let mut upc = stage(
         timeout(
             Duration::from_secs(5),
-            TcpStream::connect(format!("{ip}:4001")),
+            crate::blacklist::connect(&format!("{ip}:4001")),
         )
         .await,
         "connect",
@@ -502,6 +510,16 @@ const VET_KEEP_MAX_BYTES: usize = 8_000_000;
 const LIVE_SELECT_WAIT: Duration = Duration::from_millis(3500);
 const LIVE_SELECT_MAX_PARALLEL: usize = 4;
 
+// A candidate's first live block becomes the session's round baseline, so one far above the
+// network tip would be forwarded and then make every honest block look like a stall. The tip lags
+// by at most ~15 min (~13k rounds at ~15 rounds/s) before it resets to unknown, well inside this
+// margin, so a stale tip can't reject honest peers.
+const VET_MAX_ROUNDS_ABOVE_TIP: u32 = 2 * MAX_ACTIVE_ROUND_JUMP;
+
+fn first_round_far_above_tip(round: u32, net_tip: u32) -> bool {
+    net_tip != 0 && round > net_tip.saturating_add(VET_MAX_ROUNDS_ABOVE_TIP)
+}
+
 async fn open_live_peer_session_with_greet(
     ip: String,
     greet: [u8; 8],
@@ -535,7 +553,10 @@ async fn open_live_peer_session_with_greet(
                 continue;
             };
             {
-                if !is_plausible_mainnet_round(round, net_tip) || round <= min_round_exclusive {
+                if !is_plausible_mainnet_round(round, net_tip)
+                    || round <= min_round_exclusive
+                    || first_round_far_above_tip(round, net_tip)
+                {
                     continue;
                 }
                 // A fresh 4001 stream starts at the peer's own tip, so a lagged first block means a
@@ -577,7 +598,7 @@ async fn connect_and_greet_4001(
     } else {
         format!("{ip}:4001")
     };
-    let mut s = timeout(wait, TcpStream::connect(addr)).await??;
+    let mut s = timeout(wait, crate::blacklist::connect(&addr)).await??;
     s.set_nodelay(true).ok();
     timeout(wait, s.write_all(&greet)).await??;
     let greeting = read_live_greeting_with_timeout(&mut s, wait).await?;
@@ -1046,7 +1067,7 @@ async fn dial_active(
         }
     };
     let up = format!("{}:{}", target.ip, port);
-    match timeout(Duration::from_secs(5), TcpStream::connect(&up)).await {
+    match timeout(Duration::from_secs(5), crate::blacklist::connect(&up)).await {
         Ok(Ok(c)) => {
             c.set_nodelay(true).ok();
             Some(c)
@@ -1109,11 +1130,26 @@ fn client_block_peer_candidates(
     out
 }
 
+// A 4002 response frame together with its share of CLIENT_BLOCK_RESPONSE_BYTES: the budget is
+// held for as long as the frame exists (kept as a fallback answer, being written to the node),
+// not just while it is read.
+struct BudgetedFrame {
+    bytes: Vec<u8>,
+    _budget: tokio::sync::SemaphorePermit<'static>,
+}
+
+impl std::ops::Deref for BudgetedFrame {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
 enum ClientBlockUpstreamResponse {
-    Frames(Vec<u8>),
+    Frames(BudgetedFrame),
     PeerOnly,
-    RangeTooSmall(Vec<u8>),
-    TerminalError(Vec<u8>),
+    RangeTooSmall(BudgetedFrame),
+    TerminalError(BudgetedFrame),
 }
 
 async fn fetch_client_blocks_from_peer(
@@ -1129,7 +1165,7 @@ async fn fetch_client_blocks_from_peer(
         };
         let mut upc = timeout(
             Duration::from_secs(4),
-            TcpStream::connect(format!("{ip}:4002")),
+            crate::blacklist::connect(&format!("{ip}:4002")),
         )
         .await??;
         upc.set_nodelay(true).ok();
@@ -1145,7 +1181,7 @@ async fn fetch_client_blocks_from_peer(
         }
         // Every in-flight response buffer draws on one gateway-wide byte budget: up to 8 fetches
         // x 9 attempts could otherwise buffer ~4.6GB at once.
-        let _bytes = timeout(
+        let budget = timeout(
             Duration::from_secs(6),
             CLIENT_BLOCK_RESPONSE_BYTES.acquire_many((5 + rl) as u32),
         )
@@ -1160,16 +1196,20 @@ async fn fetch_client_blocks_from_peer(
         if response_is_peer_only(rp) {
             return Ok(ClientBlockUpstreamResponse::PeerOnly);
         }
-        if response_has_no_client_blocks(rp) {
-            return Ok(ClientBlockUpstreamResponse::TerminalError(frame));
-        }
-        if response_has_client_block_round_too_large(rp) {
-            return Ok(ClientBlockUpstreamResponse::TerminalError(frame));
-        }
-        if response_has_client_block_round_too_small(rp) {
-            return Ok(ClientBlockUpstreamResponse::RangeTooSmall(frame));
-        }
-        Ok(ClientBlockUpstreamResponse::Frames(frame))
+        let terminal =
+            response_has_no_client_blocks(rp) || response_has_client_block_round_too_large(rp);
+        let too_small = response_has_client_block_round_too_small(rp);
+        let frame = BudgetedFrame {
+            bytes: frame,
+            _budget: budget,
+        };
+        Ok(if terminal {
+            ClientBlockUpstreamResponse::TerminalError(frame)
+        } else if too_small {
+            ClientBlockUpstreamResponse::RangeTooSmall(frame)
+        } else {
+            ClientBlockUpstreamResponse::Frames(frame)
+        })
     }
     .await;
     (ip, result)
@@ -1203,9 +1243,9 @@ fn note_client_block_result(
     ip: &str,
     result: std::io::Result<ClientBlockUpstreamResponse>,
     failures: &mut Vec<String>,
-    terminal: &mut Option<Vec<u8>>,
-    too_small: &mut Option<Vec<u8>>,
-) -> Option<Vec<u8>> {
+    terminal: &mut Option<BudgetedFrame>,
+    too_small: &mut Option<BudgetedFrame>,
+) -> Option<BudgetedFrame> {
     if let Some(peer) = tag {
         if !node.active_is_current(peer) {
             failures.push(format!("{}: stale active epoch {}", peer.ip, peer.epoch));
@@ -1281,10 +1321,15 @@ async fn fetch_client_blocks_raced(
     peers: &[String],
     rr: &AtomicUsize,
     req: Arc<Vec<u8>>,
-) -> Result<Vec<u8>, String> {
+) -> Result<BudgetedFrame, String> {
     let started = Instant::now();
     // a remembered hedge winner (see NodeState::rpc_peer) stands in for a missing pin right away
-    let remembered = node.rpc_peer.lock().unwrap().clone();
+    let remembered = node
+        .rpc_peer
+        .lock()
+        .unwrap()
+        .clone()
+        .filter(|ip| !crate::blacklist::contains(ip));
     let active = if remembered.is_some() {
         node.active_session_snapshot()
     } else {
@@ -1715,7 +1760,7 @@ fn raise_round_floor(floor: &Arc<AtomicU32>, round: u32) -> bool {
 }
 
 async fn fetch_bootstrap(upstream: &str) -> std::io::Result<Vec<u8>> {
-    let mut s = TcpStream::connect(upstream).await?;
+    let mut s = crate::blacklist::connect(upstream).await?;
     s.set_nodelay(true).ok();
     s.write_all(&GREET_TRUE).await?;
     // see splice_bootstrap_capture: reserve up front to avoid re-copying gigabytes on Vec growth
@@ -2035,6 +2080,7 @@ impl NodeState {
 
     fn pin_lazy_active(&self, ip: &str) -> ActivePeer {
         let mut active = self.active.lock().unwrap();
+        unpin_blacklisted(&mut active);
         if let Some(peer) = active.clone() {
             return peer;
         }
@@ -2048,11 +2094,14 @@ impl NodeState {
     }
 
     fn active_snapshot(&self) -> Option<ActivePeer> {
-        self.active.lock().unwrap().clone()
+        let mut active = self.active.lock().unwrap();
+        unpin_blacklisted(&mut active);
+        active.clone()
     }
 
     fn active_session_snapshot(&self) -> Option<ActivePeer> {
-        let active = self.active.lock().unwrap();
+        let mut active = self.active.lock().unwrap();
+        unpin_blacklisted(&mut active);
         if self.lazy_active.load(Ordering::Acquire) {
             None
         } else {
@@ -2073,8 +2122,20 @@ impl NodeState {
 
     // "This node has a live session" — a lazy misc-port pin doesn't count.
     fn has_active_session(&self) -> bool {
-        let active = self.active.lock().unwrap();
+        let mut active = self.active.lock().unwrap();
+        unpin_blacklisted(&mut active);
         active.is_some() && !self.lazy_active.load(Ordering::Acquire)
+    }
+}
+
+// A pin to an IP blacklisted after it was set is dropped on sight, so no new connection of the
+// node follows it (the session on it is being torn down, see blacklist::wait_blacklisted).
+fn unpin_blacklisted(active: &mut Option<ActivePeer>) {
+    if active
+        .as_ref()
+        .is_some_and(|p| crate::blacklist::contains(&p.ip))
+    {
+        *active = None;
     }
 }
 
@@ -2195,7 +2256,8 @@ fn remember_state_server(list: &Mutex<Vec<String>>, ip: &str) {
 fn ordered_candidates(head: Vec<String>, pool: &[String], start: usize) -> Vec<String> {
     let mut out: Vec<String> = Vec::with_capacity(head.len() + pool.len());
     for ip in head {
-        if !out.contains(&ip) {
+        // the pool is already filtered; a remembered state server may have been blacklisted since
+        if !out.contains(&ip) && !crate::blacklist::contains(&ip) {
             out.push(ip);
         }
     }
@@ -2690,6 +2752,20 @@ async fn handle_4001_live(
 // weeks would make every real round look implausible.
 const PEER_FILE_TIP_MAX_AGE: Duration = Duration::from_secs(15 * 60);
 
+// The upstream pool in a peer file: priority peers (raced as their own tier) and blacklisted IPs
+// removed.
+fn read_pool(priority: &PriorityTier, path: &str) -> Vec<String> {
+    crate::blacklist::filtered(priority.strip(read_node_peers(path)))
+}
+
+// The gateway's ip_blacklist.txt lives next to its peer file (/pd in compose, peerd's data dir).
+fn peer_file_dir(path: &str) -> PathBuf {
+    match Path::new(path).parent() {
+        Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
+        _ => PathBuf::from("."),
+    }
+}
+
 // The refresher's tip update for one peer-file read (None = leave the tip as it is). peerd
 // re-measures the tip every cycle, so a fresh reading REPLACES the old one: a bad cycle lasts one
 // cycle instead of pinning the tip forever. With no fresh reading for PEER_FILE_TIP_MAX_AGE (peerd
@@ -2734,8 +2810,9 @@ pub(crate) async fn run_gateway(
     n_live: usize,
 ) {
     let priority = Arc::new(PriorityTier::from_env());
-    let pool: Arc<Mutex<Vec<String>>> =
-        Arc::new(Mutex::new(priority.strip(read_node_peers(&node_peer_file))));
+    let blacklist_dir = peer_file_dir(&node_peer_file);
+    crate::blacklist::reload("gw", &blacklist_dir);
+    let pool: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(read_pool(&priority, &node_peer_file)));
     // cached verbatim bootstrap (abci_state + EVM KVs) for cold-start without a peer state fetch
     let boot_blob: Arc<Mutex<Option<Arc<Vec<u8>>>>> = Arc::new(Mutex::new(None));
     let boot_blob_cached_at = Arc::new(AtomicU64::new(0));
@@ -2808,12 +2885,15 @@ pub(crate) async fn run_gateway(
             let mut last_fresh_tip = Instant::now();
             loop {
                 tokio::time::sleep(Duration::from_secs(30)).await;
-                let p = priority.strip(read_node_peers(&path));
+                crate::blacklist::reload("gw", &blacklist_dir);
+                let p = read_pool(&priority, &path);
                 if p.is_empty() {
                     // missing/unreadable/empty file (peerd itself never writes an empty pool over
                     // a good one): keep serving from the last pool rather than dropping every
-                    // upstream
-                    if !pool.lock().unwrap().is_empty() {
+                    // upstream — minus anything blacklisted since
+                    let mut pool = pool.lock().unwrap();
+                    pool.retain(|ip| !crate::blacklist::contains(ip));
+                    if !pool.is_empty() {
                         gwlog!(
                             "[gw] WARN peer file {path} has no peers; keeping the previous pool"
                         );
@@ -3363,6 +3443,64 @@ mod tests {
         assert_eq!(floor.load(Ordering::Acquire), 10);
         assert!(raise_round_floor(&floor, 11));
         assert_eq!(floor.load(Ordering::Acquire), 11);
+    }
+
+    #[test]
+    fn blacklisted_ips_leave_the_pool_and_the_pins() {
+        let _g = crate::blacklist::TEST_LOCK.blocking_lock();
+        let dir = std::env::temp_dir().join(format!("hypersync_gwbl_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("peers.json");
+        std::fs::write(
+            &file,
+            r#"{"live_servers":["203.0.113.30","203.0.113.31","203.0.113.32"]}"#,
+        )
+        .unwrap();
+        let path = file.to_str().unwrap();
+        assert_eq!(peer_file_dir(path), dir);
+        assert_eq!(peer_file_dir("peers.json"), PathBuf::from("."));
+        let priority = PriorityTier::new(
+            vec!["203.0.113.32".into()],
+            0,
+            Duration::from_millis(1500),
+            BootstrapPolicy::Fallback,
+        );
+        let node = NodeState::new("10.0.0.1".parse().unwrap(), 1);
+        node.pin_active("203.0.113.30");
+        crate::blacklist::install(&["203.0.113.30"]);
+        // priority peers and blacklisted IPs are both out of the pool
+        assert_eq!(read_pool(&priority, path), ["203.0.113.31"]);
+        // a pin made before the IP was blacklisted is dropped, so no new connection follows it
+        assert!(!node.has_active_session());
+        assert!(node.active_snapshot().is_none());
+        assert_eq!(node.pin_lazy_active("203.0.113.31").ip, "203.0.113.31");
+        // a remembered state server blacklisted since is skipped
+        assert_eq!(
+            ordered_candidates(vec!["203.0.113.30".into()], &["203.0.113.31".into()], 0),
+            ["203.0.113.31"]
+        );
+        crate::blacklist::install(&[]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn vetting_skips_first_blocks_far_above_a_known_tip() {
+        let tip = 1_496_000_000;
+        // unknown tip: nothing to compare against
+        assert!(!first_round_far_above_tip(
+            tip + 10 * VET_MAX_ROUNDS_ABOVE_TIP,
+            0
+        ));
+        // a stale tip (honest peers ~15 min = ~13k rounds ahead of it) is still accepted
+        assert!(!first_round_far_above_tip(tip + 15_000, tip));
+        assert!(!first_round_far_above_tip(
+            tip + VET_MAX_ROUNDS_ABOVE_TIP,
+            tip
+        ));
+        assert!(first_round_far_above_tip(
+            tip + VET_MAX_ROUNDS_ABOVE_TIP + 1,
+            tip
+        ));
     }
 
     #[test]

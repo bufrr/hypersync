@@ -23,6 +23,9 @@
 # Usage: soak-test.sh [restart-node-at-start:0|1] [samples] [interval-seconds] [log-file]
 NODE="${HL_NODE:-hyperliquid-node-1}"
 GW="${HL_GW:-hypersync-gw}"
+# the node's address as the gateway sees it (its log tag); default: the node container's IP on the
+# gateway network. Set HL_NODE_IP for a node on another host (e.g. its VPN address).
+NODE_IP="${HL_NODE_IP:-$(sudo docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' "$NODE" 2>/dev/null | tr ' ' '\n' | grep -m1 '^172\.28\.')}"
 RESTART="${1:-0}"
 N="${2:-20}"
 INTERVAL="${3:-180}"
@@ -58,11 +61,18 @@ for i in $(seq 1 "$N"); do
   NRC=$(sudo docker inspect -f '{{.RestartCount}}' "$NODE" 2>/dev/null)
   GWMEM=$(sudo docker stats --no-stream --format '{{.MemUsage}}' "$GW" 2>/dev/null | awk '{print $1}')
   NMEM=$(sudo docker stats --no-stream --format '{{.MemUsage}}' "$NODE" 2>/dev/null | awk '{print $1}')
-  # the node's current upstream: the last active_peer= the gateway logged for it, from the 60s
-  # serve_push stats line or, with hot standbys (no stats line), the session start/switch lines
-  LAST_ACTIVE=$(sudo docker logs "$GW" 2>&1 | grep -aoE 'active_peer=[^ ]+' | tail -1)
+  # the node's current upstream: the newest session start or failover switch the gateway logged
+  # for THIS node (lines tagged "[gw] [<node-ip>]"); a switch moves the active without a new
+  # session start. Without a known node IP, fall back to the newest active_peer= of any node.
+  if [ -n "$NODE_IP" ]; then
+    LAST_ACTIVE=$(sudo docker logs "$GW" 2>&1 | grep -aF "[gw] [$NODE_IP] " \
+      | grep -aoE 'session start active_peer=[^ ]+|failover switch [^ ]+ -> [^ ]+' | tail -1 \
+      | sed -E 's/.*(active_peer=|-> )//')
+  else
+    LAST_ACTIVE=$(sudo docker logs "$GW" 2>&1 | grep -aoE 'active_peer=[^ ]+' | tail -1 | sed 's/^active_peer=//')
+  fi
   case "$LAST_ACTIVE" in
-    active_peer=prio-*) TIER=prio ;;
+    prio-*) TIER=prio ;;
     "") TIER=none ;;
     *) TIER=pool ;;
   esac

@@ -88,8 +88,11 @@ fn find_block_round_parent(dec: &[u8]) -> Option<(u32, u32)> {
     None
 }
 
-// A live block decompresses to a few hundred KB; anything declaring more is not a block.
-const MAX_DECOMPRESSED_BLOCK: usize = 16_000_000;
+// A live block decompresses to a few hundred KB (2026-10 sample of 200: median ~100KB, p99
+// ~470KB, max ~580KB); anything declaring more is not a block. Kept tight: failover hashes every
+// standby block decompressed, and lz4 expands up to ~255x, so a loose cap lets a standby cost
+// the gateway far more CPU than the bytes it sends.
+const MAX_DECOMPRESSED_BLOCK: usize = 4_000_000;
 
 // Reference / correctness oracle + fallback: full lz4 decompress, then the same header scan. The
 // size prefix is peer-controlled and lz4_flex allocates it up front (ff ff ff ff = a 4GB buffer,

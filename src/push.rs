@@ -60,7 +60,7 @@ async fn connect_greet(addr: &str, g: [u8; 8]) -> std::io::Result<TcpStream> {
     } else {
         format!("{addr}:4001")
     };
-    let mut s = timeout(Duration::from_secs(5), TcpStream::connect(&target)).await??;
+    let mut s = timeout(Duration::from_secs(5), crate::blacklist::connect(&target)).await??;
     s.set_nodelay(true).ok();
     s.write_all(&g).await?;
     Ok(s)
@@ -120,8 +120,13 @@ async fn pump(
 // Returns (bytes upstream->node, bytes node->upstream). Writes to the node are bounded by
 // NODE_WRITE_TIMEOUT and either direction ending ends the relay: a node that stops reading (hung,
 // SIGSTOPped, half-open) would otherwise park the task — and the upstream connection, pin and
-// priority session it holds — until TCP gives up, ~15 min later.
+// priority session it holds — until TCP gives up, ~15 min later. The relay also ends once the
+// upstream's IP is blacklisted (hot reload), so the node reconnects to an allowed peer.
 pub(crate) async fn splice(down: TcpStream, upc: TcpStream) -> (u64, u64) {
+    let up_ip = upc
+        .peer_addr()
+        .map(|a| a.ip().to_string())
+        .unwrap_or_default();
     let (mut dr, mut dw) = down.into_split();
     let (mut ur, mut uw) = upc.into_split();
     let to_node = Arc::new(AtomicU64::new(0));
@@ -147,6 +152,7 @@ pub(crate) async fn splice(down: TcpStream, upc: TcpStream) -> (u64, u64) {
     let to_peer = tokio::select! {
         r = tokio::io::copy(&mut dr, &mut uw) => r.unwrap_or(0),
         _ = &mut h.0 => 0,
+        _ = crate::blacklist::wait_blacklisted(&up_ip) => 0,
     };
     drop(h);
     (to_node.load(Ordering::Relaxed), to_peer)
@@ -322,7 +328,7 @@ async fn proxy_conn(
     let cur_gen = st.generation.load(Ordering::Relaxed);
     let idx = st.active.load(Ordering::Relaxed);
     let up = format!("{}:{}", st.hosts[idx], p);
-    let mut upc = match timeout(Duration::from_secs(4), TcpStream::connect(&up)).await {
+    let mut upc = match timeout(Duration::from_secs(4), crate::blacklist::connect(&up)).await {
         Ok(Ok(s)) => s,
         _ => {
             st.fail_over(idx, "dial failed");
@@ -443,8 +449,21 @@ async fn proxy_conn(
             }
         }
     });
-    let n2u = tokio::spawn(async move {
-        let _ = tokio::io::copy(&mut dr, &mut uw).await;
+    // node -> upstream, bounded like serve_push's: an upstream that keeps sending but stops
+    // reading would otherwise park the node's RPC requests and acks behind a full socket while
+    // the stall monitor (fed by up2) sees a healthy stream. Ends true on such a write stall.
+    let mut n2u = tokio::spawn(async move {
+        let mut buf = vec![0u8; 65536];
+        loop {
+            match dr.read(&mut buf).await {
+                Ok(0) | Err(_) => break false,
+                Ok(nb) => match timeout(Duration::from_secs(5), uw.write_all(&buf[..nb])).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) => break false,
+                    Err(_) => break true,
+                },
+            }
+        }
     });
     loop {
         if st.generation.load(Ordering::Relaxed) != cur_gen {
@@ -460,6 +479,8 @@ async fn proxy_conn(
     // — an RPC peer may close after answering)
     if p == 4001 && up2.is_finished() && !n2u.is_finished() && (&mut up2).await.unwrap_or(false) {
         st.fail_over(idx, "upstream closed the stream");
+    } else if n2u.is_finished() && (&mut n2u).await.unwrap_or(false) {
+        st.fail_over(idx, "upstream stopped reading");
     }
     up2.abort();
     n2u.abort();
@@ -901,7 +922,7 @@ pub(crate) async fn serve_push(node: TcpStream, active_conn: TcpStream, cfg: Pus
                 // Stop only when the node side is gone (the merge channel is closed).
                 while !tx.is_closed() {
                     if let Ok(Ok(mut s)) =
-                        timeout(Duration::from_secs(5), TcpStream::connect(&target)).await
+                        timeout(Duration::from_secs(5), crate::blacklist::connect(&target)).await
                     {
                         s.set_nodelay(true).ok();
                         if s.write_all(&GREET_FALSE).await.is_ok() {
@@ -936,9 +957,13 @@ pub(crate) async fn serve_push(node: TcpStream, active_conn: TcpStream, cfg: Pus
     }
     let superseded = wait_superseded(cfg.superseded);
     tokio::pin!(superseded);
+    let active_host = cfg.hosts.get(cfg.active_idx).cloned().unwrap_or_default();
+    let blacklisted = crate::blacklist::wait_blacklisted(&active_host);
+    tokio::pin!(blacklisted);
     let exit_reason = loop {
         tokio::select! {
             _ = &mut superseded => break "active superseded by failover".to_string(),
+            _ = &mut blacklisted => break "active peer blacklisted".to_string(),
             maybe = rx.recv() => match maybe {
                 // Bounded like the node -> peer direction: a half-open node (no RST) would
                 // otherwise park write_all until the kernel gives up (~15 min), holding the
@@ -1129,7 +1154,13 @@ async fn process_live_frame(
                 return Ok(());
             }
             if forward_nonblock {
-                active_round.fetch_max(rnd, Ordering::AcqRel);
+                // the same jump guard pump_merge's BlockProgress applies to the live stream
+                let prev = active_round.fetch_max(rnd, Ordering::AcqRel);
+                if prev != 0 && rnd > prev.saturating_add(MAX_ACTIVE_ROUND_JUMP) {
+                    return Err(std::io::Error::other(format!(
+                        "active block round jump round={rnd} prev={prev} max_jump={MAX_ACTIVE_ROUND_JUMP}"
+                    )));
+                }
                 if let Some(lag) = round_lag_from_tip(rnd, net_tip, ACTIVE_ROUND_MAX_LAG) {
                     return Err(std::io::Error::other(format!(
                         "active block round lagged round={rnd} net_tip={net_tip} lag={lag} max_lag={ACTIVE_ROUND_MAX_LAG}"
@@ -1204,7 +1235,7 @@ pub(crate) async fn run_relay(upstream: String) {
                 };
                 let up = format!("{host}:{p}");
                 tokio::spawn(async move {
-                    let upc = match TcpStream::connect(&up).await {
+                    let upc = match crate::blacklist::connect(&up).await {
                         Ok(s) => s,
                         Err(e) => {
                             gwlog!("[relay] :{p} {addr} upstream err {e}");
@@ -1368,6 +1399,108 @@ mod tests {
         frame.push(1);
         frame.extend_from_slice(&payload);
         frame
+    }
+
+    // A prefetched block far above the session's baseline is refused before it reaches the node,
+    // like the live stream's round-jump guard.
+    #[tokio::test]
+    async fn prefetched_block_round_jump_is_refused() {
+        const BASE: u32 = 1_496_000_000;
+        let node_l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let node_addr = node_l.local_addr().unwrap();
+        let fake_node = tokio::spawn(async move {
+            let mut c = TcpStream::connect(node_addr).await.unwrap();
+            let mut buf = Vec::new();
+            c.read_to_end(&mut buf).await.unwrap();
+            buf
+        });
+        let (node_conn, _) = node_l.accept().await.unwrap();
+        let peer_l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer_l.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (_s, _) = peer_l.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        let active_conn = TcpStream::connect(peer_addr).await.unwrap();
+        let payload = crate::protocol::test_block_payload(BASE + MAX_ACTIVE_ROUND_JUMP + 1, 2);
+        let mut block = (payload.len() as u32).to_be_bytes().to_vec();
+        block.push(1);
+        block.extend_from_slice(&payload);
+        let reason = serve_push(
+            node_conn,
+            active_conn,
+            PushConfig {
+                hosts: Arc::new(vec!["127.0.0.1".into()]),
+                active_idx: 0,
+                port: 4001,
+                prefetched_greeting: Some(vec![0, 0, 0, 1, 0, 7]),
+                prefetched_frames: vec![block],
+                initial_last_forwarded: BASE,
+                live_floor: Arc::new(AtomicU32::new(0)),
+                net_round_tip: Arc::new(AtomicU32::new(0)),
+                superseded: None,
+            },
+        )
+        .await;
+        assert!(reason.contains("active block round jump"), "{reason}");
+        // the node got the greeting only
+        assert_eq!(fake_node.await.unwrap(), [0, 0, 0, 1, 0, 7]);
+    }
+
+    // An active peer blacklisted mid-session ends the session (the node reconnects elsewhere),
+    // though the peer itself is healthy and still connected.
+    #[tokio::test]
+    async fn push_session_ends_when_active_is_blacklisted() {
+        let _g = crate::blacklist::TEST_LOCK.lock().await;
+        let node_l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let node_addr = node_l.local_addr().unwrap();
+        let fake_node = tokio::spawn(async move {
+            let mut c = TcpStream::connect(node_addr).await.unwrap();
+            let mut buf = Vec::new();
+            c.read_to_end(&mut buf).await.unwrap();
+            buf
+        });
+        let (node_conn, _) = node_l.accept().await.unwrap();
+        let peer_l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer_l.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let (mut s, _) = peer_l.accept().await.unwrap();
+            s.write_all(&[0, 0, 0, 1, 0, 7]).await.unwrap();
+            // stays connected and silent until the gateway hangs up
+            let mut b = [0u8; 64];
+            while s.read(&mut b).await.is_ok_and(|n| n > 0) {}
+        });
+        let active_conn = TcpStream::connect(peer_addr).await.unwrap();
+        crate::blacklist::install(&["198.51.100.40"]);
+        let reason = timeout(
+            Duration::from_secs(5),
+            serve_push(
+                node_conn,
+                active_conn,
+                PushConfig {
+                    // the session's active host as the gateway knows it
+                    hosts: Arc::new(vec!["198.51.100.40".into()]),
+                    active_idx: 0,
+                    port: 4001,
+                    prefetched_greeting: None,
+                    prefetched_frames: Vec::new(),
+                    initial_last_forwarded: 0,
+                    live_floor: Arc::new(AtomicU32::new(0)),
+                    net_round_tip: Arc::new(AtomicU32::new(0)),
+                    superseded: None,
+                },
+            ),
+        )
+        .await
+        .expect("session ends promptly");
+        crate::blacklist::install(&[]);
+        assert!(reason.starts_with("active peer blacklisted"), "{reason}");
+        // the node got the greeting, then EOF
+        assert_eq!(fake_node.await.unwrap(), [0, 0, 0, 1, 0, 7]);
+        timeout(Duration::from_secs(2), peer)
+            .await
+            .expect("upstream connection closed")
+            .unwrap();
     }
 
     // Regression for the sample-420 soak alert: an active-peer death must tear the whole 4001

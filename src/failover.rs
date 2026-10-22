@@ -189,6 +189,10 @@ struct Upstream {
     // blocks this upstream delivered that the node has not received yet, by round
     ahead: BTreeMap<u32, Ahead>,
     ahead_bytes: usize,
+    // highest round trimmed from `ahead` for space. The reader has moved past it, so until the
+    // node has that round from the active, the buffered chain has a hole after its last block and
+    // this standby can't take over (a switch would hand the node a block with an unseen parent).
+    dropped_max: u32,
     // ms the active was later than this standby, per common round (negative = standby later)
     leads: VecDeque<i64>,
     last_rx: Option<Instant>,
@@ -202,6 +206,7 @@ impl Upstream {
             mismatches: 0,
             ahead: BTreeMap::new(),
             ahead_bytes: 0,
+            dropped_max: 0,
             leads: VecDeque::new(),
             last_rx: None,
         }
@@ -229,10 +234,11 @@ impl Upstream {
             self.ahead_bytes -= old.frame.len();
         }
         while self.ahead.len() > AHEAD_KEEP || self.ahead_bytes > AHEAD_BYTES {
-            let Some((_, a)) = self.ahead.pop_last() else {
+            let Some((r, a)) = self.ahead.pop_last() else {
                 break;
             };
             self.ahead_bytes -= a.frame.len();
+            self.dropped_max = self.dropped_max.max(r);
         }
     }
 
@@ -272,7 +278,15 @@ impl Upstream {
     }
 
     // Blocks this upstream can hand the node next, gap-free from `from` by parent links.
+    // Nothing this standby dropped is still missing at the node (whose last block is `from`).
+    fn can_continue(&self, from: u32) -> bool {
+        self.dropped_max <= from
+    }
+
     fn chain_len(&self, from: u32) -> (usize, Option<Instant>) {
+        if !self.can_continue(from) {
+            return (0, None);
+        }
         let mut cur = from;
         let mut n = 0;
         let mut first_at = None;
@@ -488,6 +502,9 @@ impl Core {
     pub(crate) fn switch_to(&mut self, id: u64, now: Instant) -> Option<SwitchFrames> {
         let u = self.ups.get_mut(&id)?;
         let mut cur = self.last_forwarded;
+        if !u.can_continue(cur) {
+            return None;
+        }
         let mut chain = Vec::new();
         while let Some((&r, a)) = u.ahead.range(cur.saturating_add(1)..).next() {
             if a.parent != cur {
@@ -716,7 +733,9 @@ async fn connect_standby(
         prio: Option<PrioritySession>,
     ) -> Option<(String, TcpStream, Option<PrioritySession>)> {
         let dial = async {
-            let mut s = TcpStream::connect((ip.as_str(), 4001)).await.ok()?;
+            let mut s = crate::blacklist::connect(&format!("{ip}:4001"))
+                .await
+                .ok()?;
             s.set_nodelay(true).ok();
             s.write_all(&GREET_FALSE).await.ok()?;
             let mut g = [0u8; 6];
@@ -908,6 +927,8 @@ pub(crate) async fn serve_failover(
     // prefetched frames (the live-selection vetting read) come first, in order
     let mut prefetched = Some(cfg.prefetched_frames);
     let mut tick = tokio::time::interval(TICK);
+    // MAX: the first tick checks once (the list may have changed since the active was dialed)
+    let mut blacklist_seen = u64::MAX;
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     let exit_reason: String = loop {
@@ -1052,6 +1073,29 @@ pub(crate) async fn serve_failover(
                         progress.last_round,
                         ACTIVE_BLOCK_STALL.as_secs()
                     )));
+                }
+                // blacklisted since connecting (hot reload): the active hands over to a standby
+                // like a dead one would, and blacklisted standbys go now. New standbys are dialed
+                // through blacklist::connect, so only a list change needs a re-check.
+                if crate::blacklist::version() != blacklist_seen {
+                    blacklist_seen = crate::blacklist::version();
+                    let active = core.active();
+                    if core.ip_of(active).is_some_and(crate::blacklist::contains) {
+                        active_dead.get_or_insert((now, "active peer blacklisted".to_string()));
+                    }
+                    let banned: Vec<u64> = lives
+                        .keys()
+                        .copied()
+                        .filter(|&id| id != active && core.ip_of(id).is_some_and(crate::blacklist::contains))
+                        .collect();
+                    for id in banned {
+                        if let Some(ip) = core.remove(id) {
+                            gwlog!("[gw] [{node_label}] failover standby {ip} dropped: blacklisted");
+                        }
+                        if let Some(l) = lives.remove(&id) {
+                            l.reader.abort();
+                        }
+                    }
                 }
                 if let Some((id, reason)) = core.pick_switch(now, active_dead.is_some()) {
                     let old = core.active();
@@ -1454,9 +1498,24 @@ mod tests {
         assert!(c.on_active_block(102, 999, t0).0);
         assert_eq!(c.ups[&1].ahead_bytes, 2 * (8 << 20));
         c.ups.get_mut(&1).unwrap().verified = MIN_VERIFIED;
-        let (frames, _) = c.switch_to(1, t0).unwrap();
-        assert_eq!(frames.len(), 2);
+        // 105 was dropped and the reader has moved on (106 is next): replaying 103-104 would
+        // leave the node without 105, so the standby can't take over yet
+        assert_eq!(c.pick_switch(t0 + 10_000 * MS, true), None);
+        assert!(c.switch_to(1, t0).is_none());
+        assert_eq!(c.active, 0);
+        // once the active has delivered the dropped round, the standby's later blocks continue
+        // the node's chain exactly
+        for r in 103..=105 {
+            c.on_active_block(r, r as u64, t0);
+        }
         assert_eq!((c.ups[&1].ahead.len(), c.ups[&1].ahead_bytes), (0, 0));
+        for r in 106..=107 {
+            c.on_standby_block(1, r, r - 1, r as u64, t0, f(r));
+        }
+        assert_eq!(c.pick_switch(t0 + 10_000 * MS, true).map(|s| s.0), Some(1));
+        let (frames, _) = c.switch_to(1, t0).unwrap();
+        assert_eq!(frames, vec![f(106), f(107)]);
+        assert_eq!(c.last_forwarded, 107);
         // and a frame-count cap for small frames
         let mut c = core();
         c.add_standby(1, "b".into());
@@ -1566,6 +1625,57 @@ mod tests {
             _ => panic!("expected Closed"),
         }
         drop(peer.await.unwrap());
+    }
+
+    // A healthy active blacklisted mid-session is treated as dead: handed over to a standby, or
+    // (none here) the session ends after ACTIVE_DEAD_GRACE.
+    #[tokio::test]
+    async fn blacklisted_active_is_treated_as_dead() {
+        let _g = crate::blacklist::TEST_LOCK.lock().await;
+        let up = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = up.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = up.accept().await.unwrap();
+            s.write_all(&[0, 0, 0, 1, 0, 7]).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        });
+        let nl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let node_client = TcpStream::connect(nl.local_addr().unwrap()).await.unwrap();
+        let (node, _) = nl.accept().await.unwrap();
+        let active = TcpStream::connect(up_addr).await.unwrap();
+        let cfg = PushConfig {
+            hosts: Arc::new(vec!["198.51.100.41".into()]),
+            active_idx: 0,
+            port: 4001,
+            prefetched_greeting: None,
+            prefetched_frames: Vec::new(),
+            initial_last_forwarded: 0,
+            live_floor: Arc::new(AtomicU32::new(0)),
+            net_round_tip: Arc::new(AtomicU32::new(0)),
+            superseded: None,
+        };
+        let fctx = FailoverCtx {
+            node_label: "test".into(),
+            pool: Arc::new(Mutex::new(Vec::new())),
+            priority: Arc::new(PriorityTier::new(
+                Vec::new(),
+                0,
+                Duration::from_millis(1500),
+                crate::priority::BootstrapPolicy::Fallback,
+            )),
+            on_switch: Box::new(|_, _| {}),
+        };
+        crate::blacklist::install(&["198.51.100.41"]);
+        // ends inside the 5s active-silence limit, so the blacklist is what ended it
+        let reason = timeout(
+            Duration::from_millis(4500),
+            serve_failover(node, active, cfg, fctx),
+        )
+        .await
+        .expect("bounded");
+        crate::blacklist::install(&[]);
+        assert!(reason.contains(": active peer blacklisted"), "{reason}");
+        drop(node_client);
     }
 
     #[tokio::test]
