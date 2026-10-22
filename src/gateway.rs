@@ -3493,6 +3493,10 @@ mod tests {
         ));
         // a stale tip (honest peers ~15 min = ~13k rounds ahead of it) is still accepted
         assert!(!first_round_far_above_tip(tip + 15_000, tip));
+        // deliberately not tighter: the tip can trail by ~15 min plus peerd's cycle age, and a
+        // high first block costs one reconnect (the node validates blocks itself), whereas a
+        // too-tight bound would reject every honest peer whenever peerd's tip lags
+        assert!(!first_round_far_above_tip(tip + 30_000, tip));
         assert!(!first_round_far_above_tip(
             tip + VET_MAX_ROUNDS_ABOVE_TIP,
             tip

@@ -78,6 +78,8 @@ for i in $(seq 1 "$N"); do
   esac
   ST_PRIO=$(printf '%s\n' "$GLOG" | grep -ac 'session start.*tier=prio')
   ST_POOL=$(printf '%s\n' "$GLOG" | grep -ac 'session start.*tier=pool')
+  # DROPS / ALERT come from serve_push's stats lines; with hot standbys (serve_failover) those
+  # lines aren't written, so both stay 0 there — check the failover switch/status lines instead
   DROPS=$(printf '%s\n' "$GLOG" | grep -ac 'push drop sample')
   ALERT=$(printf '%s\n' "$GLOG" | grep -ac 'ALERT=')
   PRIOFAIL=$(printf '%s\n' "$GLOG" | grep -ac 'live attempt failed')

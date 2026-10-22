@@ -707,6 +707,23 @@ fn previous_live_pool(contents: &str, excluded: &HashSet<String>) -> (Vec<String
     (ips, tainted)
 }
 
+// The pool peers.json gets this cycle (None = leave the file as it is): the probe's ranking, unless
+// the previous pool is kept — then nothing is written, except that a kept pool naming a
+// now-excluded IP is rewritten without it (never replaced by a thinner or empty probe result,
+// which would leave a restarting gateway without a pool).
+fn peer_pool_to_write<'a>(
+    ranked: &'a [String],
+    previous_pruned: &'a [String],
+    kept_previous: bool,
+    previous_tainted: bool,
+) -> Option<&'a [String]> {
+    match (kept_previous, previous_tainted) {
+        (false, _) => Some(ranked),
+        (true, true) => Some(previous_pruned),
+        (true, false) => None,
+    }
+}
+
 pub(crate) async fn run_peerd(interval: u64) {
     use std::collections::{HashMap, HashSet};
     let data_dir = std::env::var("HYPERSYNC_DATA").unwrap_or_else(|_| "./data".to_string());
@@ -915,15 +932,18 @@ pub(crate) async fn run_peerd(interval: u64) {
 
         let previous_live = previous_live_ips.len();
         let previous_trusted = previous_peer_pool_is_trusted(&previous_contents);
-        let kept_previous = !previous_tainted
-            && should_keep_previous_peer_pool(ranked.len(), previous_live, previous_trusted);
+        let kept_previous =
+            should_keep_previous_peer_pool(ranked.len(), previous_live, previous_trusted);
+        let published =
+            peer_pool_to_write(&ranked, &previous_live_ips, kept_previous, previous_tainted);
         // 3. write peers.json (hand-rolled: content is plain IPv4 strings, no escaping needed)
         let round_tip_json = round_tip
             .map(|round| round.to_string())
             .unwrap_or_else(|| "null".to_string());
         let json = format!(
             "{{\"live_servers\":[{}],\"n_candidates\":{},\"round_tip\":{},\"candidate_fallback\":false}}",
-            ranked
+            published
+                .unwrap_or_default()
                 .iter()
                 .map(|ip| format!("\"{ip}\""))
                 .collect::<Vec<_>>()
@@ -931,7 +951,7 @@ pub(crate) async fn run_peerd(interval: u64) {
             total_candidates,
             round_tip_json
         );
-        if !kept_previous {
+        if published.is_some() {
             write_atomic(&out_path, &json).await;
         }
         empty_live_streak =
@@ -1561,6 +1581,25 @@ mod tests {
         assert_eq!(
             previous_live_pool(prev, &HashSet::new()),
             (vec!["6.6.6.6".to_string(), "5.5.5.5".to_string()], false)
+        );
+    }
+
+    #[test]
+    fn a_tainted_kept_pool_is_rewritten_pruned_never_emptied() {
+        let ranked: Vec<String> = Vec::new();
+        let pruned = vec!["6.6.6.6".to_string()];
+        // empty probe, previous kept: an untainted file is left alone ...
+        assert_eq!(peer_pool_to_write(&ranked, &pruned, true, false), None);
+        // ... a tainted one is rewritten with the pruned previous pool, not the empty ranking
+        assert_eq!(
+            peer_pool_to_write(&ranked, &pruned, true, true),
+            Some(pruned.as_slice())
+        );
+        // a ranking that replaces the previous pool is written as usual
+        let fresh: Vec<String> = (1..=9).map(|i| format!("7.7.7.{i}")).collect();
+        assert_eq!(
+            peer_pool_to_write(&fresh, &pruned, false, true),
+            Some(fresh.as_slice())
         );
     }
 

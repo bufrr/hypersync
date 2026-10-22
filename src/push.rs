@@ -316,6 +316,13 @@ pub(crate) async fn run_proxy(upstreams: Vec<String>, push: bool) {
     }
 }
 
+// How a raw proxy's node -> upstream copy ended.
+enum N2uEnd {
+    Node,
+    UpstreamGone,
+    UpstreamStalled,
+}
+
 // One node connection on port `p`, proxied to the active upstream.
 async fn proxy_conn(
     down: TcpStream,
@@ -451,16 +458,16 @@ async fn proxy_conn(
     });
     // node -> upstream, bounded like serve_push's: an upstream that keeps sending but stops
     // reading would otherwise park the node's RPC requests and acks behind a full socket while
-    // the stall monitor (fed by up2) sees a healthy stream. Ends true on such a write stall.
+    // the stall monitor (fed by up2) sees a healthy stream. Ends with whose fault it was.
     let mut n2u = tokio::spawn(async move {
         let mut buf = vec![0u8; 65536];
         loop {
             match dr.read(&mut buf).await {
-                Ok(0) | Err(_) => break false,
+                Ok(0) | Err(_) => break N2uEnd::Node,
                 Ok(nb) => match timeout(Duration::from_secs(5), uw.write_all(&buf[..nb])).await {
                     Ok(Ok(())) => {}
-                    Ok(Err(_)) => break false,
-                    Err(_) => break true,
+                    Ok(Err(_)) => break N2uEnd::UpstreamGone,
+                    Err(_) => break N2uEnd::UpstreamStalled,
                 },
             }
         }
@@ -479,8 +486,14 @@ async fn proxy_conn(
     // — an RPC peer may close after answering)
     if p == 4001 && up2.is_finished() && !n2u.is_finished() && (&mut up2).await.unwrap_or(false) {
         st.fail_over(idx, "upstream closed the stream");
-    } else if n2u.is_finished() && (&mut n2u).await.unwrap_or(false) {
-        st.fail_over(idx, "upstream stopped reading");
+    } else if n2u.is_finished() {
+        // a stalled upstream is at fault on any port; one that reset/closed only on 4001 (a side
+        // port peer may close after answering an RPC)
+        match (&mut n2u).await {
+            Ok(N2uEnd::UpstreamStalled) => st.fail_over(idx, "upstream stopped reading"),
+            Ok(N2uEnd::UpstreamGone) if p == 4001 => st.fail_over(idx, "upstream write failed"),
+            _ => {}
+        }
     }
     up2.abort();
     n2u.abort();

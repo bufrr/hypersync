@@ -18,7 +18,7 @@ use std::collections::HashSet;
 use std::net::Ipv4Addr;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock, PoisonError, RwLock};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError, RwLock};
 use std::time::Duration;
 
 use tokio::net::TcpStream;
@@ -29,6 +29,8 @@ pub(crate) const FILE_NAME: &str = "ip_blacklist.txt";
 static LIST: LazyLock<RwLock<Arc<HashSet<Ipv4Addr>>>> = LazyLock::new(Default::default);
 // The list's size, so the common empty case answers without touching the lock.
 static LEN: AtomicUsize = AtomicUsize::new(0);
+// Invalid entries last reported, so a typo is reported once when it appears, not every reload.
+static INVALID: Mutex<Vec<String>> = Mutex::new(Vec::new());
 // Bumped on every change, so hot loops can re-check their peers only when the list changed.
 static VERSION: AtomicU64 = AtomicU64::new(0);
 
@@ -76,11 +78,17 @@ pub(crate) fn reload(tag: &str, dir: &Path) -> usize {
     let file = std::fs::read_to_string(&path).ok();
     let (ips, invalid) = parse(env_val.as_deref(), file.as_deref());
     let n = ips.len();
+    {
+        let mut last = INVALID.lock().unwrap_or_else(PoisonError::into_inner);
+        if *last != invalid {
+            for tok in invalid.iter().filter(|t| !last.contains(t)) {
+                eprintln!("[{tag}] blacklist: invalid entry {tok:?} skipped");
+            }
+            *last = invalid;
+        }
+    }
     let mut list = LIST.write().unwrap_or_else(PoisonError::into_inner);
     if **list != ips {
-        for tok in &invalid {
-            eprintln!("[{tag}] blacklist: invalid entry {tok:?} skipped");
-        }
         let mut shown: Vec<String> = ips.iter().map(|ip| ip.to_string()).collect();
         shown.sort();
         // a blacklisted priority peer still shows as prio-N
@@ -127,13 +135,12 @@ pub(crate) fn ips() -> Vec<String> {
     current().iter().map(|ip| ip.to_string()).collect()
 }
 
-// `ips` without the blacklisted ones, order kept.
-pub(crate) fn filtered(mut ips: Vec<String>) -> Vec<String> {
+// `addrs` ("ip" or "ip:port") without the blacklisted ones, order kept.
+pub(crate) fn filtered(mut addrs: Vec<String>) -> Vec<String> {
     if LEN.load(Ordering::Acquire) != 0 {
-        let list = current();
-        ips.retain(|ip| !matches!(ip.parse::<Ipv4Addr>(), Ok(a) if list.contains(&a)));
+        addrs.retain(|a| !contains(a));
     }
-    ips
+    addrs
 }
 
 // The one upstream dial: refuses a blacklisted address before any packet is sent.
@@ -188,7 +195,7 @@ mod tests {
             filtered(vec![
                 "192.0.2.7".into(),
                 "203.0.113.1".into(),
-                "198.51.100.9".into()
+                "198.51.100.9:4001".into()
             ]),
             ["203.0.113.1"]
         );
