@@ -83,7 +83,7 @@ fn summarize_peer_errors(tried: usize, errs: &[String]) -> String {
             None => counts.push((class, 1)),
         }
     }
-    counts.sort_by(|a, b| b.1.cmp(&a.1));
+    counts.sort_by_key(|c| std::cmp::Reverse(c.1));
     let mut out = format!("tried={tried}");
     for (class, n) in counts {
         out.push_str(&format!(" {class}={n}"));

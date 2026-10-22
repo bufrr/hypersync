@@ -182,6 +182,9 @@ impl PriorityTier {
     pub(crate) fn try_acquire(self: &Arc<Self>, ip: &str) -> Option<PrioritySession> {
         let i = self.index(ip)?;
         let max = self.max_sessions;
+        // fetch_update is deprecated (renamed try_update) since Rust 1.99, but the MSRV (1.87)
+        // only has fetch_update
+        #[allow(deprecated)]
         self.sessions[i]
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
                 (max == 0 || n < max).then_some(n + 1)
