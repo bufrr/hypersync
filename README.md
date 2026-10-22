@@ -87,6 +87,8 @@ Set in `.env`; compose passes them through.
 - falls more than 1,500 rounds behind the network tip, or sends an implausible round;
 - stops reading the node's outbound traffic for 5 s.
 
+The peer is then skipped for 30 s (priority peers via their own cooldown), so the reconnect lands on a different one unless every peer is cooling down.
+
 Live frames over 8 MB end the session (blocks average ~200 KB), at most 64 MB of frames are queued per node, and writes to a node are bounded to 30 s, so neither a hostile peer nor a stuck node can make a session hold more.
 
 **Network round tip.** peerd publishes the median round of the largest cluster of probed peers, so a minority of peers (even a few colluding ones) can't move it; a majority of the probed peers lying still could. The gateway replaces its tip with each fresh reading and resets it to unknown (with a `WARN`) if none arrives for 15 minutes, rather than freezing on a stale value.

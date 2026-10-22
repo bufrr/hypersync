@@ -317,6 +317,7 @@ pub(crate) async fn run_proxy(upstreams: Vec<String>, push: bool) {
 }
 
 // How a raw proxy's node -> upstream copy ended.
+#[derive(Debug, PartialEq)]
 enum N2uEnd {
     Node,
     UpstreamGone,
@@ -443,7 +444,7 @@ async fn proxy_conn(
     // ends true when the UPSTREAM ended the stream, false when the node stopped taking it
     let mut up2 = tokio::spawn(async move {
         let mut buf = vec![0u8; 262144];
-        loop {
+        let closed = loop {
             match ur.read(&mut buf).await {
                 Ok(0) | Err(_) => break true,
                 Ok(nb) => {
@@ -454,14 +455,15 @@ async fn proxy_conn(
                     }
                 }
             }
-        }
+        };
+        (closed, Instant::now())
     });
     // node -> upstream, bounded like serve_push's: an upstream that keeps sending but stops
     // reading would otherwise park the node's RPC requests and acks behind a full socket while
     // the stall monitor (fed by up2) sees a healthy stream. Ends with whose fault it was.
     let mut n2u = tokio::spawn(async move {
         let mut buf = vec![0u8; 65536];
-        loop {
+        let end = loop {
             match dr.read(&mut buf).await {
                 Ok(0) | Err(_) => break N2uEnd::Node,
                 Ok(nb) => match timeout(Duration::from_secs(5), uw.write_all(&buf[..nb])).await {
@@ -470,33 +472,63 @@ async fn proxy_conn(
                     Err(_) => break N2uEnd::UpstreamStalled,
                 },
             }
-        }
+        };
+        (end, Instant::now())
     });
-    loop {
-        if st.generation.load(Ordering::Relaxed) != cur_gen {
-            break;
+    // which direction ended first (None = superseded by a failover: nobody to blame)
+    let (mut up, mut down) = (None, None);
+    let first_up = tokio::select! {
+        _ = wait_superseded(Some((st.generation.clone(), cur_gen))) => None,
+        r = &mut up2 => {
+            up = r.ok();
+            Some(true)
         }
-        if up2.is_finished() || n2u.is_finished() {
-            break;
+        r = &mut n2u => {
+            down = r.ok();
+            Some(false)
         }
-        tokio::time::sleep(Duration::from_millis(300)).await;
-    }
-    // the upstream ended the live stream while the node was still connected and reading: rotate
-    // it out (a node that stopped reading is not the upstream's fault; side ports are left alone
-    // — an RPC peer may close after answering)
-    if p == 4001 && up2.is_finished() && !n2u.is_finished() && (&mut up2).await.unwrap_or(false) {
-        st.fail_over(idx, "upstream closed the stream");
-    } else if n2u.is_finished() {
-        // a stalled upstream is at fault on any port; one that reset/closed only on 4001 (a side
-        // port peer may close after answering an RPC)
-        match (&mut n2u).await {
-            Ok(N2uEnd::UpstreamStalled) => st.fail_over(idx, "upstream stopped reading"),
-            Ok(N2uEnd::UpstreamGone) if p == 4001 => st.fail_over(idx, "upstream write failed"),
-            _ => {}
+    };
+    if let Some(first_up) = first_up {
+        // one end makes the other side close right after, so give the other direction a moment
+        // to end too, then let the earlier end decide (never re-poll the handle that finished)
+        const SETTLE: Duration = Duration::from_millis(100);
+        if first_up {
+            down = timeout(SETTLE, &mut n2u).await.ok().and_then(Result::ok);
+        } else {
+            up = timeout(SETTLE, &mut up2).await.ok().and_then(Result::ok);
+        }
+        if let Some(why) = raw_proxy_fault(p, up, down) {
+            st.fail_over(idx, why);
         }
     }
     up2.abort();
     n2u.abort();
+}
+
+// Why a raw proxy connection was the upstream's fault, if it was, from the direction(s) that had
+// ended and when. The EARLIER end decides: an upstream that closes its stream makes the node close
+// right after (it sees EOF), and a node that leaves makes the upstream close after it. A stalled
+// upstream is at fault on any port; one that closed or reset only on 4001 — a side-port peer may
+// close after answering an RPC.
+fn raw_proxy_fault(
+    p: u16,
+    up: Option<(bool, Instant)>,
+    down: Option<(N2uEnd, Instant)>,
+) -> Option<&'static str> {
+    let upstream_first = match (&up, &down) {
+        (Some((_, u)), Some((_, d))) => u <= d,
+        (Some(_), None) => true,
+        _ => false,
+    };
+    if upstream_first {
+        let (closed, _) = up?;
+        return (p == 4001 && closed).then_some("upstream closed the stream");
+    }
+    match down?.0 {
+        N2uEnd::UpstreamStalled => Some("upstream stopped reading"),
+        N2uEnd::UpstreamGone if p == 4001 => Some("upstream write failed"),
+        N2uEnd::UpstreamGone | N2uEnd::Node => None,
+    }
 }
 
 // The upstream's first 4001 frame after the node's greeting. Live: the whole frame, at most 1000
@@ -681,6 +713,12 @@ async fn wait_superseded(superseded: Option<(Arc<AtomicU64>, u64)>) {
 // failover; anything else is the active upstream's fault and should rotate it out.
 pub(crate) fn push_exit_is_upstream_fault(reason: &str) -> bool {
     !(reason.starts_with("node outbound ended")
+        // serve_failover's node reader
+        || reason.starts_with("node outbound read failed")
+        // internal ends (a panicked task, the session's own channel or logger): nobody's fault
+        || reason.starts_with("node outbound task join error")
+        || reason.starts_with("active lag logger")
+        || reason.starts_with("event channel closed")
         || reason.starts_with("node write")
         || reason.starts_with("node greeting write")
         || reason.starts_with("active superseded"))
@@ -1273,6 +1311,43 @@ pub(crate) async fn run_relay(upstream: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_proxy_blames_whichever_side_ended_first() {
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(1);
+        // upstream closed its live stream, then the node (seeing EOF) closed: upstream's fault,
+        // also when both had ended by the time anyone looked
+        assert_eq!(
+            raw_proxy_fault(4001, Some((true, t0)), Some((N2uEnd::Node, t1))),
+            Some("upstream closed the stream")
+        );
+        assert_eq!(
+            raw_proxy_fault(4001, Some((true, t0)), None),
+            Some("upstream closed the stream")
+        );
+        // the node left first and the upstream closed after it: nobody to rotate out
+        assert_eq!(
+            raw_proxy_fault(4001, Some((true, t1)), Some((N2uEnd::Node, t0))),
+            None
+        );
+        // the node stopped reading (write to it failed): not the upstream's fault
+        assert_eq!(raw_proxy_fault(4001, Some((false, t0)), None), None);
+        // side ports: an upstream closing after an RPC answer is normal, a stall is not
+        assert_eq!(raw_proxy_fault(4002, Some((true, t0)), None), None);
+        assert_eq!(
+            raw_proxy_fault(4002, None, Some((N2uEnd::UpstreamGone, t0))),
+            None
+        );
+        assert_eq!(
+            raw_proxy_fault(4002, None, Some((N2uEnd::UpstreamStalled, t0))),
+            Some("upstream stopped reading")
+        );
+        assert_eq!(
+            raw_proxy_fault(4001, None, Some((N2uEnd::UpstreamGone, t0))),
+            Some("upstream write failed")
+        );
+    }
 
     #[tokio::test]
     async fn proxy_first_frame_rejects_status_frames_and_oversize() {

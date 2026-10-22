@@ -20,7 +20,10 @@ use crate::protocol::{
     round_lag_from_tip, unix_secs, HeaderRead, ACTIVE_ROUND_MAX_LAG, GREET_FALSE, GREET_TRUE,
     MAX_LIVE_FRAME,
 };
-use crate::push::{serve_push, splice, PushConfig, MAX_ACTIVE_ROUND_JUMP, NODE_WRITE_TIMEOUT};
+use crate::push::{
+    push_exit_is_upstream_fault, serve_push, splice, PushConfig, MAX_ACTIVE_ROUND_JUMP,
+    NODE_WRITE_TIMEOUT,
+};
 
 // ---- full P2P gateway ----
 
@@ -796,6 +799,7 @@ async fn serve_push_repinned(
     node: &Arc<NodeState>,
     priority: &Arc<PriorityTier>,
     pool: &Arc<Mutex<Vec<String>>>,
+    cooldown: &PeerCooldown,
     // the priority slot live selection already took for this peer (None: take one here)
     prio_session: Option<PrioritySession>,
     mode: &str,
@@ -860,9 +864,11 @@ async fn serve_push_repinned(
             exit_reason
         );
         node.clear_active_if_current(&last_peer);
+        cool_down_on_fault(priority, cooldown, &last_peer.ip, &exit_reason);
         return;
     }
     let exit_reason = serve_push(down, upc, cfg).await;
+    cool_down_on_fault(priority, cooldown, &active_ip, &exit_reason);
     gwlog!(
         "[gw] [{}] 4001 push session ended active_peer={} tier={} mode={} secs={} reason={}",
         node.ip,
@@ -872,6 +878,52 @@ async fn serve_push_repinned(
         started.elapsed().as_secs(),
         exit_reason
     );
+}
+
+// A peer whose node session just ended on an upstream fault (stall, round jump, lag, EOF, ...)
+// vets fine on a fresh connect but couldn't sustain the stream, so the node's reconnect must not
+// land on it again straight away: priority peers take the tier's cooldown, pool peers this one.
+const SESSION_FAULT_COOLDOWN: Duration = Duration::from_secs(30);
+
+#[derive(Default)]
+struct PeerCooldown(Mutex<HashMap<String, Instant>>);
+
+impl PeerCooldown {
+    fn mark(&self, ip: &str, now: Instant) {
+        let mut m = self.0.lock().unwrap();
+        m.retain(|_, until| *until > now);
+        m.insert(ip.to_string(), now + SESSION_FAULT_COOLDOWN);
+    }
+
+    // `peers` minus those cooling down, order kept; all of them if every one is cooling (a pool
+    // that only has recently-faulted peers is still better than none).
+    fn usable(&self, peers: Vec<String>, now: Instant) -> Vec<String> {
+        let m = self.0.lock().unwrap();
+        if m.is_empty() {
+            return peers;
+        }
+        let out: Vec<String> = peers
+            .iter()
+            .filter(|ip| m.get(*ip).is_none_or(|until| *until <= now))
+            .cloned()
+            .collect();
+        if out.is_empty() {
+            peers
+        } else {
+            out
+        }
+    }
+}
+
+fn cool_down_on_fault(priority: &PriorityTier, cooldown: &PeerCooldown, ip: &str, reason: &str) {
+    if !push_exit_is_upstream_fault(reason) {
+        return;
+    }
+    if priority.contains(ip) {
+        priority.mark_failed(ip);
+    } else {
+        cooldown.mark(ip, Instant::now());
+    }
 }
 
 // Priority candidates first (least-loaded), then the pool rotated from `start`, deduped.
@@ -994,6 +1046,7 @@ async fn serve_push_4001_fallback(
         &node,
         &ctx.priority,
         &ctx.pool,
+        &ctx.cooldown,
         slot,
         "fallback",
         PushConfig {
@@ -2236,6 +2289,8 @@ struct GatewayCtx {
     priority: Arc<PriorityTier>,
     // the live peer pool (peerd's file, refreshed every 30s) — failover standbys are drawn from it
     pool: Arc<Mutex<Vec<String>>>,
+    // pool peers whose last node session ended on an upstream fault, skipped for a while
+    cooldown: Arc<PeerCooldown>,
     cache_coldstart: bool,
     push: bool,
     n_live: usize,
@@ -2480,6 +2535,7 @@ async fn replay_cache_then_live(
             &node,
             &ctx.priority,
             &ctx.pool,
+            &ctx.cooldown,
             live.prio_session,
             "cache-live",
             PushConfig {
@@ -2668,6 +2724,7 @@ async fn handle_4001_live(
                 &node,
                 &ctx.priority,
                 &ctx.pool,
+                &ctx.cooldown,
                 live.prio_session,
                 "live",
                 PushConfig {
@@ -3106,6 +3163,7 @@ pub(crate) async fn run_gateway(
         state_servers: Arc::new(Mutex::new(Vec::new())),
         priority: priority.clone(),
         pool: pool.clone(),
+        cooldown: Arc::new(PeerCooldown::default()),
         cache_coldstart,
         push,
         n_live,
@@ -3143,7 +3201,9 @@ pub(crate) async fn run_gateway(
                     let mut down = down;
                     down.set_nodelay(true).ok();
                     let (node, _conn_guard) = nodes.get_or_insert(addr.ip(), unix_secs());
-                    let peers = pool.lock().unwrap().clone();
+                    let peers = ctx
+                        .cooldown
+                        .usable(pool.lock().unwrap().clone(), Instant::now());
                     if peers.is_empty() && ctx.priority.is_empty() {
                         return;
                     }
@@ -3505,6 +3565,60 @@ mod tests {
             tip + VET_MAX_ROUNDS_ABOVE_TIP + 1,
             tip
         ));
+    }
+
+    #[test]
+    fn a_session_fault_cools_the_peer_down_for_the_next_selection() {
+        let pool: Vec<String> = ["1.1.1.1", "2.2.2.2", "3.3.3.3"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let cooldown = PeerCooldown::default();
+        let priority = PriorityTier::new(
+            vec!["9.9.9.9".into()],
+            0,
+            Duration::from_millis(1500),
+            BootstrapPolicy::Fallback,
+        );
+        // the node leaving is not the peer's fault
+        cool_down_on_fault(&priority, &cooldown, "2.2.2.2", "node outbound ended");
+        cool_down_on_fault(
+            &priority,
+            &cooldown,
+            "2.2.2.2",
+            "node outbound read failed: x",
+        );
+        for internal_or_node in ["node writer closed", "event channel closed"] {
+            cool_down_on_fault(&priority, &cooldown, "2.2.2.2", internal_or_node);
+        }
+        assert_eq!(cooldown.usable(pool.clone(), Instant::now()), pool);
+        // a stalled stream is: the reconnect skips the peer until the cooldown runs out
+        cool_down_on_fault(
+            &priority,
+            &cooldown,
+            "2.2.2.2",
+            "active stream error: no block progress for 30s",
+        );
+        let now = Instant::now();
+        assert_eq!(cooldown.usable(pool.clone(), now), ["1.1.1.1", "3.3.3.3"]);
+        assert_eq!(
+            cooldown.usable(
+                pool.clone(),
+                now + SESSION_FAULT_COOLDOWN + Duration::from_secs(1)
+            ),
+            pool
+        );
+        // a pool of only cooling peers is still used
+        assert_eq!(cooldown.usable(vec!["2.2.2.2".into()], now), ["2.2.2.2"]);
+        // a priority peer takes the tier's own cooldown
+        cool_down_on_fault(
+            &priority,
+            &cooldown,
+            "9.9.9.9",
+            "active stream error: early eof",
+        );
+        assert!(priority.candidates().is_empty());
+        assert_eq!(cooldown.usable(pool.clone(), now), ["1.1.1.1", "3.3.3.3"]);
     }
 
     #[test]
