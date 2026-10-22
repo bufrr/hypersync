@@ -3,11 +3,15 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::time::timeout;
 
-use crate::gateway::{MIN_COMPLETE_BOOTSTRAP_BYTES, MIN_COMPLETE_BOOTSTRAP_FRAMES};
-
 pub(crate) const GREET_FALSE: [u8; 8] = [0, 0, 0, 3, 0, 0, 0, 0]; // send_abci:false (live blocks; no rate-limited state)
 pub(crate) const GREET_TRUE: [u8; 8] = [0, 0, 0, 3, 0, 1, 0, 0]; // send_abci:true (full bootstrap stream)
 pub(crate) const MIN_PLAUSIBLE_MAINNET_ROUND: u32 = 1_000_000_000;
+// A capture that ends (timeout / EOF / rate collapse) at a frame boundary counts as complete only
+// past this size. It has to track the real bootstrap: at the old 4.4GB a stall inside the 2026-10
+// EVM-KV tail (~5.8GB total) was installed and replayed as complete. ~90% of the 2026-10 size;
+// raise it again when the bootstrap grows (gw logs the size of every capture).
+pub(crate) const MIN_COMPLETE_BOOTSTRAP_BYTES: usize = 5_200_000_000;
+pub(crate) const MIN_COMPLETE_BOOTSTRAP_FRAMES: u64 = 4_000;
 // Largest frame accepted on a live (send_abci:false) 4001 stream. Live blocks average ~200KB
 // (2026-10); a bigger frame is a broken or hostile peer, and every queue that holds live frames is
 // also bounded in bytes (push::NODE_QUEUE_BYTES), so this only has to be generous for real blocks.

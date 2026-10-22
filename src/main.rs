@@ -17,14 +17,16 @@ mod priority;
 mod protocol;
 mod push;
 mod testing;
+mod util;
 
 use std::env;
 use tokio::net::TcpListener;
 
 use crate::gateway::run_gateway;
-use crate::peerd::{run_peerd, split_csv};
+use crate::peerd::run_peerd;
 use crate::push::{run_proxy, run_relay, serve};
 use crate::testing::{run_bench, run_cache, run_fakenode, run_mock};
+use crate::util::split_csv;
 
 // glibc raises its mmap threshold (up to 32MB) each time a large mmapped chunk is freed, after
 // which multi-MB buffers (4002 client-block responses, up to ~57MB) are carved from per-thread
@@ -106,7 +108,7 @@ async fn main() {
     if args.get(1).map(|s| s.as_str()) == Some("proxy") {
         // default: transparent proxy + failover (NO block push).
         // optional `--push`: route live blocks through serve_push for active-stream monitoring.
-        // Shadow multi-source injection is disabled until block/proposer validation is added.
+        // Only the active upstream ever feeds the node (no multi-source block merging).
         let push = args.iter().any(|a| a == "--push");
         let upstreams: Vec<String> = args
             .iter()
@@ -141,24 +143,23 @@ async fn main() {
     if args.get(1).map(|s| s.as_str()) == Some("gateway") {
         // full P2P gateway: reads the node's OWN peer file (path arg) for its upstream pool, then
         // relays bootstrap/live/RPC through an active peer, with optional bootstrap cache.
-        let node_peer_file =
-            gateway_peer_file(&args[2..]).unwrap_or_else(|| "/nodepeers".to_string());
-        // --push: use serve_push's active transparent backbone; an active-stream stall/death
-        //   tears the session down so the node reconnects and a fresh active is pinned. Shadow
-        //   multi-source injection is currently disabled, so --live N is only a future capacity knob.
+        // --push: use serve_push's round-gated active stream; an active-stream stall/death tears
+        //   the session down so the node reconnects and a fresh active is pinned.
         // --cache: additionally capture the bootstrap and replay it on a node cold-start, avoiding the
         //   per-IP abci_state rate-limit on node restart. Trade-off: a cache-cold-started node has no
         //   peer relationship, so its client-block RPC (4002) must be fetched-and-forwarded rather
         //   than spliced. Default off = robust transparent bootstrap (node keeps a real peer).
-        let push = args.iter().any(|a| a == "--push");
-        let cache_coldstart = args.iter().any(|a| a == "--cache");
-        let n_live = args
-            .iter()
-            .position(|a| a == "--live")
-            .and_then(|i| args.get(i + 1))
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(5);
-        run_gateway(node_peer_file, push, cache_coldstart, n_live).await;
+        let g = match parse_gateway_args(&args[2..]) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("gateway: {e}\nusage: hypersync gateway <peers.json> [--push] [--cache]");
+                std::process::exit(2);
+            }
+        };
+        if g.live_ignored {
+            eprintln!("[gw] --live is ignored: multi-source push was removed");
+        }
+        run_gateway(g.peer_file, g.push, g.cache).await;
         return;
     }
     // default `<port> <peers>` mode: multi-upstream live-block merge. Testing/aux only — `pump`
@@ -208,36 +209,66 @@ async fn main() {
     }
 }
 
-// The gateway's peer-file path: the first positional argument, skipping flags and the value of
-// `--live`, so `gateway --push /pd/peers.json` works as well as `gateway /pd/peers.json --push`.
-fn gateway_peer_file(args: &[String]) -> Option<String> {
+#[derive(Debug, PartialEq)]
+struct GatewayArgs {
+    peer_file: String,
+    push: bool,
+    cache: bool,
+    // `--live N` was given: accepted (old compose files pass it) but no longer does anything
+    live_ignored: bool,
+}
+
+// `gateway [<peers.json>] [--push] [--cache] [--live N]`, flags in any order. The peer file
+// defaults to /nodepeers. Anything else — an unknown flag, a second path, `--live` without a
+// number — is an error rather than silently starting with the wrong config.
+fn parse_gateway_args(args: &[String]) -> Result<GatewayArgs, String> {
+    let mut g = GatewayArgs {
+        peer_file: String::new(),
+        push: false,
+        cache: false,
+        live_ignored: false,
+    };
     let mut it = args.iter();
     while let Some(a) = it.next() {
-        if a == "--live" {
-            it.next();
-        } else if !a.starts_with("--") {
-            return Some(a.clone());
+        match a.as_str() {
+            "--push" => g.push = true,
+            "--cache" => g.cache = true,
+            "--live" => match it.next().and_then(|v| v.parse::<u32>().ok()) {
+                Some(_) => g.live_ignored = true,
+                None => return Err("--live needs a number".into()),
+            },
+            f if f.starts_with("--") => return Err(format!("unknown flag {f}")),
+            path if g.peer_file.is_empty() => g.peer_file = path.to_string(),
+            extra => return Err(format!("unexpected argument {extra}")),
         }
     }
-    None
+    if g.peer_file.is_empty() {
+        g.peer_file = "/nodepeers".into();
+    }
+    Ok(g)
 }
 
 #[cfg(test)]
 mod tests {
     #[test]
-    fn gateway_peer_file_skips_flags() {
-        let v = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
-        let f = |s: &[&str]| super::gateway_peer_file(&v(s));
+    fn gateway_args_are_strict() {
+        let p = |s: &[&str]| {
+            super::parse_gateway_args(&s.iter().map(|x| x.to_string()).collect::<Vec<_>>())
+        };
+        let ok = |s: &[&str]| p(s).unwrap();
+        // the compose command (with the now-ignored --live) and flags in any order
+        let g = ok(&["/pd/peers.json", "--push", "--live", "5"]);
         assert_eq!(
-            f(&["/pd/peers.json", "--push", "--live", "5"]).as_deref(),
-            Some("/pd/peers.json")
+            (g.peer_file.as_str(), g.push, g.cache, g.live_ignored),
+            ("/pd/peers.json", true, false, true)
         );
-        assert_eq!(
-            f(&["--push", "/pd/peers.json"]).as_deref(),
-            Some("/pd/peers.json")
-        );
-        assert_eq!(f(&["--live", "5", "--push", "/x"]).as_deref(), Some("/x"));
-        assert_eq!(f(&["--push", "--live", "5"]), None);
+        assert_eq!(ok(&["--push", "--cache", "/x"]).peer_file, "/x");
+        assert_eq!(ok(&["--push"]).peer_file, "/nodepeers");
+        // what used to start silently with the wrong peer file / config
+        assert!(p(&["--live", "/pd/peers.json"]).is_err());
+        assert!(p(&["--push", "--live"]).is_err());
+        assert!(p(&["/pd/peers.json", "--psuh"]).is_err());
+        assert!(p(&["/pd/peers.json", "/other.json"]).is_err());
     }
 
     #[cfg(all(target_os = "linux", target_env = "gnu"))]

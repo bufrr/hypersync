@@ -7,10 +7,12 @@ use tokio::time::timeout;
 
 use crate::gateway::{
     response_has_client_block_round_too_large, response_has_client_block_round_too_small,
-    response_has_no_client_blocks, response_is_peer_only, MIN_COMPLETE_BOOTSTRAP_BYTES,
-    MIN_COMPLETE_BOOTSTRAP_FRAMES,
+    response_has_no_client_blocks, response_is_peer_only,
 };
-use crate::protocol::{block_round, block_round_full, RoundDedup, GREET_FALSE, GREET_TRUE};
+use crate::protocol::{
+    block_round, block_round_full, RoundDedup, GREET_FALSE, GREET_TRUE,
+    MIN_COMPLETE_BOOTSTRAP_BYTES, MIN_COMPLETE_BOOTSTRAP_FRAMES,
+};
 
 // Caching gateway (always-on store-and-forward):
 //  - state feeder (send_abci:true via docker-proxy): fetches the full abci_state ONCE and caches it.

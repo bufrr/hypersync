@@ -39,7 +39,7 @@ Point each node at the gateway in `override_gossip_config.json` and restart it:
 
 | Command | Use |
 |---|---|
-| `gateway <peers.json> [--push] [--cache] [--live N]` | The gateway. Compose runs `--push` without `--cache`. |
+| `gateway <peers.json> [--push] [--cache]` | The gateway. Compose runs `--push` without `--cache`. |
 | `peerd [interval-secs]` | Peer discovery and probing (default 300 s; compose uses 120). Run as its own container. |
 | `proxy <ip1,ip2,...> [--push]` | Failover proxy over a fixed upstream list instead of peerd's pool. |
 | `relay <ip>` | Plain relay of 4000-4010 to one upstream. |
@@ -50,7 +50,6 @@ Gateway flags:
 
 - **`--push`** (recommended): live blocks pass through the gateway's checks (below) instead of a raw splice, and a bad upstream ends the session so the node reconnects to a fresh one.
 - **`--cache`**: keep the full bootstrap (~5.8 GB) in memory and on disk and replay it to cold-starting nodes, avoiding the per-IP abci_state rate limit. Holds up to ~3 bootstraps at once (~17 GB: the cache plus a refresh capture and a fallback tap), which pushed a 64 GB host shared with an hl-node past hl-visor's low-memory restart threshold — so it is off by default. A capture is installed only if it ends in live blocks, but a hostile state peer could still append a few fake ones to an incomplete state; enable it only with state peers you trust. Without it, a node restart bootstraps from a peer that is serving state right now (the gateway remembers recent state servers).
-- **`--live N`**: reserved for multi-source push (disabled).
 
 ## Configuration
 
@@ -94,6 +93,8 @@ Live frames over 8 MB end the session (blocks average ~200 KB), at most 64 MB of
 **Network round tip.** peerd publishes the median round of the largest cluster of probed peers, so a minority of peers (even a few colluding ones) can't move it; a majority of the probed peers lying still could. The gateway replaces its tip with each fresh reading and resets it to unknown (with a `WARN`) if none arrives for 15 minutes, rather than freezing on a stale value.
 
 **Pool.** Re-read every 30 s; a missing or empty `peers.json` keeps the previous pool.
+
+**Bootstrap relay.** A state server that sends nothing for 60 s ends the relay so the node retries elsewhere; one that ends before delivering the whole abci_state is no longer tried first.
 
 **Client blocks (4002).** The node's active peer answers alone for 2 s, then up to 8 others are hedged in. 15 s per request, at most 8 requests at once.
 

@@ -8,3 +8,7 @@ plan.md
 docs/*.html
 docs/superpowers/
 docs/hypersync-vs-quicknode.md
+
+# local working notes and review snapshots
+tasks/
+*.diff

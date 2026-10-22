@@ -20,4 +20,4 @@ ENTRYPOINT ["/usr/local/bin/hypersync"]
 # expected at /pd (bind-mount the peerd data dir there). --cache is opt-in (it holds a ~6 GB
 # bootstrap in RAM plus refresh races); append it only with that memory headroom to spare.
 # Override CMD for other subcommands.
-CMD ["gateway", "/pd/peers.json", "--push", "--live", "5"]
+CMD ["gateway", "/pd/peers.json", "--push"]

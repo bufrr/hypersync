@@ -18,12 +18,13 @@ use crate::protocol::{
     finish_header_after_partial, is_plausible_mainnet_round, max_block_round_in_frames,
     read_header_or_timeout, read_live_frame_with_timeout, response_is_peer_full,
     round_lag_from_tip, unix_secs, HeaderRead, ACTIVE_ROUND_MAX_LAG, GREET_FALSE, GREET_TRUE,
-    MAX_LIVE_FRAME,
+    MAX_LIVE_FRAME, MIN_COMPLETE_BOOTSTRAP_BYTES,
 };
 use crate::push::{
-    push_exit_is_upstream_fault, serve_push, splice, PushConfig, MAX_ACTIVE_ROUND_JUMP,
-    NODE_WRITE_TIMEOUT,
+    push_exit_is_upstream_fault, serve_push, splice, splice_with_idle, PushConfig, Relayed,
+    MAX_ACTIVE_ROUND_JUMP, NODE_WRITE_TIMEOUT,
 };
+use crate::util::lock;
 
 // ---- full P2P gateway ----
 
@@ -75,7 +76,7 @@ fn install_bootstrap_cache(blob: Vec<u8>, source: &str, sink: &CacheSink) {
         "[gw] bootstrap captured from {source}: {} MB",
         blob.len() / 1_000_000
     );
-    *sink.boot_blob.lock().unwrap() = Some(blob.clone());
+    *lock(&sink.boot_blob) = Some(blob.clone());
     sink.boot_blob_cached_at
         .store(unix_secs(), Ordering::Release);
     if let Some(path) = sink.disk_cache_path.clone() {
@@ -834,7 +835,7 @@ async fn serve_push_repinned(
             Box::new(move |ip: &str, slot: Option<PrioritySession>| {
                 let p = node.pin_active(ip);
                 let s = slot.or_else(|| priority.try_acquire(ip));
-                *pin.lock().unwrap() = (p, s);
+                *lock(&pin) = (p, s);
             })
         };
         let exit_reason = serve_failover(
@@ -850,7 +851,7 @@ async fn serve_push_repinned(
         )
         .await;
         let (last_peer, _last_session) = {
-            let mut g = pin.lock().unwrap();
+            let mut g = lock(&pin);
             let p = g.0.clone();
             (p, g.1.take())
         };
@@ -890,7 +891,7 @@ struct PeerCooldown(Mutex<HashMap<String, Instant>>);
 
 impl PeerCooldown {
     fn mark(&self, ip: &str, now: Instant) {
-        let mut m = self.0.lock().unwrap();
+        let mut m = lock(&self.0);
         m.retain(|_, until| *until > now);
         m.insert(ip.to_string(), now + SESSION_FAULT_COOLDOWN);
     }
@@ -898,7 +899,7 @@ impl PeerCooldown {
     // `peers` minus those cooling down, order kept; all of them if every one is cooling (a pool
     // that only has recently-faulted peers is still better than none).
     fn usable(&self, peers: Vec<String>, now: Instant) -> Vec<String> {
-        let m = self.0.lock().unwrap();
+        let m = lock(&self.0);
         if m.is_empty() {
             return peers;
         }
@@ -929,21 +930,6 @@ fn cool_down_on_fault(priority: &PriorityTier, cooldown: &PeerCooldown, ip: &str
 // Priority candidates first (least-loaded), then the pool rotated from `start`, deduped.
 fn tiered_peers(priority: &PriorityTier, pool: &[String], start: usize) -> Vec<String> {
     ordered_candidates(priority.candidates(), pool, start)
-}
-
-// The push host set: the vetted live peer first (active backbone), padded with other pool peers
-// up to the live-upstream budget for the (currently disabled) shadow block sources.
-fn build_push_hosts(live_ip: &str, peers: &[String], n_live: usize) -> Vec<String> {
-    let mut hosts = vec![live_ip.to_string()];
-    for p in peers {
-        if hosts.len() >= n_live {
-            break;
-        }
-        if p != live_ip {
-            hosts.push(p.clone());
-        }
-    }
-    hosts
 }
 
 // hl-node abandons a fresh 4001 connection this long after sending its greeting ("connecting to
@@ -1052,7 +1038,6 @@ async fn serve_push_4001_fallback(
         PushConfig {
             hosts: Arc::new(vec![ip.clone()]),
             active_idx: 0,
-            port: 4001,
             prefetched_greeting: Some(greeting),
             prefetched_frames: Vec::new(),
             initial_last_forwarded,
@@ -1377,10 +1362,7 @@ async fn fetch_client_blocks_raced(
 ) -> Result<BudgetedFrame, String> {
     let started = Instant::now();
     // a remembered hedge winner (see NodeState::rpc_peer) stands in for a missing pin right away
-    let remembered = node
-        .rpc_peer
-        .lock()
-        .unwrap()
+    let remembered = lock(&node.rpc_peer)
         .clone()
         .filter(|ip| !crate::blacklist::contains(ip));
     let active = if remembered.is_some() {
@@ -1480,7 +1462,7 @@ async fn fetch_client_blocks_raced(
             attempts.abort_all();
             let stage = if tag.is_some() { "active" } else { "hedge" };
             if tag.is_none() && node.active_session_snapshot().is_none() {
-                *node.rpc_peer.lock().unwrap() = Some(ip.clone());
+                *lock(&node.rpc_peer) = Some(ip.clone());
             }
             log_client_blocks(node, priority, &ip, stage, &frame, started);
             return Ok(frame);
@@ -1599,12 +1581,6 @@ fn bootstrap_capture_err(
     ))
 }
 
-// A capture that ends (timeout / EOF / rate collapse) at a frame boundary counts as complete only
-// past this size. It has to track the real bootstrap: at the old 4.4GB a stall inside the 2026-10
-// EVM-KV tail (~5.8GB total) was installed and replayed as complete. ~90% of the 2026-10 size;
-// raise it again when the bootstrap grows (gw logs the size of every capture).
-pub(crate) const MIN_COMPLETE_BOOTSTRAP_BYTES: usize = 5_200_000_000;
-pub(crate) const MIN_COMPLETE_BOOTSTRAP_FRAMES: u64 = 4_000;
 const CACHE_REPLAY_COOLDOWN_SECS: u64 = 30;
 // How long a cache replay's live floor stays in force (it only covers the replay's backlog).
 const CACHE_FLOOR_TTL: Duration = Duration::from_secs(10 * 60);
@@ -2124,15 +2100,15 @@ impl NodeState {
             ip: ip.to_string(),
             epoch: self.next_active_epoch.fetch_add(1, Ordering::AcqRel) + 1,
         };
-        let mut active = self.active.lock().unwrap();
+        let mut active = lock(&self.active);
         *active = Some(peer.clone());
         self.lazy_active.store(false, Ordering::Release);
-        *self.rpc_peer.lock().unwrap() = None;
+        *lock(&self.rpc_peer) = None;
         peer
     }
 
     fn pin_lazy_active(&self, ip: &str) -> ActivePeer {
-        let mut active = self.active.lock().unwrap();
+        let mut active = lock(&self.active);
         unpin_blacklisted(&mut active);
         if let Some(peer) = active.clone() {
             return peer;
@@ -2147,13 +2123,13 @@ impl NodeState {
     }
 
     fn active_snapshot(&self) -> Option<ActivePeer> {
-        let mut active = self.active.lock().unwrap();
+        let mut active = lock(&self.active);
         unpin_blacklisted(&mut active);
         active.clone()
     }
 
     fn active_session_snapshot(&self) -> Option<ActivePeer> {
-        let mut active = self.active.lock().unwrap();
+        let mut active = lock(&self.active);
         unpin_blacklisted(&mut active);
         if self.lazy_active.load(Ordering::Acquire) {
             None
@@ -2163,11 +2139,11 @@ impl NodeState {
     }
 
     fn active_is_current(&self, peer: &ActivePeer) -> bool {
-        self.active.lock().unwrap().as_ref() == Some(peer)
+        lock(&self.active).as_ref() == Some(peer)
     }
 
     fn clear_active_if_current(&self, peer: &ActivePeer) {
-        let mut active = self.active.lock().unwrap();
+        let mut active = lock(&self.active);
         if active.as_ref() == Some(peer) {
             *active = None;
         }
@@ -2175,7 +2151,7 @@ impl NodeState {
 
     // "This node has a live session" — a lazy misc-port pin doesn't count.
     fn has_active_session(&self) -> bool {
-        let mut active = self.active.lock().unwrap();
+        let mut active = lock(&self.active);
         unpin_blacklisted(&mut active);
         active.is_some() && !self.lazy_active.load(Ordering::Acquire)
     }
@@ -2246,7 +2222,7 @@ impl NodeRegistry {
     // Returns the node's state plus a guard that holds its open-connection count; keep the guard
     // alive for the life of the connection task.
     fn get_or_insert(&self, ip: IpAddr, now: u64) -> (Arc<NodeState>, NodeConnGuard) {
-        let mut nodes = self.nodes.lock().unwrap();
+        let mut nodes = lock(&self.nodes);
         if let Some(state) = nodes.get(&ip) {
             state.last_seen_secs.store(now, Ordering::Release);
             state.open_conns.fetch_add(1, Ordering::AcqRel);
@@ -2293,13 +2269,20 @@ struct GatewayCtx {
     cooldown: Arc<PeerCooldown>,
     cache_coldstart: bool,
     push: bool,
-    n_live: usize,
 }
 
 const STATE_SERVER_MEMORY: usize = 8;
+// A 4001 relay (bootstrap transfer, then live blocks) that hears nothing from its upstream this
+// long has a stalled peer: end it so the node reconnects elsewhere. Live blocks arrive several
+// times a second and the state transfer streams continuously, so this never cuts a healthy relay.
+const RELAY_UPSTREAM_IDLE: Duration = Duration::from_secs(60);
+
+fn forget_state_server(list: &Mutex<Vec<String>>, ip: &str) {
+    lock(list).retain(|x| x != ip);
+}
 
 fn remember_state_server(list: &Mutex<Vec<String>>, ip: &str) {
-    let mut l = list.lock().unwrap();
+    let mut l = lock(list);
     l.retain(|x| x != ip);
     l.insert(0, ip.to_string());
     l.truncate(STATE_SERVER_MEMORY);
@@ -2389,7 +2372,7 @@ fn cache_replay_blob(node: &NodeState, ctx: &GatewayCtx) -> Option<Arc<Vec<u8>>>
     let last = node.last_cache_replay_secs.load(Ordering::Acquire);
     let has_active_session = node.has_active_session();
     let cached_at = ctx.boot_blob_cached_at.load(Ordering::Acquire);
-    let blob = ctx.boot_blob.lock().unwrap().clone()?;
+    let blob = lock(&ctx.boot_blob).clone()?;
     if should_replay_cache(now, last, has_active_session, cached_at) {
         if node
             .replay_in_flight
@@ -2524,11 +2507,7 @@ async fn replay_cache_then_live(
             live.first_round,
             hex_bytes(&live.greeting)
         );
-        let hosts = if ctx.push {
-            build_push_hosts(&live.ip, &peers, ctx.n_live)
-        } else {
-            vec![live.ip.clone()]
-        };
+        let hosts = vec![live.ip.clone()];
         serve_push_repinned(
             down,
             live.stream,
@@ -2541,7 +2520,6 @@ async fn replay_cache_then_live(
             PushConfig {
                 hosts: Arc::new(hosts),
                 active_idx: 0,
-                port: 4001,
                 prefetched_greeting: Some(live.greeting),
                 prefetched_frames: live.prefetched_frames,
                 initial_last_forwarded: cache_floor,
@@ -2582,7 +2560,7 @@ async fn transparent_bootstrap(
     let start = ctx
         .rr
         .fetch_add(BOOTSTRAP_SELECT_MAX_PEERS, Ordering::Relaxed);
-    let remembered = ctx.state_servers.lock().unwrap().clone();
+    let remembered = lock(&ctx.state_servers).clone();
     let candidates = bootstrap_source_list(
         ctx.priority.bootstrap,
         ctx.priority.candidates(),
@@ -2659,8 +2637,15 @@ async fn transparent_bootstrap(
         // Free the 64MB prefetch before the splice: the bootstrap connection can stay open long
         // after the state transfer, and keeping it in scope held 64MB per open bootstrap
         // connection (2026-10-21 2-node soak: 68MB resident for 25+ min).
+        let prefetched = (hdr.len() + payload_prefix.len()) as u64;
         drop(payload_prefix);
-        splice(down, upc).await;
+        let r = splice_with_idle(down, upc, Some(RELAY_UPSTREAM_IDLE)).await;
+        // remembered above so concurrent bootstraps benefit at once; a server that stalled or
+        // closed before delivering the whole abci_state frame must not head the next bootstrap
+        // (a node that left mid-transfer says nothing about the server)
+        if r.upstream_ended && prefetched + r.to_node < 5 + abci_len as u64 {
+            forget_state_server(&ctx.state_servers, &ip);
+        }
     }
 }
 
@@ -2715,9 +2700,8 @@ async fn handle_4001_live(
                 live.first_round,
                 hex_bytes(&live.greeting)
             );
-            // active stays transparent and owns the peer relationship used by 4002. Shadow
-            // multi-source injection is disabled for correctness.
-            let hosts = build_push_hosts(&live.ip, &peers, ctx.n_live);
+            // active stays transparent and owns the peer relationship used by 4002
+            let hosts = vec![live.ip.clone()];
             serve_push_repinned(
                 down,
                 live.stream,
@@ -2730,7 +2714,6 @@ async fn handle_4001_live(
                 PushConfig {
                     hosts: Arc::new(hosts),
                     active_idx: 0,
-                    port: 4001,
                     prefetched_greeting: Some(live.greeting),
                     prefetched_frames: live.prefetched_frames,
                     initial_last_forwarded: 0,
@@ -2792,7 +2775,9 @@ async fn handle_4001_live(
     ) {
         return;
     }
-    let (to_node, to_peer) = splice(down, upc).await;
+    let Relayed {
+        to_node, to_peer, ..
+    } = splice_with_idle(down, upc, Some(RELAY_UPSTREAM_IDLE)).await;
     gwlog!(
         "[gw] [{}] 4001 splice ended peer={} tier={} secs={} bytes_to_node={} bytes_to_peer={}",
         node.ip,
@@ -2860,12 +2845,7 @@ fn fresh_peer_file_tip(path: &str) -> Option<u32> {
 //     other gossip ports are transparently spliced.
 // If the active peer has a problem the session tears down and the node's reconnect elects a fresh
 // peer from the (continuously refreshed) pool.
-pub(crate) async fn run_gateway(
-    node_peer_file: String,
-    push: bool,
-    cache_coldstart: bool,
-    n_live: usize,
-) {
+pub(crate) async fn run_gateway(node_peer_file: String, push: bool, cache_coldstart: bool) {
     let priority = Arc::new(PriorityTier::from_env());
     let blacklist_dir = peer_file_dir(&node_peer_file);
     crate::blacklist::reload("gw", &blacklist_dir);
@@ -2884,7 +2864,7 @@ pub(crate) async fn run_gateway(
                     blob.len() / 1_000_000,
                     unix_secs().saturating_sub(cached_at)
                 );
-                *boot_blob.lock().unwrap() = Some(Arc::new(blob));
+                *lock(&boot_blob) = Some(Arc::new(blob));
                 boot_blob_cached_at.store(cached_at, Ordering::Release);
             }
             Ok(None) => {
@@ -2915,20 +2895,19 @@ pub(crate) async fn run_gateway(
         net_round_tip.store(tip, Ordering::Release);
     }
     gwlog!(
-        "[gw] full P2P gateway: pool from {} ({} peers); bootstrap={}; live={}; live-upstream budget={}",
+        "[gw] full P2P gateway: pool from {} ({} peers); bootstrap={}; live={}",
         node_peer_file,
-        pool.lock().unwrap().len(),
+        lock(&pool).len(),
         if cache_coldstart {
             "cache-coldstart(+transparent fallback)"
         } else {
             "transparent"
         },
         if push {
-            "block-push(transparent active backbone + shadow-disabled)"
+            "block-push(round-gated active peer)"
         } else {
             "transparent splice"
-        },
-        n_live
+        }
     );
     gwlog!("[gw] upstream tiers: {}", priority.describe());
 
@@ -2948,7 +2927,7 @@ pub(crate) async fn run_gateway(
                     // missing/unreadable/empty file (peerd itself never writes an empty pool over
                     // a good one): keep serving from the last pool rather than dropping every
                     // upstream — minus anything blacklisted since
-                    let mut pool = pool.lock().unwrap();
+                    let mut pool = lock(&pool);
                     pool.retain(|ip| !crate::blacklist::contains(ip));
                     if !pool.is_empty() {
                         gwlog!(
@@ -2956,7 +2935,7 @@ pub(crate) async fn run_gateway(
                         );
                     }
                 } else {
-                    *pool.lock().unwrap() = p;
+                    *lock(&pool) = p;
                 }
                 let fresh = fresh_peer_file_tip(&path);
                 if fresh.is_some() {
@@ -3002,14 +2981,14 @@ pub(crate) async fn run_gateway(
                     // blob stays valid, so refreshes use a small rotated window before the replay
                     // freshness window expires (gentle on peers, lets per-peer abci_state limits
                     // recover).
-                    let have_cache = boot_blob.lock().unwrap().is_some();
+                    let have_cache = lock(&boot_blob).is_some();
                     let now = unix_secs();
                     let cached_at = boot_blob_cached_at.load(Ordering::Acquire);
                     let have_fresh_cache = have_cache && is_bootstrap_cache_fresh(now, cached_at);
                     if have_cache && !have_fresh_cache {
                         // past the freshness window it can never be replayed again: free the
                         // ~6GB now instead of holding it alongside the refresh captures
-                        *boot_blob.lock().unwrap() = None;
+                        *lock(&boot_blob) = None;
                     }
                     if have_fresh_cache {
                         let next_refresh = cached_at.saturating_add(CACHE_REFRESH_SECS);
@@ -3022,7 +3001,7 @@ pub(crate) async fn run_gateway(
                             .await;
                             continue;
                         }
-                        let live_count = pool.lock().unwrap().len();
+                        let live_count = lock(&pool).len();
                         if should_delay_cache_refresh_for_live_pool(now, cached_at, live_count) {
                             let cache_age = now.saturating_sub(cached_at);
                             let seconds_left =
@@ -3044,7 +3023,7 @@ pub(crate) async fn run_gateway(
                     }
                     let window = if have_fresh_cache { 24 } else { 64 };
                     let peers: Vec<String> = {
-                        let live = pool.lock().unwrap().clone();
+                        let live = lock(&pool).clone();
                         // the cache refresh never uses priority peers, whatever the policy
                         let full = priority.strip(bootstrap_capture_peers(
                             &capture_peer_file,
@@ -3106,7 +3085,7 @@ pub(crate) async fn run_gateway(
                             ip
                         );
                         let blob = Arc::new(blob);
-                        *boot_blob.lock().unwrap() = Some(blob.clone());
+                        *lock(&boot_blob) = Some(blob.clone());
                         boot_blob_cached_at.store(unix_secs(), Ordering::Release);
                         if let Some(path) = disk_cache_path.clone() {
                             tokio::task::spawn_blocking(move || {
@@ -3166,7 +3145,6 @@ pub(crate) async fn run_gateway(
         cooldown: Arc::new(PeerCooldown::default()),
         cache_coldstart,
         push,
-        n_live,
     };
 
     // listeners on 4000-4010. The node connects ONLY here; the gateway transparently relays each
@@ -3201,9 +3179,7 @@ pub(crate) async fn run_gateway(
                     let mut down = down;
                     down.set_nodelay(true).ok();
                     let (node, _conn_guard) = nodes.get_or_insert(addr.ip(), unix_secs());
-                    let peers = ctx
-                        .cooldown
-                        .usable(pool.lock().unwrap().clone(), Instant::now());
+                    let peers = ctx.cooldown.usable(lock(&pool).clone(), Instant::now());
                     if peers.is_empty() && ctx.priority.is_empty() {
                         return;
                     }
@@ -3483,7 +3459,7 @@ mod tests {
         }
         assert!(!has_live_tail(&blob));
         install_bootstrap_cache(blob, "test", &sink);
-        assert!(sink.boot_blob.lock().unwrap().is_none());
+        assert!(lock(&sink.boot_blob).is_none());
         // the same bulk followed by a few live blocks is a complete capture
         let mut complete = Vec::new();
         for r in 0..6u32 {
@@ -3755,16 +3731,16 @@ mod tests {
         // different ip -> fresh state
         let (b, b_guard) = reg.get_or_insert(ip_b, t0);
         assert!(!Arc::ptr_eq(&a1, &b));
-        assert!(b.active.lock().unwrap().is_none());
+        assert!(lock(&b.active).is_none());
         drop(b_guard); // stamps last_seen ~t0; ip_b now idle with no open connections
 
         // ip_a still has an open connection (a1_guard) -> survives TTL eviction; ip_b doesn't
         let later = t0 + NODE_STATE_TTL_SECS + 60;
         let ip_c: IpAddr = "10.0.0.3".parse().unwrap();
         let (_c, _c_guard) = reg.get_or_insert(ip_c, later);
-        assert!(reg.nodes.lock().unwrap().contains_key(&ip_a));
-        assert!(!reg.nodes.lock().unwrap().contains_key(&ip_b));
-        assert!(reg.nodes.lock().unwrap().contains_key(&ip_c));
+        assert!(lock(&reg.nodes).contains_key(&ip_a));
+        assert!(!lock(&reg.nodes).contains_key(&ip_b));
+        assert!(lock(&reg.nodes).contains_key(&ip_c));
         drop(a1_guard);
     }
 
@@ -4105,7 +4081,7 @@ mod tests {
             remember_state_server(&list, &format!("10.0.0.{i}"));
         }
         remember_state_server(&list, "10.0.0.5"); // re-serve moves to front, no duplicate
-        let l = list.lock().unwrap();
+        let l = lock(&list);
         assert_eq!(l.len(), STATE_SERVER_MEMORY);
         assert_eq!(l[0], "10.0.0.5");
         assert_eq!(l.iter().filter(|ip| *ip == "10.0.0.5").count(), 1);

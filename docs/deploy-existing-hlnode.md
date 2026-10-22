@@ -54,7 +54,7 @@ hypersync 的 compose 里，但需要加入 `hypersync_gwnet` 网络，并把
 
 - 先保持已有 HL node 正常运行，不要一开始就停掉或切到 gateway-only。
 - 先启动 `peerd + gw`，让 peerd 读取已有 HL node 的 `tcp_lz4_stats`，建立 live peer pool。
-- 等 `data/peers.json` 有稳定 `live_servers` 后，再切换 HL node。默认 compose 不开 `--cache`（`gateway /pd/peers.json --push --live 5`），不会生成 `data/bootstrap.cache`，也不需要等它；node 冷启动时 gateway 会透明转发一个正在提供 abci_state 的真实 peer 完成 bootstrap。只有确有内存余量时才按第 7 节开启 `--cache`。
+- 等 `data/peers.json` 有稳定 `live_servers` 后，再切换 HL node。默认 compose 不开 `--cache`（`gateway /pd/peers.json --push`），不会生成 `data/bootstrap.cache`，也不需要等它；node 冷启动时 gateway 会透明转发一个正在提供 abci_state 的真实 peer 完成 bootstrap。只有确有内存余量时才按第 7 节开启 `--cache`。
 - 生产推荐把 gw/peerd 部署在至少一个真实 HL node 所在机器。备选方案也必须保证 gw 出公网的源 IP 和一个健康 HL node 的公网 peer 行为一致。公网 HL peers 可能根据源 IP 是否有正常 `4001/4002` 行为来降级连接；如果 gw 放在一台没有 HL node 公网端口行为的空机器上，peerd/gw 可能拿不到稳定 live peer。
 - gateway 默认只在 Docker 内网 `hypersync_gwnet` 暴露。同机部署时不要把 gateway 的 `4000-4010` publish 到宿主机；真实 HL node 继续占用宿主机公网 `4001/4002`。异机 node 访问 gw 时，也只应把 gateway 发布到私网/VPN IP，并用防火墙只允许 HL node 来源 IP。
 - HL node 自己的公网 `4001/4002` 可以保持原状；这些端口属于 HL node，不是 gateway。
@@ -332,7 +332,7 @@ cat data/peers.json
 
 只有主机有足够内存余量、并且希望 node 重启时不依赖外部 peer 提供 abci_state 时，才开启 `--cache`：在
 `docker-compose.yml` 的 `gw` 服务 `command` 里追加 `"--cache"`（或用 compose override 覆盖 `command`），
-例如 `["gateway", "/pd/peers.json", "--push", "--cache", "--live", "5"]`，然后重新 `up -d`。
+例如 `["gateway", "/pd/peers.json", "--push", "--cache"]`，然后重新 `up -d`。
 
 gateway 使用 `--cache` 时会捕获完整 bootstrap，生成：
 

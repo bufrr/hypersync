@@ -123,6 +123,27 @@ async fn pump(
 // priority session it holds — until TCP gives up, ~15 min later. The relay also ends once the
 // upstream's IP is blacklisted (hot reload), so the node reconnects to an allowed peer.
 pub(crate) async fn splice(down: TcpStream, upc: TcpStream) -> (u64, u64) {
+    let r = splice_with_idle(down, upc, None).await;
+    (r.to_node, r.to_peer)
+}
+
+// What a relay carried, and which side ended it.
+pub(crate) struct Relayed {
+    pub(crate) to_node: u64,
+    pub(crate) to_peer: u64,
+    // the upstream ended it (closed, failed, went silent, was blacklisted) — not the node leaving
+    // or no longer reading
+    pub(crate) upstream_ended: bool,
+}
+
+// splice, also ending once the upstream has sent nothing for `upstream_idle` — for 4001 relays,
+// whose bootstrap transfer and live blocks flow continuously, so silence means a stalled peer
+// (side ports carry sporadic gossip and get no such limit).
+pub(crate) async fn splice_with_idle(
+    down: TcpStream,
+    upc: TcpStream,
+    upstream_idle: Option<Duration>,
+) -> Relayed {
     let up_ip = upc
         .peer_addr()
         .map(|a| a.ip().to_string())
@@ -136,26 +157,39 @@ pub(crate) async fn splice(down: TcpStream, upc: TcpStream) -> (u64, u64) {
         let to_node = to_node.clone();
         tokio::spawn(async move {
             let mut buf = vec![0u8; 256 * 1024];
+            // true when the upstream side ended the copy, false when the node stopped taking it
             loop {
-                let n = match ur.read(&mut buf).await {
-                    Ok(0) | Err(_) => break,
+                let read = ur.read(&mut buf);
+                let n = match upstream_idle {
+                    Some(idle) => match timeout(idle, read).await {
+                        Ok(r) => r,
+                        Err(_) => break true,
+                    },
+                    None => read.await,
+                };
+                let n = match n {
+                    Ok(0) | Err(_) => break true,
                     Ok(n) => n,
                 };
                 match timeout(NODE_WRITE_TIMEOUT, dw.write_all(&buf[..n])).await {
                     Ok(Ok(())) => {}
-                    _ => break,
+                    _ => break false,
                 }
                 to_node.fetch_add(n as u64, Ordering::Relaxed);
             }
         })
     });
-    let to_peer = tokio::select! {
-        r = tokio::io::copy(&mut dr, &mut uw) => r.unwrap_or(0),
-        _ = &mut h.0 => 0,
-        _ = crate::blacklist::wait_blacklisted(&up_ip) => 0,
+    let (to_peer, upstream_ended) = tokio::select! {
+        r = tokio::io::copy(&mut dr, &mut uw) => (r.unwrap_or(0), false),
+        r = &mut h.0 => (0, r.unwrap_or(false)),
+        _ = crate::blacklist::wait_blacklisted(&up_ip) => (0, true),
     };
     drop(h);
-    (to_node.load(Ordering::Relaxed), to_peer)
+    Relayed {
+        to_node: to_node.load(Ordering::Relaxed),
+        to_peer,
+        upstream_ended,
+    }
 }
 
 // A spawned task that is aborted when its owner is dropped (a plain JoinHandle detaches).
@@ -228,8 +262,8 @@ impl ProxyState {
 // rotates to the next healthy peer on stall/dial-failure ("选择其他peer替代").
 // With push=true: the heavy block channel (4001) runs serve_push — live blocks from the active peer
 // are round-gated (dedup + live floor) before reaching the node, while the active connection stays
-// transparent for the node's outbound + control/state/RPC frames. Shadow peers are compiled out
-// (ENABLE_SHADOW_PUSH), so this does not merge blocks from other peers. serve_push itself is the
+// transparent for the node's outbound + control/state/RPC frames; no other peer's blocks are
+// merged in. serve_push itself is the
 // health signal then (idle, block progress, lag, implausible rounds): an upstream-side session end
 // fails the active over, and a failover ends every session of the older generation so 4001 and
 // 4002 always follow the same peer.
@@ -387,15 +421,14 @@ async fn proxy_conn(
         }
     }
     if push && p == 4001 && !bootstrap {
-        // live channel: round-gated blocks from the active peer (shadows are compiled out);
-        // active stays transparent for node->peer + control/RPC.
+        // live channel: round-gated blocks from the active peer; the active stays transparent
+        // for node->peer + control/RPC.
         let exit_reason = serve_push(
             down,
             upc,
             PushConfig {
                 hosts: st.hosts.clone(),
                 active_idx: idx,
-                port: p,
                 prefetched_greeting: Some(first),
                 prefetched_frames: Vec::new(),
                 initial_last_forwarded: 0,
@@ -575,11 +608,10 @@ async fn read_first_frame(
 }
 
 // Block-push serving (push mode, heavy channel): the active peer connection is transparent for the
-// node's outbound and the active peer's control / abci_state / RPC frames. Shadow peer injection is
-// compiled out (ENABLE_SHADOW_PUSH = false, no runtime switch): round-only dedup cannot prove proposer/fork correctness, and a wrong shadow
-// block can poison the node even when the active transparent peer is healthy.
+// node's outbound and the active peer's control / abci_state / RPC frames. Only the active peer
+// feeds the node: merging blocks from other peers by round alone cannot prove proposer/fork
+// correctness, and a wrong block can poison the node even when the active peer is healthy.
 const PUSH_MERGE_QUEUE_FRAMES: usize = 256;
-const ENABLE_SHADOW_PUSH: bool = false;
 // Generous: the node normally drains 4001 continuously; only a stuck/half-open node hits this.
 pub(crate) const NODE_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 // An upstream greeting reply is a few bytes sent right away; hl-node itself gives up ~5s after
@@ -642,10 +674,6 @@ impl NodeQueue {
     pub(crate) async fn send(&self, frame: Vec<u8>) -> Result<(), ()> {
         queue_frame(&self.tx, &self.budget, frame).await
     }
-
-    pub(crate) fn is_closed(&self) -> bool {
-        self.tx.is_closed()
-    }
 }
 
 pub(crate) struct BlockProgress {
@@ -686,7 +714,6 @@ impl BlockProgress {
 pub(crate) struct PushConfig {
     pub(crate) hosts: Arc<Vec<String>>,
     pub(crate) active_idx: usize,
-    pub(crate) port: u16,
     pub(crate) prefetched_greeting: Option<Vec<u8>>,
     pub(crate) prefetched_frames: Vec<Vec<u8>>,
     pub(crate) initial_last_forwarded: u32,
@@ -827,7 +854,6 @@ fn spawn_active_pump(
             live_floor,
             net_round_tip,
             active_round,
-            true,
             &stats,
         )
         .await
@@ -847,10 +873,8 @@ pub(crate) async fn serve_push(node: TcpStream, active_conn: TcpStream, cfg: Pus
     let active_round = Arc::new(AtomicU32::new(cfg.initial_last_forwarded));
     let stats = Arc::new(PushStats::default());
     // The node's first read on 4001 is the peer's greeting ("abci_stream recv greeting", max 1000
-    // bytes). Forward the active peer's greeting frame to the node BEFORE starting the shadow
-    // injectors: they all share node_w, so a shadow peer's first live block can otherwise reach the
-    // node ahead of the greeting, and the node reads the block's length as the greeting length and
-    // bails ("tcp read bytes over limit").
+    // bytes): forward the active peer's greeting frame before any block, or the node reads a
+    // block's length as the greeting length and bails ("tcp read bytes over limit").
     if let Some(greet) = cfg.prefetched_greeting {
         match timeout(NODE_WRITE_TIMEOUT, node_w.write_all(&greet)).await {
             Ok(Ok(())) => {}
@@ -905,7 +929,6 @@ pub(crate) async fn serve_push(node: TcpStream, active_conn: TcpStream, cfg: Pus
             &cfg.live_floor,
             &cfg.net_round_tip,
             &active_round,
-            true,
             &stats,
         )
         .await
@@ -943,8 +966,7 @@ pub(crate) async fn serve_push(node: TcpStream, active_conn: TcpStream, cfg: Pus
     // active peer -> node: the transparent backbone (forwards non-block frames + blocks). If the
     // active stream stalls or dies the session is torn down so the node reconnects and a fresh
     // active is elected — a mid-session replacement peer would start at its own tip and hand the
-    // node a block whose parent it never saw (invalid parent round). Shadow sources remain
-    // disabled unless validation is added.
+    // node a block whose parent it never saw (invalid parent round).
     let mut active_task = spawn_active_pump(
         act_r,
         tx.clone(),
@@ -954,51 +976,6 @@ pub(crate) async fn serve_push(node: TcpStream, active_conn: TcpStream, cfg: Pus
         active_round.clone(),
         stats.clone(),
     );
-    // every other peer -> node: live blocks only, deduped. Keep this off until shadow blocks are
-    // validated beyond round number.
-    let mut shadows = Vec::new();
-    if ENABLE_SHADOW_PUSH {
-        for (i, h) in cfg.hosts.iter().enumerate() {
-            if i == cfg.active_idx {
-                continue;
-            }
-            let target = format!("{}:{}", h, cfg.port);
-            let tx = tx.clone();
-            let forward_gate = forward_gate.clone();
-            let live_floor = cfg.live_floor.clone();
-            let net_round_tip = cfg.net_round_tip.clone();
-            shadows.push(tokio::spawn(async move {
-                // Reconnect with backoff: public peers drop their streams, and a shadow source that
-                // exited permanently would silently degrade the merge from n_live sources to fewer.
-                // Stop only when the node side is gone (the merge channel is closed).
-                while !tx.is_closed() {
-                    if let Ok(Ok(mut s)) =
-                        timeout(Duration::from_secs(5), crate::blacklist::connect(&target)).await
-                    {
-                        s.set_nodelay(true).ok();
-                        if s.write_all(&GREET_FALSE).await.is_ok() {
-                            let (r, _w) = s.into_split();
-                            let _ = pump_merge(
-                                r,
-                                tx.clone(),
-                                forward_gate.clone(),
-                                live_floor.clone(),
-                                net_round_tip.clone(),
-                                Arc::new(AtomicU32::new(0)),
-                                false,
-                                &PushStats::default(),
-                            )
-                            .await;
-                        }
-                    }
-                    if tx.is_closed() {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                }
-            }));
-        }
-    }
     fn active_exit_reason(joined: Result<std::io::Result<()>, tokio::task::JoinError>) -> String {
         match joined {
             Ok(Ok(())) => "active stream ended".to_string(),
@@ -1044,15 +1021,12 @@ pub(crate) async fn serve_push(node: TcpStream, active_conn: TcpStream, cfg: Pus
     up.abort();
     active_task.abort();
     lag_log.abort();
-    for s in shadows {
-        s.abort();
-    }
     format!("{exit_reason} stats=[{}]", stats.summary())
 }
 
-// Frame reader for serve_push: forward block frames (type=1 with a round) deduped; if forward_nonblock
-// (the active peer only) also forward control / abci_state / RPC frames as-is.
-#[allow(clippy::too_many_arguments)]
+// The active peer's stream for serve_push: block frames (type=1 with a round) pass the round
+// gates (plausibility, progress/jump, tip lag, node floor, dedup); control / abci_state / RPC
+// frames are forwarded as-is.
 async fn pump_merge(
     mut r: tokio::net::tcp::OwnedReadHalf,
     tx: NodeQueue,
@@ -1060,7 +1034,6 @@ async fn pump_merge(
     live_floor: Arc<AtomicU32>,
     net_round_tip: Arc<AtomicU32>,
     active_round: Arc<AtomicU32>,
-    forward_nonblock: bool,
     stats: &PushStats,
 ) -> std::io::Result<()> {
     // Live blocks arrive continuously (~4-15/s on mainnet). Keep this below hl-node's own abci
@@ -1069,7 +1042,7 @@ async fn pump_merge(
     const IDLE: Duration = Duration::from_secs(10);
     let mut progress = BlockProgress::new(active_round.load(Ordering::Acquire), Instant::now());
     loop {
-        if forward_nonblock && progress.stalled(Instant::now()) {
+        if progress.stalled(Instant::now()) {
             return Err(std::io::Error::other(format!(
                 "no block progress for {}s (last round {})",
                 ACTIVE_BLOCK_STALL.as_secs(),
@@ -1084,26 +1057,10 @@ async fn pump_merge(
         let len = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as usize;
         let typ = hdr[4];
         if len > MAX_LIVE_FRAME {
-            // Legit frames on a live (send_abci:false) channel are ~200KB (greeting + blocks).
-            // From the ACTIVE peer an oversized length is a broken/hostile stream — error out so
-            // the session tears down (never allocate a peer-controlled multi-GB buffer). From a
-            // shadow, drain to stay frame-aligned and keep the accelerator alive.
-            if forward_nonblock {
-                return Err(std::io::Error::other("oversized frame from active peer"));
-            }
-            let mut rem = len;
-            let mut buf = vec![0u8; 65536];
-            while rem > 0 {
-                let nb = match timeout(IDLE, r.read(&mut buf[..rem.min(65536)])).await {
-                    Ok(res) => res?,
-                    Err(_) => return Err(std::io::Error::other("idle timeout (drain)")),
-                };
-                if nb == 0 {
-                    return Ok(());
-                }
-                rem -= nb;
-            }
-            continue;
+            // Legit frames on a live (send_abci:false) channel are ~200KB (greeting + blocks): an
+            // oversized length is a broken/hostile stream — never allocate a peer-controlled
+            // multi-GB buffer, end the session instead.
+            return Err(std::io::Error::other("oversized frame from active peer"));
         }
         // Read the payload straight into a ready-to-send frame (header + payload): forwarding is
         // the common case, and rebuilding the frame from a separate payload Vec would cost an
@@ -1114,66 +1071,49 @@ async fn pump_merge(
             Ok(res) => res?,
             Err(_) => return Err(std::io::Error::other("idle timeout (payload)")),
         };
-        if typ == 1 {
-            if let Some(rnd) = block_round(&frame[5..]) {
-                let net_tip = net_round_tip.load(Ordering::Acquire);
-                if !is_plausible_mainnet_round(rnd, net_tip) {
-                    if forward_nonblock {
-                        return Err(std::io::Error::other(format!(
-                            "implausible active block round {rnd}"
-                        )));
-                    }
-                    continue;
-                }
-                if forward_nonblock {
-                    progress
-                        .on_round(rnd, Instant::now())
-                        .map_err(std::io::Error::other)?;
-                    active_round.fetch_max(rnd, Ordering::AcqRel);
-                    if let Some(lag) = round_lag_from_tip(rnd, net_tip, ACTIVE_ROUND_MAX_LAG) {
-                        return Err(std::io::Error::other(format!(
-                            "active block round lagged round={rnd} net_tip={net_tip} lag={lag} max_lag={ACTIVE_ROUND_MAX_LAG}"
-                        )));
-                    }
-                }
-                let floor = live_floor.load(Ordering::Acquire);
-                if rnd <= floor {
-                    if forward_nonblock {
-                        let last = active_round.load(Ordering::Acquire);
-                        stats.dropped("floor", &frame, rnd, last, floor);
-                    }
-                    continue;
-                }
-                let mut gate = forward_gate.lock().await;
-                let last = gate.last_forwarded();
-                if gate.should_forward(rnd, forward_nonblock) {
-                    stats.forwarded(&frame, FrameKindSeen::Block);
-                    if tx.send(frame).await.is_err() {
-                        return Ok(());
-                    }
-                } else if forward_nonblock {
-                    stats.dropped("dup", &frame, rnd, last, floor);
-                }
+        let kind = if typ != 1 {
+            FrameKindSeen::Control
+        } else if let Some(rnd) = block_round(&frame[5..]) {
+            let net_tip = net_round_tip.load(Ordering::Acquire);
+            if !is_plausible_mainnet_round(rnd, net_tip) {
+                return Err(std::io::Error::other(format!(
+                    "implausible active block round {rnd}"
+                )));
+            }
+            progress
+                .on_round(rnd, Instant::now())
+                .map_err(std::io::Error::other)?;
+            active_round.fetch_max(rnd, Ordering::AcqRel);
+            if let Some(lag) = round_lag_from_tip(rnd, net_tip, ACTIVE_ROUND_MAX_LAG) {
+                return Err(std::io::Error::other(format!(
+                    "active block round lagged round={rnd} net_tip={net_tip} lag={lag} max_lag={ACTIVE_ROUND_MAX_LAG}"
+                )));
+            }
+            let floor = live_floor.load(Ordering::Acquire);
+            if rnd <= floor {
+                let last = active_round.load(Ordering::Acquire);
+                stats.dropped("floor", &frame, rnd, last, floor);
                 continue;
             }
-            if forward_nonblock {
-                stats.forwarded(&frame, FrameKindSeen::DataNoRound);
-                if tx.send(frame).await.is_err() {
-                    return Ok(());
-                }
+            let mut gate = forward_gate.lock().await;
+            let last = gate.last_forwarded();
+            if !gate.should_forward(rnd, true) {
+                stats.dropped("dup", &frame, rnd, last, floor);
+                continue;
             }
-            continue;
-        }
-        if forward_nonblock {
-            stats.forwarded(&frame, FrameKindSeen::Control);
-            if tx.send(frame).await.is_err() {
-                return Ok(());
-            }
+            FrameKindSeen::Block
+        } else {
+            FrameKindSeen::DataNoRound
+        };
+        stats.forwarded(&frame, kind);
+        if tx.send(frame).await.is_err() {
+            return Ok(());
         }
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+// One frame the active peer sent during selection (prefetched), through the same gates as
+// pump_merge's live stream.
 async fn process_live_frame(
     frame: Vec<u8>,
     tx: &NodeQueue,
@@ -1181,7 +1121,6 @@ async fn process_live_frame(
     live_floor: &Arc<AtomicU32>,
     net_round_tip: &Arc<AtomicU32>,
     active_round: &Arc<AtomicU32>,
-    forward_nonblock: bool,
     stats: &PushStats,
 ) -> std::io::Result<()> {
     if frame.len() < 5 {
@@ -1192,64 +1131,44 @@ async fn process_live_frame(
     if len != frame.len().saturating_sub(5) {
         return Err(std::io::Error::other("mis-sized prefetched frame"));
     }
-    let payload = &frame[5..];
-    if typ == 1 {
-        if let Some(rnd) = block_round(payload) {
-            let net_tip = net_round_tip.load(Ordering::Acquire);
-            if !is_plausible_mainnet_round(rnd, net_tip) {
-                if forward_nonblock {
-                    return Err(std::io::Error::other(format!(
-                        "implausible active block round {rnd}"
-                    )));
-                }
-                return Ok(());
-            }
-            if forward_nonblock {
-                // the same jump guard pump_merge's BlockProgress applies to the live stream
-                let prev = active_round.fetch_max(rnd, Ordering::AcqRel);
-                if prev != 0 && rnd > prev.saturating_add(MAX_ACTIVE_ROUND_JUMP) {
-                    return Err(std::io::Error::other(format!(
-                        "active block round jump round={rnd} prev={prev} max_jump={MAX_ACTIVE_ROUND_JUMP}"
-                    )));
-                }
-                if let Some(lag) = round_lag_from_tip(rnd, net_tip, ACTIVE_ROUND_MAX_LAG) {
-                    return Err(std::io::Error::other(format!(
-                        "active block round lagged round={rnd} net_tip={net_tip} lag={lag} max_lag={ACTIVE_ROUND_MAX_LAG}"
-                    )));
-                }
-            }
-            let floor = live_floor.load(Ordering::Acquire);
-            if rnd <= floor {
-                if forward_nonblock {
-                    stats.dropped(
-                        "floor",
-                        &frame,
-                        rnd,
-                        active_round.load(Ordering::Acquire),
-                        floor,
-                    );
-                }
-                return Ok(());
-            }
-            let mut gate = forward_gate.lock().await;
-            let last = gate.last_forwarded();
-            if !gate.should_forward(rnd, forward_nonblock) {
-                if forward_nonblock {
-                    stats.dropped("dup", &frame, rnd, last, floor);
-                }
-                return Ok(());
-            }
-            stats.forwarded(&frame, FrameKindSeen::Block);
-        } else if !forward_nonblock {
-            return Ok(());
-        } else {
-            stats.forwarded(&frame, FrameKindSeen::DataNoRound);
+    let kind = if typ != 1 {
+        FrameKindSeen::Control
+    } else if let Some(rnd) = block_round(&frame[5..]) {
+        let net_tip = net_round_tip.load(Ordering::Acquire);
+        if !is_plausible_mainnet_round(rnd, net_tip) {
+            return Err(std::io::Error::other(format!(
+                "implausible active block round {rnd}"
+            )));
         }
-    } else if !forward_nonblock {
-        return Ok(());
+        // the same jump guard pump_merge's BlockProgress applies to the live stream
+        let prev = active_round.fetch_max(rnd, Ordering::AcqRel);
+        if prev != 0 && rnd > prev.saturating_add(MAX_ACTIVE_ROUND_JUMP) {
+            return Err(std::io::Error::other(format!(
+                "active block round jump round={rnd} prev={prev} max_jump={MAX_ACTIVE_ROUND_JUMP}"
+            )));
+        }
+        if let Some(lag) = round_lag_from_tip(rnd, net_tip, ACTIVE_ROUND_MAX_LAG) {
+            return Err(std::io::Error::other(format!(
+                "active block round lagged round={rnd} net_tip={net_tip} lag={lag} max_lag={ACTIVE_ROUND_MAX_LAG}"
+            )));
+        }
+        let floor = live_floor.load(Ordering::Acquire);
+        if rnd <= floor {
+            let last = active_round.load(Ordering::Acquire);
+            stats.dropped("floor", &frame, rnd, last, floor);
+            return Ok(());
+        }
+        let mut gate = forward_gate.lock().await;
+        let last = gate.last_forwarded();
+        if !gate.should_forward(rnd, true) {
+            stats.dropped("dup", &frame, rnd, last, floor);
+            return Ok(());
+        }
+        FrameKindSeen::Block
     } else {
-        stats.forwarded(&frame, FrameKindSeen::Control);
-    }
+        FrameKindSeen::DataNoRound
+    };
+    stats.forwarded(&frame, kind);
     tx.send(frame)
         .await
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "node writer closed"))
@@ -1382,6 +1301,76 @@ mod tests {
         let big = 1_300_000_000u32.to_be_bytes();
         let mut c = upstream(vec![big[0], big[1], big[2], big[3], 1]).await;
         assert_eq!(read_first_frame(&mut c, wait, true).await.unwrap().len(), 5);
+    }
+
+    // A 4001 relay whose upstream goes silent ends (the node reconnects elsewhere), while one
+    // whose upstream keeps sending is never cut by the idle limit.
+    #[tokio::test]
+    async fn relay_ends_when_the_upstream_goes_silent() {
+        async fn relay(upstream_sends_every: Option<Duration>) -> (Instant, (u64, u64)) {
+            let up_l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let up_addr = up_l.local_addr().unwrap();
+            tokio::spawn(async move {
+                let (mut s, _) = up_l.accept().await.unwrap();
+                s.write_all(b"first").await.unwrap();
+                match upstream_sends_every {
+                    Some(every) => loop {
+                        tokio::time::sleep(every).await;
+                        if s.write_all(b"x").await.is_err() {
+                            break;
+                        }
+                    },
+                    None => tokio::time::sleep(Duration::from_secs(10)).await,
+                }
+            });
+            let node_l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let node_addr = node_l.local_addr().unwrap();
+            tokio::spawn(async move {
+                let mut c = TcpStream::connect(node_addr).await.unwrap();
+                let mut buf = [0u8; 64];
+                while c.read(&mut buf).await.is_ok_and(|n| n > 0) {}
+            });
+            let (down, _) = node_l.accept().await.unwrap();
+            let upc = TcpStream::connect(up_addr).await.unwrap();
+            let t0 = Instant::now();
+            let r = timeout(
+                Duration::from_millis(1500),
+                splice_with_idle(down, upc, Some(Duration::from_millis(300))),
+            )
+            .await;
+            if let Ok(r) = &r {
+                assert!(r.upstream_ended, "a silent upstream ended the relay");
+            }
+            (
+                t0,
+                r.map(|r| (r.to_node, r.to_peer)).unwrap_or((u64::MAX, 0)),
+            )
+        }
+        let (t0, (to_node, _)) = relay(None).await;
+        assert_eq!(to_node, 5, "relayed the first bytes, then ended on silence");
+        // and says who ended it: the silent upstream, versus a node that left
+        let (up_l, node_l) = (
+            TcpListener::bind("127.0.0.1:0").await.unwrap(),
+            TcpListener::bind("127.0.0.1:0").await.unwrap(),
+        );
+        let (up_addr, node_addr) = (up_l.local_addr().unwrap(), node_l.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (_s, _) = up_l.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        tokio::spawn(async move {
+            let c = TcpStream::connect(node_addr).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            drop(c);
+        });
+        let (down, _) = node_l.accept().await.unwrap();
+        let upc = TcpStream::connect(up_addr).await.unwrap();
+        let r = splice_with_idle(down, upc, Some(Duration::from_secs(2))).await;
+        assert!(!r.upstream_ended, "the node left first");
+        assert!(t0.elapsed() < Duration::from_millis(1200));
+        // steady traffic (every 100ms, under the 300ms limit) keeps the relay up past 1.5s
+        let (_, (to_node, _)) = relay(Some(Duration::from_millis(100))).await;
+        assert_eq!(to_node, u64::MAX, "still relaying when the test stopped it");
     }
 
     #[tokio::test]
@@ -1520,7 +1509,6 @@ mod tests {
             PushConfig {
                 hosts: Arc::new(vec!["127.0.0.1".into()]),
                 active_idx: 0,
-                port: 4001,
                 prefetched_greeting: Some(vec![0, 0, 0, 1, 0, 7]),
                 prefetched_frames: vec![block],
                 initial_last_forwarded: BASE,
@@ -1569,7 +1557,6 @@ mod tests {
                     // the session's active host as the gateway knows it
                     hosts: Arc::new(vec!["198.51.100.40".into()]),
                     active_idx: 0,
-                    port: 4001,
                     prefetched_greeting: None,
                     prefetched_frames: Vec::new(),
                     initial_last_forwarded: 0,
@@ -1612,15 +1599,6 @@ mod tests {
         });
         let (node_conn, _) = node_l.accept().await.unwrap();
 
-        // a healthy pool peer that would have been the hot-swap target; it must never be dialed
-        let standby_l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let standby_port = standby_l.local_addr().unwrap().port();
-        let standby = tokio::spawn(async move {
-            timeout(Duration::from_secs(2), standby_l.accept())
-                .await
-                .is_ok()
-        });
-
         let peer_l = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let peer_addr = peer_l.local_addr().unwrap();
         tokio::spawn(async move {
@@ -1636,7 +1614,6 @@ mod tests {
             PushConfig {
                 hosts: Arc::new(vec!["127.0.0.1".into(), "127.0.0.1".into()]),
                 active_idx: 0,
-                port: standby_port,
                 prefetched_greeting: None,
                 prefetched_frames: Vec::new(),
                 initial_last_forwarded: 0,
@@ -1654,10 +1631,6 @@ mod tests {
             fake_node.await.unwrap(),
             0,
             "node must see EOF, not injected frames"
-        );
-        assert!(
-            !standby.await.unwrap(),
-            "standby pool peer must never be dialed"
         );
     }
 
@@ -1709,7 +1682,6 @@ mod tests {
             PushConfig {
                 hosts: Arc::new(vec!["127.0.0.1".into()]),
                 active_idx: 0,
-                port: 4001,
                 prefetched_greeting: None,
                 prefetched_frames: Vec::new(),
                 initial_last_forwarded: 0,
@@ -1771,7 +1743,6 @@ mod tests {
             PushConfig {
                 hosts: Arc::new(vec!["127.0.0.1".into()]),
                 active_idx: 0,
-                port: 4001,
                 prefetched_greeting: None,
                 prefetched_frames: Vec::new(),
                 initial_last_forwarded: 0,

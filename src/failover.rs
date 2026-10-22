@@ -53,6 +53,7 @@ use crate::push::{
     node_queue_budget, queue_frame, BlockProgress, PushConfig, QueuedFrame, ACTIVE_BLOCK_STALL,
     NODE_WRITE_TIMEOUT,
 };
+use crate::util::lock;
 
 // ---- configuration ----
 
@@ -1168,7 +1169,7 @@ pub(crate) async fn serve_failover(
                 if !connecting && core.standby_count() < fo.standbys && now >= next_connect {
                     cooldown.retain(|_, until| *until > now);
                     let in_use: HashSet<String> = lives.keys().filter_map(|id| core.ip_of(*id).map(str::to_string)).collect();
-                    let pool = fctx.pool.lock().unwrap().clone();
+                    let pool = lock(&fctx.pool).clone();
                     let start = rot.fetch_add(1, Ordering::Relaxed);
                     let mut cands: Vec<String> = fctx.priority.candidates();
                     if !pool.is_empty() {
@@ -1646,7 +1647,6 @@ mod tests {
         let cfg = PushConfig {
             hosts: Arc::new(vec!["198.51.100.41".into()]),
             active_idx: 0,
-            port: 4001,
             prefetched_greeting: None,
             prefetched_frames: Vec::new(),
             initial_last_forwarded: 0,
@@ -1694,7 +1694,6 @@ mod tests {
         let cfg = PushConfig {
             hosts: Arc::new(vec!["127.0.0.1".into()]),
             active_idx: 0,
-            port: 4001,
             prefetched_greeting: None,
             prefetched_frames: Vec::new(),
             initial_last_forwarded: 0,

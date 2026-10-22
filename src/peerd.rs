@@ -8,6 +8,7 @@ use tokio::time::timeout;
 use crate::protocol::{
     block_round, corroborated_clustered_round, is_plausible_mainnet_round, GREET_FALSE,
 };
+use crate::util::split_csv;
 
 fn is_ipv4(s: &str) -> bool {
     let mut parts = 0;
@@ -648,11 +649,36 @@ fn select_probe_candidates(
 
 // Root IPs from the gossipRootIps curl. A failed curl (non-zero exit: HTTP error with -f, timeout,
 // DNS) is treated like a spawn error/timeout and contributes nothing, even if it wrote some stdout.
+// The answer must be exactly the API's JSON array of IPv4 strings (~400 bytes): an error or
+// maintenance page that merely mentions addresses must not seed candidates.
+const MAX_GOSSIP_ROOTS_BYTES: usize = 64 * 1024;
+
 fn gossip_root_ips(out: &std::process::Output) -> Vec<String> {
-    if !out.status.success() {
+    if !out.status.success() || out.stdout.len() > MAX_GOSSIP_ROOTS_BYTES {
         return Vec::new();
     }
-    extract_ipv4(&String::from_utf8_lossy(&out.stdout))
+    std::str::from_utf8(&out.stdout)
+        .ok()
+        .and_then(parse_ip_string_array)
+        .unwrap_or_default()
+}
+
+// `["1.2.3.4", "5.6.7.8"]` -> routable IPv4s, or None for anything else (not an array, an entry
+// that isn't a quoted IPv4).
+fn parse_ip_string_array(body: &str) -> Option<Vec<String>> {
+    let inner = body.trim().strip_prefix('[')?.strip_suffix(']')?.trim();
+    if inner.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut out = Vec::new();
+    for item in inner.split(',') {
+        let ip = item.trim().strip_prefix('"')?.strip_suffix('"')?;
+        ip.parse::<std::net::Ipv4Addr>().ok()?;
+        if is_routable(ip) {
+            out.push(ip.to_string());
+        }
+    }
+    Some(out)
 }
 
 // peer_candidates.txt: one IP per line, newline-terminated so a manual `echo ip >> file` starts a
@@ -674,14 +700,6 @@ fn format_peer_candidates(candidates: &HashSet<String>) -> String {
         out.push('\n');
     }
     out
-}
-
-pub(crate) fn split_csv(v: &str) -> Vec<String> {
-    v.split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect()
 }
 
 // Forget candidates (and their failure counts) that are now excluded — a newly blacklisted IP.
@@ -803,6 +821,8 @@ pub(crate) async fn run_peerd(interval: u64) {
                     "5",
                     "--max-time",
                     "10",
+                    "--max-filesize",
+                    "65536",
                     "-X",
                     "POST",
                     "-H",
@@ -1035,19 +1055,6 @@ mod tests {
         ] {
             assert!(!is_routable(ip), "{ip} should NOT be routable");
         }
-    }
-
-    #[test]
-    fn split_csv_splits_and_trims() {
-        assert_eq!(
-            split_csv("1.2.3.4, 5.6.7.8 ,,9.9.9.9"),
-            vec!["1.2.3.4", "5.6.7.8", "9.9.9.9"]
-        );
-        assert!(split_csv("").is_empty());
-        assert_eq!(
-            split_csv("/hl/node1,/hl/node2"),
-            vec!["/hl/node1", "/hl/node2"]
-        );
     }
 
     #[test]
@@ -1696,6 +1703,21 @@ mod tests {
         // e.g. curl -f on an HTTP 5xx (exit 22), or --max-time (exit 28) after a partial body
         assert!(gossip_root_ips(&out(22, r#"["8.8.8.8"]"#)).is_empty());
         assert!(gossip_root_ips(&out(28, r#"["8.8.8.8"]"#)).is_empty());
+        // only the exact array shape counts: an error page naming an address seeds nothing
+        assert!(gossip_root_ips(&out(0, "<html>blocked: 9.9.9.9</html>")).is_empty());
+        assert!(gossip_root_ips(&out(0, r#"{"error":"9.9.9.9"}"#)).is_empty());
+        assert!(gossip_root_ips(&out(0, r#"["8.8.8.8","x"]"#)).is_empty());
+        assert_eq!(
+            gossip_root_ips(&out(0, " [ \"8.8.8.8\" ,\n \"10.0.0.1\" ]\n")),
+            vec!["8.8.8.8".to_string()],
+            "whitespace tolerated, private addresses dropped"
+        );
+        assert!(gossip_root_ips(&out(0, "[]")).is_empty());
+        let huge = format!("[{}]", vec![r#""8.8.8.8""#; 10_000].join(","));
+        assert!(
+            gossip_root_ips(&out(0, &huge)).is_empty(),
+            "oversized answer"
+        );
     }
 
     #[tokio::test]

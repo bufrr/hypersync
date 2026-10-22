@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use crate::peerd::split_csv;
+use crate::util::{lock, split_csv};
 
 // A priority peer that failed selection (refused, peer full, lagged, no block) is skipped for
 // this long, so one dead sentry does not cost every reconnect its stage budget.
@@ -138,7 +138,7 @@ impl PriorityTier {
     }
 
     fn candidates_at(&self, now: Instant) -> Vec<String> {
-        let cooldown = self.cooldown_until.lock().unwrap();
+        let cooldown = lock(&self.cooldown_until);
         let mut out: Vec<(usize, usize)> = Vec::new();
         for (i, until) in cooldown.iter().enumerate() {
             if until.is_some_and(|t| now < t) || crate::blacklist::contains(&self.peers[i]) {
@@ -162,7 +162,7 @@ impl PriorityTier {
 
     fn mark_failed_at(&self, ip: &str, now: Instant) {
         if let Some(i) = self.index(ip) {
-            self.cooldown_until.lock().unwrap()[i] = Some(now + PRIORITY_COOLDOWN);
+            lock(&self.cooldown_until)[i] = Some(now + PRIORITY_COOLDOWN);
         }
     }
 
