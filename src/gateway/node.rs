@@ -64,6 +64,9 @@ pub(super) struct NodeState {
     // when this node last probed a priority peer to leave a pool session (see
     // select::wait_priority_return); kept across reconnects so re-pins stay rate-limited
     last_repin_attempt: Mutex<Option<Instant>>,
+    // when a client-block (4002) response was last forwarded to this node: a catching-up node
+    // pulls a batch every few seconds, one at the tip almost never
+    last_client_blocks: Mutex<Option<Instant>>,
 }
 
 impl NodeState {
@@ -80,6 +83,7 @@ impl NodeState {
             rpc_peer: Mutex::new(None),
             replay_in_flight: AtomicBool::new(false),
             last_repin_attempt: Mutex::new(None),
+            last_client_blocks: Mutex::new(None),
         }
     }
 
@@ -146,6 +150,15 @@ impl NodeState {
         let mut active = lock(&self.active);
         unpin_blacklisted(&mut active);
         active.is_some() && !self.lazy_active.load(Ordering::Acquire)
+    }
+
+    pub(super) fn mark_client_blocks_response(&self, now: Instant) {
+        *lock(&self.last_client_blocks) = Some(now);
+    }
+
+    // No client-block response forwarded to this node for `quiet`: it has finished catching up.
+    pub(super) fn client_blocks_quiet_for(&self, now: Instant, quiet: Duration) -> bool {
+        lock(&self.last_client_blocks).is_none_or(|t| now.saturating_duration_since(t) >= quiet)
     }
 
     // An attempt that never probed (the slot was gone): doesn't count against the node.
@@ -421,6 +434,20 @@ mod tests {
         // an attempt that never probed (lost the slot race) doesn't count
         node.forget_repin_attempt();
         assert!(node.claim_repin_attempt(t0 + retry, retry));
+    }
+
+    #[test]
+    fn client_block_responses_mark_the_node_as_catching_up() {
+        let node = NodeState::new("10.0.0.1".parse().unwrap(), 1);
+        let t0 = Instant::now();
+        let quiet = Duration::from_secs(60);
+        assert!(
+            node.client_blocks_quiet_for(t0, quiet),
+            "never fetched: quiet"
+        );
+        node.mark_client_blocks_response(t0);
+        assert!(!node.client_blocks_quiet_for(t0 + Duration::from_secs(59), quiet));
+        assert!(node.client_blocks_quiet_for(t0 + quiet, quiet));
     }
 
     #[test]

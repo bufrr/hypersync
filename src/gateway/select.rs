@@ -684,10 +684,14 @@ pub(super) fn bootstrap_source_list(
 // standbys it can't switch upstream mid-stream either (the new peer's stream starts at its own
 // tip), so it ends itself once a priority peer is demonstrably serving again, and the node's
 // reconnect re-selects (priority first). That reconnect costs the node a few seconds of blocks,
-// hence the session-age floor and the per-node attempt limit.
+// hence the session-age floor, the catch-up wait and the per-node attempt limit.
 pub(super) struct RepinTiming {
-    // never during the node's catch-up burst right after a (re)connect
+    // the session's age floor
     pub(super) min_session: Duration,
+    // ...and the node must have stopped catching up: no client-block response forwarded to it for
+    // this long (a catching-up node pulls a 4002 batch every few seconds and reconnects 4001 on its
+    // own, so ending its session then is pointless churn)
+    pub(super) catchup_quiet: Duration,
     pub(super) check_every: Duration,
     // at most one probe per node this often, whatever its outcome (a failed probe also cools the
     // priority peer down like a failed selection)
@@ -696,6 +700,7 @@ pub(super) struct RepinTiming {
 
 pub(super) const REPIN: RepinTiming = RepinTiming {
     min_session: Duration::from_secs(60),
+    catchup_quiet: Duration::from_secs(60),
     check_every: Duration::from_secs(15),
     retry: Duration::from_secs(5 * 60),
 };
@@ -712,7 +717,13 @@ pub(super) async fn wait_priority_return(
 ) -> String {
     tokio::time::sleep(timing.min_session).await;
     loop {
-        if let Some(ip) = priority.candidates().into_iter().next() {
+        let caught_up = node.client_blocks_quiet_for(Instant::now(), timing.catchup_quiet);
+        if let Some(ip) = priority
+            .candidates()
+            .into_iter()
+            .next()
+            .filter(|_| caught_up)
+        {
             if node.claim_repin_attempt(Instant::now(), timing.retry) {
                 let tip = net_tip.load(Ordering::Acquire);
                 let (_, _, probe) = live_attempt(
@@ -1100,6 +1111,7 @@ mod tests {
     fn fast_repin() -> RepinTiming {
         RepinTiming {
             min_session: Duration::from_millis(150),
+            catchup_quiet: Duration::from_millis(300),
             check_every: Duration::from_millis(50),
             retry: Duration::from_secs(10),
         }
@@ -1186,5 +1198,46 @@ mod tests {
         );
         assert!(!n.claim_repin_attempt(Instant::now(), fast_repin().retry));
         h2.abort();
+    }
+
+    #[tokio::test]
+    async fn no_return_while_the_node_is_still_catching_up() {
+        let (p, h) = fake_live_peer(FakePeer::Healthy).await;
+        let tier = test_tier(&[&p], 300);
+        let node = Arc::new(NodeState::new("10.0.0.9".parse().unwrap(), 1));
+        // client-block batches keep arriving: the node is catching up
+        let feeder = {
+            let node = node.clone();
+            tokio::spawn(async move {
+                loop {
+                    node.mark_client_blocks_response(Instant::now());
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            })
+        };
+        let wait = tokio::spawn(wait_priority_return(
+            node.clone(),
+            tier.clone(),
+            Arc::new(AtomicU32::new(0)),
+            fast_repin(),
+        ));
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert!(
+            !wait.is_finished(),
+            "no re-pin while client blocks keep flowing"
+        );
+        assert_eq!(tier.sessions(&p), 0, "and no probe");
+        // catch-up done: once it has been quiet for catchup_quiet, the session returns
+        feeder.abort();
+        let reason = timeout(Duration::from_secs(5), wait)
+            .await
+            .expect("returns once the node has caught up")
+            .unwrap();
+        assert!(reason.starts_with(RETURNING_TO_PRIORITY), "{reason}");
+        assert!(
+            !node.claim_repin_attempt(Instant::now(), fast_repin().retry),
+            "only the probe that ran counted as the node's attempt"
+        );
+        h.abort();
     }
 }

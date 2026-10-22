@@ -88,7 +88,7 @@ Set in `.env`; compose passes them through.
 
 The peer is then skipped for 30 s (priority peers via their own cooldown), so the reconnect lands on a different one unless every peer is cooling down.
 
-**Returning to priority peers.** A session that ended up on a pool peer (e.g. after a network-wide pause cooled the priority peers down) moves back once a priority peer serves again: after the session has run 60 s, the gateway probes the least-loaded available priority peer with the same first-block vetting as selection and, if it passes, ends the session so the node reconnects to it. A failed probe cools that peer down; each node probes at most once per 5 minutes, since the reconnect costs it a few seconds of blocks. With hot standbys the switch happens on the same connection instead (below).
+**Returning to priority peers.** A session that ended up on a pool peer (e.g. after a network-wide pause cooled the priority peers down) moves back once a priority peer serves again: after the session has run 60 s and the node has finished catching up (no client-block batch for 60 s), the gateway probes the least-loaded available priority peer with the same first-block vetting as selection and, if it passes, ends the session so the node reconnects to it. A failed probe cools that peer down; each node probes at most once per 5 minutes, since the reconnect costs it a few seconds of blocks. With hot standbys the switch happens on the same connection instead (below).
 
 Live frames over 8 MB end the session (blocks average ~200 KB), at most 64 MB of frames are queued per node, and writes to a node are bounded to 30 s, so neither a hostile peer nor a stuck node can make a session hold more.
 

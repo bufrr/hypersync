@@ -438,6 +438,7 @@ pub(super) async fn serve_client_blocks(
     });
     match fetched {
         Ok(frame) => {
+            node.mark_client_blocks_response(Instant::now());
             let _ = timeout(NODE_WRITE_TIMEOUT, down.write_all(&frame)).await;
         }
         Err(failure) => {
