@@ -193,7 +193,7 @@ pub(crate) async fn splice_with_idle(
 }
 
 // A spawned task that is aborted when its owner is dropped (a plain JoinHandle detaches).
-struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+pub(crate) struct AbortOnDrop<T>(pub(crate) tokio::task::JoinHandle<T>);
 
 impl<T> Drop for AbortOnDrop<T> {
     fn drop(&mut self) {
@@ -744,6 +744,7 @@ pub(crate) fn push_exit_is_upstream_fault(reason: &str) -> bool {
         || reason.starts_with("node outbound read failed")
         // internal ends (a panicked task, the session's own channel or logger): nobody's fault
         || reason.starts_with("node outbound task join error")
+        || reason.starts_with("active task join error")
         || reason.starts_with("active lag logger")
         || reason.starts_with("event channel closed")
         || reason.starts_with("node write")
@@ -1140,13 +1141,15 @@ async fn process_live_frame(
                 "implausible active block round {rnd}"
             )));
         }
-        // the same jump guard pump_merge's BlockProgress applies to the live stream
-        let prev = active_round.fetch_max(rnd, Ordering::AcqRel);
+        // the same jump guard pump_merge's BlockProgress applies to the live stream, checked
+        // before the round is recorded so a refused jump never becomes the session's baseline
+        let prev = active_round.load(Ordering::Acquire);
         if prev != 0 && rnd > prev.saturating_add(MAX_ACTIVE_ROUND_JUMP) {
             return Err(std::io::Error::other(format!(
                 "active block round jump round={rnd} prev={prev} max_jump={MAX_ACTIVE_ROUND_JUMP}"
             )));
         }
+        active_round.fetch_max(rnd, Ordering::AcqRel);
         if let Some(lag) = round_lag_from_tip(rnd, net_tip, ACTIVE_ROUND_MAX_LAG) {
             return Err(std::io::Error::other(format!(
                 "active block round lagged round={rnd} net_tip={net_tip} lag={lag} max_lag={ACTIVE_ROUND_MAX_LAG}"

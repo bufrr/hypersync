@@ -9,7 +9,7 @@ use std::sync::{Mutex, MutexGuard};
 pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|poisoned| {
         // say so once (the flag is cleared): a panic happened while this state was being changed
-        eprintln!("[gw] WARN recovered a lock poisoned by a panicked task; its state may be stale");
+        eprintln!("WARN recovered a lock poisoned by a panicked task; its state may be stale");
         m.clear_poison();
         poisoned.into_inner()
     })

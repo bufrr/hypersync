@@ -202,6 +202,7 @@ dependencies = [
  "futures-util",
  "hdrhistogram",
  "hotpath-macros",
+ "hotpath-meta",
  "libc",
  "pin-project-lite",
  "prettytable-rs",
@@ -210,6 +211,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tiny_http",
+ "tokio",
 ]
 
 [[package]]
@@ -221,6 +223,21 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "hotpath-macros-meta"
+version = "0.19.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e804ccbbd13922ff16b752ab72043d15ea38411a03a82917b8ea5b36b6b45655"
+
+[[package]]
+name = "hotpath-meta"
+version = "0.19.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f76b1b9a176e5677878243b0c9052d2e0a62405359bd6990bbd85b59cafa2aa"
+dependencies = [
+ "hotpath-macros-meta",
 ]
 
 [[package]]

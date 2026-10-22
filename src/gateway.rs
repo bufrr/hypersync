@@ -21,8 +21,8 @@ use crate::protocol::{
     MAX_LIVE_FRAME, MIN_COMPLETE_BOOTSTRAP_BYTES,
 };
 use crate::push::{
-    push_exit_is_upstream_fault, serve_push, splice, splice_with_idle, PushConfig, Relayed,
-    MAX_ACTIVE_ROUND_JUMP, NODE_WRITE_TIMEOUT,
+    push_exit_is_upstream_fault, serve_push, splice, splice_with_idle, AbortOnDrop, PushConfig,
+    Relayed, MAX_ACTIVE_ROUND_JUMP, NODE_WRITE_TIMEOUT,
 };
 use crate::util::lock;
 
@@ -113,155 +113,211 @@ async fn splice_bootstrap_capture(
     first_payload_prefix: Vec<u8>,
     sink: CacheSink,
     capture_permit: tokio::sync::OwnedSemaphorePermit,
-) {
+    upstream_idle: Duration,
+) -> Relayed {
     let up_ip = upc
         .peer_addr()
         .map(|a| a.ip().to_string())
         .unwrap_or_default();
     let (mut dr, mut dw) = down.into_split();
     let (mut ur, mut uw) = upc.into_split();
-    let h = tokio::spawn(async move {
-        // Single-flight permit: released as soon as capturing stops (installed, overflowed, or
-        // task end/abort) — NOT held for the rest of the relay, which may stream live blocks for
-        // hours and would otherwise block every future cache tap.
-        let mut capture_permit = Some(capture_permit);
-        // Reserve the full capture budget up front: growing a ~4.5GB Vec by doubling re-copies
-        // the whole blob at every growth step (~2x the final size in extra memcpy) and briefly
-        // holds old+new allocations. The reservation is virtual memory; RSS only grows as pages
-        // are actually written.
-        let mut blob = Vec::with_capacity(MAX_BOOTSTRAP_CAPTURE_BYTES);
-        let mut frames = 0u64;
-        let mut capture = true;
-        let mut first = Some((first_hdr, first_payload_prefix));
-        let mut win = Instant::now();
-        let mut win_bytes = 0usize;
-        let mut slow = 0u32;
-        let source = "transparent fallback";
-        // one relay buffer for the whole bootstrap (thousands of frames), not one per frame
-        let mut buf = vec![0u8; 1_048_576];
-
-        loop {
-            if !capture {
-                capture_permit.take();
-            }
-            let mut hdr = [0u8; 5];
-            let mut payload_prefix = Vec::new();
-            if let Some((h, prefix)) = first.take() {
-                hdr = h;
-                payload_prefix = prefix;
-            } else if capture && complete_bootstrap_at_frame_boundary(blob.len(), frames) {
-                match read_header_or_timeout(&mut ur, &mut hdr, Duration::from_secs(20)).await {
-                    Ok(HeaderRead::Complete) => {}
-                    Ok(HeaderRead::TimedOut(off)) => {
-                        install_bootstrap_cache(std::mem::take(&mut blob), source, &sink);
+    // bytes relayed to the node, and whether the upstream side ended the relay (closed, failed,
+    // went silent for `upstream_idle`, or sent a malformed frame) rather than the node
+    let delivered = Arc::new(AtomicU64::new(0));
+    let upstream_ended = Arc::new(AtomicBool::new(false));
+    // aborted on drop too: if this future is cancelled the copy task (and the capture permit it
+    // holds) must not live on detached
+    let h = AbortOnDrop({
+        let delivered = delivered.clone();
+        let upstream_ended = upstream_ended.clone();
+        let upstream_gone = move || upstream_ended.store(true, Ordering::Release);
+        tokio::spawn(async move {
+            // Single-flight permit: released as soon as capturing stops (installed, overflowed, or
+            // task end/abort) — NOT held for the rest of the relay, which may stream live blocks for
+            // hours and would otherwise block every future cache tap.
+            let mut capture_permit = Some(capture_permit);
+            // Reserve the full capture budget up front: growing a ~4.5GB Vec by doubling re-copies
+            // the whole blob at every growth step (~2x the final size in extra memcpy) and briefly
+            // holds old+new allocations. The reservation is virtual memory; RSS only grows as pages
+            // are actually written.
+            let mut blob = Vec::with_capacity(MAX_BOOTSTRAP_CAPTURE_BYTES);
+            let mut frames = 0u64;
+            let mut capture = true;
+            let mut first = Some((first_hdr, first_payload_prefix));
+            let mut win = Instant::now();
+            let mut win_bytes = 0usize;
+            let mut slow = 0u32;
+            let source = "transparent fallback";
+            // one relay buffer for the whole bootstrap (thousands of frames), not one per frame
+            let mut buf = vec![0u8; 1_048_576];
+            // A peer that trickles just enough to dodge the idle limit must not keep the
+            // single-flight permit (and a growing blob) forever: past this the capture is
+            // dropped, the relay goes on.
+            let capture_deadline = Instant::now() + MAX_TAP_CAPTURE;
+            macro_rules! drop_slow_capture {
+                () => {
+                    if capture && Instant::now() >= capture_deadline {
+                        gwlog!(
+                            "[gw] transparent bootstrap cache tap took over {}s; disabling tap",
+                            MAX_TAP_CAPTURE.as_secs()
+                        );
+                        blob = Vec::new();
                         capture = false;
-                        // bounded: a stalled upstream must not hold this task (and the tap
-                        // permit) forever after the 20s header gap
-                        if !matches!(
-                            timeout(
-                                Duration::from_secs(10),
-                                finish_header_after_partial(&mut ur, &mut hdr, off)
-                            )
-                            .await,
-                            Ok(Ok(()))
-                        ) {
+                        capture_permit.take();
+                    }
+                };
+            }
+
+            loop {
+                drop_slow_capture!();
+                if !capture {
+                    capture_permit.take();
+                }
+                let mut hdr = [0u8; 5];
+                let mut payload_prefix = Vec::new();
+                if let Some((h, prefix)) = first.take() {
+                    hdr = h;
+                    payload_prefix = prefix;
+                } else if capture && complete_bootstrap_at_frame_boundary(blob.len(), frames) {
+                    match read_header_or_timeout(&mut ur, &mut hdr, Duration::from_secs(20)).await {
+                        Ok(HeaderRead::Complete) => {}
+                        Ok(HeaderRead::TimedOut(off)) => {
+                            install_bootstrap_cache(std::mem::take(&mut blob), source, &sink);
+                            capture = false;
+                            // bounded: a stalled upstream must not hold this task (and the tap
+                            // permit) forever after the 20s header gap
+                            if !matches!(
+                                timeout(
+                                    Duration::from_secs(10),
+                                    finish_header_after_partial(&mut ur, &mut hdr, off)
+                                )
+                                .await,
+                                Ok(Ok(()))
+                            ) {
+                                upstream_gone();
+                                break;
+                            }
+                        }
+                        Err(_) => {
+                            install_bootstrap_cache(std::mem::take(&mut blob), source, &sink);
+                            upstream_gone();
                             break;
                         }
                     }
-                    Err(_) => {
+                } else if !matches!(
+                    timeout(upstream_idle, ur.read_exact(&mut hdr)).await,
+                    Ok(Ok(_))
+                ) {
+                    if capture && complete_bootstrap_at_frame_boundary(blob.len(), frames) {
                         install_bootstrap_cache(std::mem::take(&mut blob), source, &sink);
-                        break;
                     }
+                    upstream_gone();
+                    break;
                 }
-            } else if ur.read_exact(&mut hdr).await.is_err() {
-                if capture && complete_bootstrap_at_frame_boundary(blob.len(), frames) {
-                    install_bootstrap_cache(std::mem::take(&mut blob), source, &sink);
-                }
-                break;
-            }
 
-            let len = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as usize;
-            if len > MAX_ABCI_STATE_FRAME {
-                break;
-            }
-            // checked before appending: the frame alone may be up to 1.5GB
-            if capture && blob.len() + 5 + len > MAX_BOOTSTRAP_CAPTURE_BYTES {
-                gwlog!(
+                let len = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as usize;
+                if len > MAX_ABCI_STATE_FRAME {
+                    upstream_gone();
+                    break;
+                }
+                // checked before appending: the frame alone may be up to 1.5GB
+                if capture && blob.len() + 5 + len > MAX_BOOTSTRAP_CAPTURE_BYTES {
+                    gwlog!(
                     "[gw] transparent bootstrap cache tap would exceed max capture size; disabling tap"
                 );
-                blob = Vec::new();
-                capture = false;
-            }
-            if !node_write(&mut dw, &hdr).await {
-                break;
-            }
-            if capture {
-                blob.extend_from_slice(&hdr);
-            }
-
-            let mut remaining = len;
-            if !payload_prefix.is_empty() {
-                if payload_prefix.len() > remaining {
-                    break;
-                }
-                if !node_write(&mut dw, &payload_prefix).await {
-                    break;
-                }
-                if capture {
-                    blob.extend_from_slice(&payload_prefix);
-                }
-                remaining -= payload_prefix.len();
-            }
-            while remaining > 0 {
-                let take = remaining.min(buf.len());
-                let n = match ur.read(&mut buf[..take]).await {
-                    Ok(0) | Err(_) => return,
-                    Ok(n) => n,
-                };
-                if !node_write(&mut dw, &buf[..n]).await {
-                    return;
-                }
-                if capture {
-                    blob.extend_from_slice(&buf[..n]);
-                }
-                remaining -= n;
-            }
-            frames += 1;
-
-            if capture {
-                if blob.len() > MAX_BOOTSTRAP_CAPTURE_BYTES {
-                    gwlog!(
-                        "[gw] transparent bootstrap cache tap exceeded max capture size; disabling tap"
-                    );
                     blob = Vec::new();
                     capture = false;
-                    continue;
                 }
-                win_bytes += 5 + len;
-                let el = win.elapsed();
-                if el >= Duration::from_millis(1500) {
-                    let rate = win_bytes as f64 / el.as_secs_f64();
-                    if blob.len() > 1_500_000_000 && rate < 400_000.0 {
-                        slow += 1;
-                        if slow >= 8 && complete_bootstrap_at_frame_boundary(blob.len(), frames) {
-                            install_bootstrap_cache(std::mem::take(&mut blob), source, &sink);
-                            capture = false;
-                        }
-                    } else {
-                        slow = 0;
+                if !node_write(&mut dw, &hdr).await {
+                    break;
+                }
+                delivered.fetch_add(5, Ordering::Relaxed);
+                if capture {
+                    blob.extend_from_slice(&hdr);
+                }
+
+                let mut remaining = len;
+                if !payload_prefix.is_empty() {
+                    if payload_prefix.len() > remaining {
+                        upstream_gone();
+                        break;
                     }
-                    win = Instant::now();
-                    win_bytes = 0;
+                    if !node_write(&mut dw, &payload_prefix).await {
+                        break;
+                    }
+                    delivered.fetch_add(payload_prefix.len() as u64, Ordering::Relaxed);
+                    if capture {
+                        blob.extend_from_slice(&payload_prefix);
+                    }
+                    remaining -= payload_prefix.len();
+                }
+                while remaining > 0 {
+                    let take = remaining.min(buf.len());
+                    drop_slow_capture!();
+                    let n = match timeout(upstream_idle, ur.read(&mut buf[..take])).await {
+                        Ok(Ok(n)) if n > 0 => n,
+                        _ => {
+                            upstream_gone();
+                            return;
+                        }
+                    };
+                    if !node_write(&mut dw, &buf[..n]).await {
+                        return;
+                    }
+                    delivered.fetch_add(n as u64, Ordering::Relaxed);
+                    if capture {
+                        blob.extend_from_slice(&buf[..n]);
+                    }
+                    remaining -= n;
+                }
+                frames += 1;
+
+                if capture {
+                    if blob.len() > MAX_BOOTSTRAP_CAPTURE_BYTES {
+                        gwlog!(
+                        "[gw] transparent bootstrap cache tap exceeded max capture size; disabling tap"
+                    );
+                        blob = Vec::new();
+                        capture = false;
+                        continue;
+                    }
+                    win_bytes += 5 + len;
+                    let el = win.elapsed();
+                    if el >= Duration::from_millis(1500) {
+                        let rate = win_bytes as f64 / el.as_secs_f64();
+                        if blob.len() > 1_500_000_000 && rate < 400_000.0 {
+                            slow += 1;
+                            if slow >= 8 && complete_bootstrap_at_frame_boundary(blob.len(), frames)
+                            {
+                                install_bootstrap_cache(std::mem::take(&mut blob), source, &sink);
+                                capture = false;
+                            }
+                        } else {
+                            slow = 0;
+                        }
+                        win = Instant::now();
+                        win_bytes = 0;
+                    }
                 }
             }
-        }
+        })
     });
-    // like splice: a source blacklisted mid-relay ends it (an unfinished capture is discarded)
-    tokio::select! {
-        _ = tokio::io::copy(&mut dr, &mut uw) => {}
-        _ = crate::blacklist::wait_blacklisted(&up_ip) => {}
+    // like splice: a source blacklisted mid-relay ends it (an unfinished capture is discarded).
+    // When the upstream side ends the copy task, dropping its node writer shows the node EOF,
+    // and the node closing ends the node -> upstream copy here.
+    let to_peer = tokio::select! {
+        r = tokio::io::copy(&mut dr, &mut uw) => r.unwrap_or(0),
+        _ = crate::blacklist::wait_blacklisted(&up_ip) => {
+            upstream_ended.store(true, Ordering::Release);
+            0
+        }
+    };
+    drop(h);
+    Relayed {
+        to_node: delivered.load(Ordering::Relaxed),
+        to_peer,
+        upstream_ended: upstream_ended.load(Ordering::Acquire),
     }
-    h.abort();
 }
 
 const BOOTSTRAP_PREFETCH_BYTES: usize = 64_000_000;
@@ -899,7 +955,8 @@ impl PeerCooldown {
     // `peers` minus those cooling down, order kept; all of them if every one is cooling (a pool
     // that only has recently-faulted peers is still better than none).
     fn usable(&self, peers: Vec<String>, now: Instant) -> Vec<String> {
-        let m = lock(&self.0);
+        let mut m = lock(&self.0);
+        m.retain(|_, until| *until > now);
         if m.is_empty() {
             return peers;
         }
@@ -917,9 +974,12 @@ impl PeerCooldown {
 }
 
 fn cool_down_on_fault(priority: &PriorityTier, cooldown: &PeerCooldown, ip: &str, reason: &str) {
-    if !push_exit_is_upstream_fault(reason) {
-        return;
+    if push_exit_is_upstream_fault(reason) {
+        cool_down(priority, cooldown, ip);
     }
+}
+
+fn cool_down(priority: &PriorityTier, cooldown: &PeerCooldown, ip: &str) {
     if priority.contains(ip) {
         priority.mark_failed(ip);
     } else {
@@ -1600,7 +1660,11 @@ const FRESH_CACHE_REFRESH_MAX_INFLIGHT: usize = 1;
 const COLD_CACHE_REFRESH_MAX_INFLIGHT: usize = 2;
 // The full bootstrap was ~4.5GB in mid-2026 and 5.8GB by 2026-10; keep headroom so growth does
 // not silently stop cache capture. Reserved as virtual memory only (see the capture loop).
+#[cfg(not(test))]
 const MAX_BOOTSTRAP_CAPTURE_BYTES: usize = 9_000_000_000;
+// tests never capture a real bootstrap: don't reserve 9GB of address space on a small CI runner
+#[cfg(test)]
+const MAX_BOOTSTRAP_CAPTURE_BYTES: usize = 64 << 20;
 // capture_bootstrap_raced's rate gates catch slow or stalled peers. Keep fresh refreshes bounded
 // so one bad race cannot monopolize the cache loop, but give cold-cache capture enough time for a
 // valid multi-GB bootstrap instead of killing it with the short fresh-refresh deadline.
@@ -2272,6 +2336,14 @@ struct GatewayCtx {
 }
 
 const STATE_SERVER_MEMORY: usize = 8;
+// Longest a transparent bootstrap's cache tap may capture. Headroom over the cache refresh's own
+// limits: its 15 min cold deadline, and ~20 min for a whole bootstrap (~5.8GB) at the 5MB/s its
+// rate spot-check accepts. (The tap's own sustained-rate detector, 400KB/s, only marks the end of
+// the bulk transfer.)
+#[cfg(not(test))]
+const MAX_TAP_CAPTURE: Duration = Duration::from_secs(30 * 60);
+#[cfg(test)]
+const MAX_TAP_CAPTURE: Duration = Duration::from_millis(300);
 // A 4001 relay (bootstrap transfer, then live blocks) that hears nothing from its upstream this
 // long has a stalled peer: end it so the node reconnects elsewhere. Live blocks arrive several
 // times a second and the state transfer streams continuously, so this never cuts a healthy relay.
@@ -2603,7 +2675,7 @@ async fn transparent_bootstrap(
     } else {
         None
     };
-    if let Some(permit) = tap_permit {
+    let relayed = if let Some(permit) = tap_permit {
         splice_bootstrap_capture(
             down,
             upc,
@@ -2615,8 +2687,9 @@ async fn transparent_bootstrap(
                 disk_cache_path: ctx.disk_cache_path.clone(),
             },
             permit,
+            RELAY_UPSTREAM_IDLE,
         )
-        .await;
+        .await
     } else {
         if ctx.cache_coldstart {
             gwlog!(
@@ -2639,13 +2712,15 @@ async fn transparent_bootstrap(
         // connection (2026-10-21 2-node soak: 68MB resident for 25+ min).
         let prefetched = (hdr.len() + payload_prefix.len()) as u64;
         drop(payload_prefix);
-        let r = splice_with_idle(down, upc, Some(RELAY_UPSTREAM_IDLE)).await;
-        // remembered above so concurrent bootstraps benefit at once; a server that stalled or
-        // closed before delivering the whole abci_state frame must not head the next bootstrap
-        // (a node that left mid-transfer says nothing about the server)
-        if r.upstream_ended && prefetched + r.to_node < 5 + abci_len as u64 {
-            forget_state_server(&ctx.state_servers, &ip);
-        }
+        let mut r = splice_with_idle(down, upc, Some(RELAY_UPSTREAM_IDLE)).await;
+        r.to_node += prefetched;
+        r
+    };
+    // remembered above so concurrent bootstraps benefit at once; a server whose side ended the
+    // relay before the whole bootstrap (abci_state + EVM KVs) was through must not head the next
+    // one (a node that left mid-transfer says nothing about the server)
+    if relayed.upstream_ended && relayed.to_node < MIN_COMPLETE_BOOTSTRAP_BYTES as u64 {
+        forget_state_server(&ctx.state_servers, &ip);
     }
 }
 
@@ -2776,8 +2851,13 @@ async fn handle_4001_live(
         return;
     }
     let Relayed {
-        to_node, to_peer, ..
+        to_node,
+        to_peer,
+        upstream_ended,
     } = splice_with_idle(down, upc, Some(RELAY_UPSTREAM_IDLE)).await;
+    if upstream_ended {
+        cool_down(&ctx.priority, &ctx.cooldown, &ip);
+    }
     gwlog!(
         "[gw] [{}] 4001 splice ended peer={} tier={} secs={} bytes_to_node={} bytes_to_peer={}",
         node.ip,
@@ -3577,13 +3657,6 @@ mod tests {
         );
         let now = Instant::now();
         assert_eq!(cooldown.usable(pool.clone(), now), ["1.1.1.1", "3.3.3.3"]);
-        assert_eq!(
-            cooldown.usable(
-                pool.clone(),
-                now + SESSION_FAULT_COOLDOWN + Duration::from_secs(1)
-            ),
-            pool
-        );
         // a pool of only cooling peers is still used
         assert_eq!(cooldown.usable(vec!["2.2.2.2".into()], now), ["2.2.2.2"]);
         // a priority peer takes the tier's own cooldown
@@ -3595,6 +3668,117 @@ mod tests {
         );
         assert!(priority.candidates().is_empty());
         assert_eq!(cooldown.usable(pool.clone(), now), ["1.1.1.1", "3.3.3.3"]);
+        // once the cooldown has run out the peer is back, and its entry is gone
+        let later = now + SESSION_FAULT_COOLDOWN + Duration::from_secs(1);
+        assert_eq!(cooldown.usable(pool.clone(), later), pool);
+        assert!(lock(&cooldown.0).is_empty());
+    }
+
+    // A tapped bootstrap relay whose upstream goes silent mid-frame ends: the single-flight
+    // capture permit is released (it used to be held forever) and the upstream is blamed.
+    #[tokio::test]
+    async fn silent_upstream_ends_the_tapped_bootstrap_relay_and_frees_the_permit() {
+        let up_l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = up_l.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (_s, _) = up_l.accept().await.unwrap();
+            // the frame's first bytes came with selection; then nothing
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        });
+        let node_l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let node_addr = node_l.local_addr().unwrap();
+        let node = tokio::spawn(async move {
+            let mut c = TcpStream::connect(node_addr).await.unwrap();
+            let mut got = Vec::new();
+            c.read_to_end(&mut got).await.unwrap();
+            got.len()
+        });
+        let (down, _) = node_l.accept().await.unwrap();
+        let upc = TcpStream::connect(up_addr).await.unwrap();
+        let tap = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = tap.clone().try_acquire_owned().unwrap();
+        let r = timeout(
+            Duration::from_secs(5),
+            splice_bootstrap_capture(
+                down,
+                upc,
+                [0, 0, 0, 100, 1],
+                vec![7u8; 10],
+                CacheSink {
+                    boot_blob: Arc::new(Mutex::new(None)),
+                    boot_blob_cached_at: Arc::new(AtomicU64::new(0)),
+                    disk_cache_path: None,
+                },
+                permit,
+                Duration::from_millis(200),
+            ),
+        )
+        .await
+        .expect("the relay ends instead of waiting on the silent upstream");
+        assert!(r.upstream_ended);
+        assert_eq!(r.to_node, 15, "header + prefetched prefix reached the node");
+        assert_eq!(node.await.unwrap(), 15);
+        assert_eq!(tap.available_permits(), 1, "capture permit released");
+    }
+
+    // A state peer that trickles just enough to dodge the idle limit loses the cache tap (its
+    // permit is released) once the capture deadline passes, while the node keeps getting bytes.
+    #[tokio::test]
+    async fn a_trickling_upstream_loses_the_tap_but_keeps_relaying() {
+        let up_l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = up_l.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = up_l.accept().await.unwrap();
+            // one byte every 50ms: never idle for the 200ms limit
+            while s.write_all(&[1]).await.is_ok() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        });
+        let node_l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let node_addr = node_l.local_addr().unwrap();
+        let node = tokio::spawn(async move {
+            let mut c = TcpStream::connect(node_addr).await.unwrap();
+            let mut buf = [0u8; 64];
+            let mut got = 0usize;
+            let until = Instant::now() + Duration::from_millis(800);
+            while Instant::now() < until {
+                if let Ok(Ok(n)) = timeout(Duration::from_millis(100), c.read(&mut buf)).await {
+                    got += n;
+                }
+            }
+            got // then the node leaves
+        });
+        let (down, _) = node_l.accept().await.unwrap();
+        let upc = TcpStream::connect(up_addr).await.unwrap();
+        let tap = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = tap.clone().try_acquire_owned().unwrap();
+        let relay = tokio::spawn(splice_bootstrap_capture(
+            down,
+            upc,
+            // a big frame the trickle never finishes
+            [0, 0, 100, 0, 1],
+            Vec::new(),
+            CacheSink {
+                boot_blob: Arc::new(Mutex::new(None)),
+                boot_blob_cached_at: Arc::new(AtomicU64::new(0)),
+                disk_cache_path: None,
+            },
+            permit,
+            Duration::from_millis(200),
+        ));
+        tokio::time::sleep(MAX_TAP_CAPTURE + Duration::from_millis(250)).await;
+        assert_eq!(tap.available_permits(), 1, "tap dropped after its deadline");
+        assert!(!relay.is_finished(), "while the relay itself goes on");
+        let got = node.await.unwrap();
+        assert!(
+            got > 5 + 5,
+            "the node kept receiving the trickle ({got} bytes)"
+        );
+        let r = timeout(Duration::from_secs(2), relay)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!r.upstream_ended, "the node left first");
     }
 
     #[test]

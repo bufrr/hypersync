@@ -4,7 +4,7 @@
 #         runtime deps; curl is included so the same image can also run `peerd`
 #         if you choose to containerize it with /var/run/docker.sock mounted)
 
-FROM rust:1-bookworm AS builder
+FROM rust:1.93-bookworm AS builder
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
