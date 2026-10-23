@@ -85,7 +85,7 @@ Set in `.env`; compose passes them through.
 - sends nothing for 10 s, or no higher block for 30 s;
 - sends a block more than 20,000 rounds above its previous one;
 - falls more than 1,500 rounds behind the network tip, or sends an implausible round;
-- stays more than 150 rounds (~10 s) behind the freshest round the gateway's live streams agree on, for 15 s — a peer that still sends, just slowly. "Agree" means streams from at least two different peers (other node sessions, two pace reference streams) have reached it, so one bad peer can't make honest sessions look lagging, and rounds more than ~20 min past peerd's network tip never count (nor any while that tip is unknown). Time when the node itself isn't taking blocks counts against the peer neither here nor for the 30 s stall;
+- stays more than 100 rounds (~7 s) behind the freshest round the gateway's live streams agree on, for 5 s (cut ~12 s after it starts falling behind) — a peer that still sends, just slowly. "Agree" means streams from at least two different peers (other node sessions, two pace reference streams) have reached it, so one bad peer can't make honest sessions look lagging, and rounds more than ~20 min past peerd's network tip never count (nor any while that tip is unknown). Time when the node itself isn't taking blocks counts against the peer neither here nor for the 30 s stall;
 - stops reading the node's outbound traffic for 5 s.
 
 The peer is then skipped for 30 s (priority peers via their own cooldown), so the reconnect lands on a different one unless every peer is cooling down.

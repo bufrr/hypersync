@@ -304,10 +304,11 @@ pub(crate) struct FreshestRound {
     stale: Duration,
 }
 
-// ~10s at mainnet's ~14.8 rounds/s, sustained for 15s: past normal jitter, well short of the
-// minutes a slow peer was left feeding a node before this guard existed
-pub(crate) const PEER_LAG_ROUNDS: u32 = 150;
-pub(crate) const PEER_LAG_GRACE: Duration = Duration::from_secs(15);
+// ~7s at mainnet's ~14.8 rounds/s, sustained for 5s: healthy streams sit within a few rounds of
+// the freshest one (soak: 0-5, with rare brief dips up to ~90 that this clears), so a slow peer
+// goes in ~12s instead of the minutes it was left feeding a node before this guard existed
+pub(crate) const PEER_LAG_ROUNDS: u32 = 100;
+pub(crate) const PEER_LAG_GRACE: Duration = Duration::from_secs(5);
 pub(crate) const FRESHEST_STALE: Duration = Duration::from_secs(30);
 // Frames queued for a node that is not draining them (~2s of blocks): the node, not its upstream,
 // is then what holds the stream back, so the lag guard doesn't blame the peer.
@@ -1241,6 +1242,34 @@ mod tests {
         for secs in [0, 20, 60] {
             assert_eq!(p.lagging(&f, false, t0 + Duration::from_secs(secs)), None);
         }
+    }
+
+    // The production tuning: a dip like the worst a healthy priority peer showed in soak (87
+    // rounds) never counts; past PEER_LAG_ROUNDS, a stream is flagged only after the whole grace.
+    #[test]
+    fn the_production_lag_tuning_clears_observed_healthy_dips() {
+        let f = Arc::new(FreshestRound::new(
+            PEER_LAG_ROUNDS,
+            PEER_LAG_GRACE,
+            FRESHEST_STALE,
+            Arc::new(AtomicU32::new(TIP)),
+        ));
+        let (a, b) = (f.feed("a"), f.feed("b"));
+        let t0 = Instant::now();
+        let mut p = BlockProgress::new(0, t0);
+        p.on_round(TIP, t0).unwrap();
+        a.offer(TIP + 87);
+        b.offer(TIP + 87);
+        assert_eq!(p.lagging(&f, false, t0), None);
+        assert_eq!(p.lagging(&f, false, t0 + Duration::from_secs(60)), None);
+        let behind = PEER_LAG_ROUNDS + 1;
+        a.offer(TIP + behind);
+        b.offer(TIP + behind);
+        let t1 = t0 + Duration::from_secs(60);
+        assert_eq!(p.lagging(&f, false, t1), None, "the grace starts now");
+        let almost = t1 + PEER_LAG_GRACE - Duration::from_millis(1);
+        assert_eq!(p.lagging(&f, false, almost), None);
+        assert_eq!(p.lagging(&f, false, t1 + PEER_LAG_GRACE), Some(behind));
     }
 
     // Rounds far past peerd's network tip — or any while that tip is unknown — don't count, so
