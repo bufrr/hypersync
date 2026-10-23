@@ -521,8 +521,11 @@ pub(super) async fn select_live_peer(
                 if is_priority {
                     prio_in_flight = prio_in_flight.saturating_sub(1);
                     prio_pending.retain(|p| p != &ip);
-                    // a full peer is busy with our other nodes, not broken: no cooldown
-                    if e.to_string() != PRIORITY_CAP_REACHED {
+                    // a full peer is busy with our other nodes, not broken: no cooldown; one that
+                    // only timed out may be waiting on a local stall (PriorityTier::mark_hung)
+                    if e.kind() == std::io::ErrorKind::TimedOut {
+                        priority.mark_hung(&ip);
+                    } else if e.to_string() != PRIORITY_CAP_REACHED {
                         priority.mark_failed(&ip);
                     }
                     gwlog!(
@@ -555,7 +558,7 @@ pub(super) async fn select_live_peer(
     // hung priority peers x 1.5s each ran the node's live connect out after both low-memory
     // restarts).
     for ip in &prio_pending {
-        priority.mark_failed(ip);
+        priority.mark_hung(ip);
     }
     gwlog!(
         "[gw] live selection: no vetted peer in {:.1}s (prio_tried={} prio_hung={} {})",
@@ -770,7 +773,11 @@ pub(super) async fn wait_priority_return(
                             "[gw] [{}] priority peer {ip} still not serving: {e}",
                             node.ip
                         );
-                        priority.mark_failed(&ip);
+                        if e.kind() == std::io::ErrorKind::TimedOut {
+                            priority.mark_hung(&ip);
+                        } else {
+                            priority.mark_failed(&ip);
+                        }
                     }
                 }
             }

@@ -377,7 +377,8 @@ async fn fetch_client_blocks_raced(
                     Ok(Some(j)) => j,
                     Ok(None) => break,
                     Err(_) => {
-                        // hung for this request: cool them down, like a hung live selection
+                        // hung for this request: the full failure cooldown (a 4002 answer was due ~4s ago;
+                        // unlike a live connect, this isn't the node's first seconds after a restart)
                         for ip in &prio_pending {
                             priority.mark_failed(ip);
                         }

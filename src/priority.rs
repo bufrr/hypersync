@@ -15,6 +15,13 @@ use crate::util::{lock, split_csv};
 // A priority peer that failed selection (refused, peer full, lagged, no block) is skipped for
 // this long, so one dead sentry does not cost every reconnect its stage budget.
 const PRIORITY_COOLDOWN: Duration = Duration::from_secs(30);
+// An exclusive tier's peer that merely went silent (timed out, no error) is skipped only this
+// long: enough to keep it out of the same connect's fallback (~1.3s after the 3.5s window), short
+// enough that the node's next connect (10s after this one started, ~6.5s after the window closed)
+// tries the priority peers again. Silence from all of them at once is mostly
+// a local stall (soak: the node's first live connect right after writing its state, when pool
+// peers stayed silent too); the full cooldown sent that node to the pool for a whole session.
+const PRIORITY_HUNG_COOLDOWN: Duration = Duration::from_secs(4);
 const DEFAULT_STAGE_MS: u64 = 1500;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -194,8 +201,29 @@ impl PriorityTier {
     }
 
     fn mark_failed_at(&self, ip: &str, now: Instant) {
+        self.cool_until(ip, now + PRIORITY_COOLDOWN);
+    }
+
+    // A priority peer that timed out without an error: on an exclusive tier only briefly (see
+    // PRIORITY_HUNG_COOLDOWN), otherwise like any failure.
+    pub(crate) fn mark_hung(&self, ip: &str) {
+        self.mark_hung_at(ip, Instant::now());
+    }
+
+    fn mark_hung_at(&self, ip: &str, now: Instant) {
+        if self.exclusive() {
+            self.cool_until(ip, now + PRIORITY_HUNG_COOLDOWN);
+        } else {
+            self.mark_failed_at(ip, now);
+        }
+    }
+
+    // Only ever extends a cooldown: a short one never cuts a longer one set meanwhile (a live
+    // attempt timing out after the peer's session already failed).
+    fn cool_until(&self, ip: &str, until: Instant) {
         if let Some(i) = self.index(ip) {
-            lock(&self.cooldown_until)[i] = Some(now + PRIORITY_COOLDOWN);
+            let c = &mut lock(&self.cooldown_until)[i];
+            *c = Some(c.map_or(until, |t| t.max(until)));
         }
     }
 
@@ -356,6 +384,35 @@ mod tests {
             Duration::from_millis(1500),
             BootstrapPolicy::Fallback,
         ))
+    }
+
+    // A priority peer that merely went silent comes back after PRIORITY_HUNG_COOLDOWN on an
+    // exclusive tier (the node's next connect retries it); a staged tier, or a real failure,
+    // keeps the full cooldown.
+    #[test]
+    fn a_silent_priority_peer_is_cooled_briefly_only_on_an_exclusive_tier() {
+        let ex = PriorityTier::new(
+            vec!["203.0.113.81".into()],
+            0,
+            Duration::from_millis(1500),
+            BootstrapPolicy::Prefer,
+        )
+        .with_exclusive(true);
+        let t0 = Instant::now();
+        ex.mark_hung_at("203.0.113.81", t0);
+        assert!(ex.candidates_at(t0 + Duration::from_secs(3)).is_empty());
+        assert_eq!(ex.candidates_at(t0 + Duration::from_secs(5)).len(), 1);
+        ex.mark_failed_at("203.0.113.81", t0);
+        assert!(ex.candidates_at(t0 + Duration::from_secs(29)).is_empty());
+        // a later short cooldown doesn't cut the failure's
+        ex.mark_hung_at("203.0.113.81", t0 + Duration::from_secs(1));
+        assert!(ex.candidates_at(t0 + Duration::from_secs(29)).is_empty());
+        let staged = tier(&["203.0.113.81"], 0);
+        staged.mark_hung_at("203.0.113.81", t0);
+        assert!(staged
+            .candidates_at(t0 + Duration::from_secs(29))
+            .is_empty());
+        assert_eq!(staged.candidates_at(t0 + Duration::from_secs(31)).len(), 1);
     }
 
     // An exclusive tier lets the pool serve a node only while no priority peer is usable: each
