@@ -604,7 +604,8 @@ pub(crate) async fn serve_failover(
                     let pool = lock(&fctx.pool).clone();
                     let start = rot.fetch_add(1, Ordering::Relaxed);
                     let mut cands: Vec<String> = fctx.priority.candidates();
-                    if !pool.is_empty() {
+                    // an exclusive priority tier keeps standbys on its peers while any is usable
+                    if !pool.is_empty() && fctx.priority.pool_allowed() {
                         cands.extend((0..pool.len()).map(|i| pool[(start + i) % pool.len()].clone()));
                     }
                     let mut seen = HashSet::new();

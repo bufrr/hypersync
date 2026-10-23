@@ -61,8 +61,9 @@ Set in `.env`; compose passes them through.
 | `HYPERSYNC_IP_BLACKLIST` | – | Comma-separated IPs never connected to (see [IP blacklist](#ip-blacklist)). |
 | `HYPERSYNC_PRIORITY_PEERS` | – | Comma-separated priority peer IPs. Logged as `prio-N`, never by IP. |
 | `HYPERSYNC_PRIORITY_MAX_SESSIONS` | `0` | Max node sessions per priority peer (`0` = unlimited). |
-| `HYPERSYNC_PRIORITY_STAGE_MS` | `1500` | How long priority peers race alone before the pool joins. |
-| `HYPERSYNC_PRIORITY_BOOTSTRAP` | `fallback` | Bootstrap from priority peers: `fallback` (after the pool), `prefer`, or `never`. |
+| `HYPERSYNC_PRIORITY_EXCLUSIVE` | `1` | Keep nodes on the priority peers (QuickNode-style peering): the pool serves a node only while every priority peer is unusable. `0` = staged: the pool joins after `HYPERSYNC_PRIORITY_STAGE_MS`. |
+| `HYPERSYNC_PRIORITY_STAGE_MS` | `1500` | Staged tier only: how long priority peers race alone before the pool joins. |
+| `HYPERSYNC_PRIORITY_BOOTSTRAP` | `prefer` if exclusive, else `fallback` | Bootstrap from priority peers: `prefer` (first), `fallback` (after the pool, even on an exclusive tier), or `never`. |
 | `HYPERSYNC_FAILOVER_STANDBYS` | `0` | Hot standbys per node session (see below). |
 | `HYPERSYNC_REFERENCE_STREAM` | `1` | `0` turns off the two pace reference streams: extra live streams from pool peers (~1-2 MB/s each, nothing forwarded) that let even a single node session notice its peer falling behind. |
 | `HYPERSYNC_BOOT_CACHE` | next to peers.json | Disk path for `--cache`. |
@@ -76,7 +77,8 @@ Set in `.env`; compose passes them through.
 
 **Picking a peer** (on every node 4001 connect):
 
-- Priority peers race first. Every upstream session the gateway opens on a priority peer — live, fallback, bootstrap, 4002 prewarm, hot standby — reserves one of its `HYPERSYNC_PRIORITY_MAX_SESSIONS` slots before dialing; a full peer is skipped without penalty. A node's own side connections (4000, 4002-4010) to its active peer belong to that session and take no extra slot. The pool joins after the stage delay, 4 at a time.
+- **Exclusive tier (default).** A node stays on the priority peers while any of them is usable; the pool serves it — live blocks, 4002, the 4001 fallback, abci_state, hot standbys — only while every priority peer is cooling down (after an error, a hang or a lag cut), at its session cap, or blacklisted. A slow priority peer is waited for for the whole selection window, never outraced by the pool. A session that did land on the pool returns to a priority peer as below.
+- Priority peers race first. Every upstream session the gateway opens on a priority peer — live, fallback, bootstrap, 4002 prewarm, hot standby — reserves one of its `HYPERSYNC_PRIORITY_MAX_SESSIONS` slots before dialing; a full peer is skipped without penalty. A node's own side connections (4000, 4002-4010) to its active peer belong to that session and take no extra slot. On a staged tier (`HYPERSYNC_PRIORITY_EXCLUSIVE=0`) the pool joins after the stage delay, 4 at a time.
 - The first peer whose first live block is plausible and within 1,500 rounds of the network tip wins — all within 3.5 s, because hl-node abandons a connect ~5 s after greeting. If none qualifies, a fallback races up to 8 peers in the time left.
 - A priority peer that errors, refuses (`peer full`) or hangs is cooled down for 30 s.
 
@@ -100,7 +102,7 @@ Live frames over 8 MB end the session (blocks average ~200 KB), at most 64 MB of
 
 **Bootstrap relay.** A state server that sends nothing for 60 s ends the relay so the node retries elsewhere; one that ends before delivering the whole abci_state is no longer tried first.
 
-**Client blocks (4002).** The node's active peer answers alone for 2 s, then up to 8 others are hedged in. 15 s per request, at most 8 requests at once.
+**Client blocks (4002).** The node's active peer answers alone for 2 s, then up to 8 others are hedged in — on an exclusive tier the other priority peers first, and the pool only once every one of them has failed that request or 6 s have passed (a priority peer silent that long cools down). 15 s per request, at most 8 requests at once.
 
 ## IP blacklist
 

@@ -184,14 +184,20 @@ pub(super) async fn select_fast_bootstrap_peer(
     let deadline = started + Duration::from_secs(BOOTSTRAP_SELECT_DEADLINE_SECS);
     let mut launched = 0usize;
     let mut in_flight = 0usize;
+    let mut prio_in_flight = 0usize;
     let mut set = tokio::task::JoinSet::new();
     let mut fails: Vec<String> = Vec::new();
 
     loop {
         while launched < limit && in_flight < BOOTSTRAP_SELECT_MAX_INFLIGHT {
             let ip = peers[(start + launched) % n].clone();
+            let is_priority = priority.contains(&ip);
+            // an exclusive tier's pool candidates wait until every priority attempt has failed
+            if !is_priority && prio_in_flight > 0 && priority.exclusive() {
+                break;
+            }
             // a priority peer is only dialed with a free slot (HYPERSYNC_PRIORITY_MAX_SESSIONS)
-            let slot = if priority.contains(&ip) {
+            let slot = if is_priority {
                 match priority.try_acquire(&ip) {
                     Some(s) => Some(s),
                     None => {
@@ -204,13 +210,15 @@ pub(super) async fn select_fast_bootstrap_peer(
                 None
             };
             set.spawn(async move {
-                try_fast_bootstrap_peer(ip, greet).await.map(|mut s| {
+                let r = try_fast_bootstrap_peer(ip, greet).await.map(|mut s| {
                     s.prio_session = slot;
                     s
-                })
+                });
+                (is_priority, r)
             });
             launched += 1;
             in_flight += 1;
+            prio_in_flight += usize::from(is_priority);
         }
         if in_flight == 0 {
             break;
@@ -223,12 +231,19 @@ pub(super) async fn select_fast_bootstrap_peer(
             Ok(Some(joined)) => {
                 in_flight = in_flight.saturating_sub(1);
                 match joined {
-                    Ok(Ok(selected)) => {
+                    Ok((_, Ok(selected))) => {
                         set.abort_all();
                         return Some(selected);
                     }
-                    Ok(Err(e)) => fails.push(e),
-                    Err(e) => fails.push(format!("join: {e}")),
+                    Ok((is_priority, Err(e))) => {
+                        prio_in_flight -= usize::from(is_priority);
+                        fails.push(e);
+                    }
+                    Err(e) => {
+                        // a failed task can't say which tier it was; never let it hold the pool back
+                        prio_in_flight = prio_in_flight.min(in_flight);
+                        fails.push(format!("join: {e}"));
+                    }
                 }
             }
             Ok(None) => break,
@@ -421,7 +436,9 @@ async fn live_attempt(
 //
 // Two stages share that window. Stage A races every eligible priority peer at once. Stage B (the
 // pool, LIVE_SELECT_MAX_PARALLEL slots) opens when the priority stage budget runs out or every
-// priority attempt has failed; priority attempts still in flight keep racing alongside it. With no
+// priority attempt has failed; priority attempts still in flight keep racing alongside it. An
+// exclusive tier has no stage budget: the pool opens only once every priority peer has failed (or
+// none was usable to begin with), so a slow priority peer is never outraced by the pool. With no
 // priority peers this is the plain pool race.
 pub(super) async fn select_live_peer(
     priority: &Arc<PriorityTier>,
@@ -439,6 +456,8 @@ pub(super) async fn select_live_peer(
     let deadline = started + LIVE_SELECT_WAIT;
     let pool_opens = if prio.is_empty() {
         started
+    } else if priority.exclusive() {
+        deadline
     } else {
         started + priority.stage
     };
@@ -520,7 +539,7 @@ pub(super) async fn select_live_peer(
             Ok(None) => break,
             Err(_) if pool_open => break,
             Err(_) => {
-                if Instant::now() >= pool_opens {
+                if Instant::now() >= pool_opens && pool_opens < deadline {
                     gwlog!(
                         "[gw] priority stage expired after {}ms with {prio_in_flight} attempt(s) pending; opening the pool",
                         started.elapsed().as_millis()
@@ -548,9 +567,14 @@ pub(super) async fn select_live_peer(
     None
 }
 
-// Priority candidates first (least-loaded), then the pool rotated from `start`, deduped.
+// Priority candidates first (least-loaded), then the pool rotated from `start`, deduped. An
+// exclusive tier with a usable priority peer offers only the priority peers.
 pub(super) fn tiered_peers(priority: &PriorityTier, pool: &[String], start: usize) -> Vec<String> {
-    ordered_candidates(priority.candidates(), pool, start)
+    let prio = priority.candidates();
+    if priority.exclusive() && !prio.is_empty() {
+        return prio;
+    }
+    ordered_candidates(prio, pool, start)
 }
 
 // hl-node abandons a fresh 4001 connection this long after sending its greeting ("connecting to
@@ -843,6 +867,8 @@ mod tests {
         Silent,
         // answer the greeting with the 0x04 peer-full status
         Full,
+        // like Healthy, but only after this many ms
+        Slow(u64),
     }
 
     // A fake upstream 4001 on an ephemeral 127.0.0.1 port; returns ("127.0.0.1:port", task).
@@ -861,6 +887,11 @@ mod tests {
                         return;
                     }
                     match kind {
+                        FakePeer::Slow(ms) => {
+                            tokio::time::sleep(Duration::from_millis(ms)).await;
+                            let _ = s.write_all(&[0, 0, 0, 1, 0, 3]).await;
+                            let _ = s.write_all(&live_block_frame(1_400_000_000)).await;
+                        }
                         FakePeer::Healthy => {
                             let _ = s.write_all(&[0, 0, 0, 1, 0, 3]).await;
                             let _ = s.write_all(&live_block_frame(1_400_000_000)).await;
@@ -894,6 +925,108 @@ mod tests {
             Duration::from_millis(stage_ms),
             BootstrapPolicy::Fallback,
         ))
+    }
+
+    fn exclusive_tier(peers: &[&str], max: usize) -> Arc<PriorityTier> {
+        Arc::new(
+            PriorityTier::new(
+                peers.iter().map(|s| s.to_string()).collect(),
+                max,
+                Duration::from_millis(300),
+                BootstrapPolicy::Prefer,
+            )
+            .with_exclusive(true),
+        )
+    }
+
+    // QuickNode-style peering: a node stays on the priority peers while any of them serves —
+    // a slow one is waited for past the stage, never outraced by the pool — and the pool takes
+    // over only once every priority peer has failed or is unusable.
+    #[tokio::test]
+    async fn an_exclusive_tier_uses_the_pool_only_when_every_priority_peer_fails() {
+        let (slow, h1) = fake_live_peer(FakePeer::Slow(1000)).await;
+        let (o1, h2) = fake_live_peer(FakePeer::Healthy).await;
+        let (silent, h3) = fake_live_peer(FakePeer::Silent).await;
+        let refused = refused_addr().await;
+        let pool = vec![o1.clone()];
+
+        // a priority peer answering well past the 300ms stage still beats a healthy pool peer
+        let tier = exclusive_tier(&[&slow], 0);
+        let s = select_live_peer(&tier, &pool, 0, GREET_FALSE, 0, 0)
+            .await
+            .unwrap();
+        assert_eq!(s.ip, slow);
+        assert!(!tier.pool_allowed());
+        drop(s);
+
+        // every priority peer refuses: the pool opens at once
+        let tier = exclusive_tier(&[&refused], 0);
+        let s = select_live_peer(&tier, &pool, 0, GREET_FALSE, 0, 0)
+            .await
+            .unwrap();
+        assert_eq!(s.ip, o1);
+        assert!(
+            tier.pool_allowed(),
+            "the only priority peer is cooling down"
+        );
+        drop(s);
+
+        // one priority peer refuses, the other hangs: no pool while the hung one might answer;
+        // once the window has cooled it down too, the next selection may use the pool
+        let tier = exclusive_tier(&[&refused, &silent], 0);
+        assert!(select_live_peer(&tier, &pool, 0, GREET_FALSE, 0, 0)
+            .await
+            .is_none());
+        assert!(tier.pool_allowed());
+        let s = select_live_peer(&tier, &pool, 0, GREET_FALSE, 0, 0)
+            .await
+            .unwrap();
+        assert_eq!(s.ip, o1);
+        drop(s);
+
+        // a priority peer at its session cap is unusable too
+        let tier = exclusive_tier(&[&slow], 1);
+        let held = tier.try_acquire(&slow).unwrap();
+        assert!(tier.pool_allowed());
+        let s = select_live_peer(&tier, &pool, 0, GREET_FALSE, 0, 0)
+            .await
+            .unwrap();
+        assert_eq!(s.ip, o1);
+        drop((s, held));
+        for h in [h1, h2, h3] {
+            h.abort();
+        }
+    }
+
+    #[test]
+    fn an_exclusive_tier_offers_the_fallback_only_its_usable_priority_peers() {
+        let pool: Vec<String> = vec!["198.51.100.1".into(), "198.51.100.2".into()];
+        let tier = exclusive_tier(&["203.0.113.1", "203.0.113.2"], 0);
+        assert_eq!(
+            tiered_peers(&tier, &pool, 0),
+            vec!["203.0.113.1".to_string(), "203.0.113.2".to_string()]
+        );
+        tier.mark_failed("203.0.113.1");
+        assert_eq!(
+            tiered_peers(&tier, &pool, 0),
+            vec!["203.0.113.2".to_string()]
+        );
+        tier.mark_failed("203.0.113.2");
+        assert_eq!(
+            tiered_peers(&tier, &pool, 0),
+            pool,
+            "every priority peer is down"
+        );
+        // a staged (non-exclusive) tier keeps the pool behind its priority peers
+        let staged = test_tier(&["203.0.113.1"], 300);
+        assert_eq!(
+            tiered_peers(&staged, &pool, 0),
+            vec![
+                "203.0.113.1".to_string(),
+                "198.51.100.1".to_string(),
+                "198.51.100.2".to_string()
+            ]
+        );
     }
 
     #[tokio::test]

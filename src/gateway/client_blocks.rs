@@ -156,6 +156,11 @@ const ACTIVE_4002_PIN_WAIT: Duration = Duration::from_millis(1500);
 // common case at one upstream connection and guarantees a healthy active can't be outraced by
 // a cross-peer response.
 const ACTIVE_4002_GRACE: Duration = Duration::from_millis(2000);
+// On an exclusive priority tier, how long into a request the priority peers have before the pool
+// is hedged anyway: one that hasn't answered by then counts as failed for the request and cools
+// down (a hung one would otherwise hold every request past its budget, the pool never reached).
+// Priority answers take ~2s; this leaves the pool most of the request budget.
+const PRIORITY_4002_ROUND: Duration = Duration::from_secs(6);
 
 async fn wait_active_session(node: &NodeState, budget: Duration) -> Option<ActivePeer> {
     let deadline = Instant::now() + budget;
@@ -258,9 +263,11 @@ async fn fetch_client_blocks_raced(
 ) -> Result<BudgetedFrame, String> {
     let started = Instant::now();
     // a remembered hedge winner (see NodeState::rpc_peer) stands in for a missing pin right away
+    // (a remembered pool peer only while the pool may serve this node at all)
     let remembered = lock(&node.rpc_peer)
         .clone()
-        .filter(|ip| !crate::blacklist::contains(ip));
+        .filter(|ip| !crate::blacklist::contains(ip))
+        .filter(|ip| priority.contains(ip) || priority.pool_allowed());
     let active = if remembered.is_some() {
         node.active_session_snapshot()
     } else {
@@ -321,54 +328,115 @@ async fn fetch_client_blocks_raced(
         }
     }
 
-    // Stage 2: hedge across pool candidates — only reached when the active is absent, failed,
-    // or slow. Each candidate opens its own temporary live relationship (prewarm) first.
-    for ip in client_block_peer_candidates(priority.candidates(), peers, rr, 8) {
-        if first_ip.as_deref() == Some(ip.as_str()) {
-            continue;
-        }
-        let Some(slot) = prewarm_slot(&ip) else {
-            continue; // priority peer at its session cap
-        };
-        let req = req.clone();
-        attempts.spawn(async move {
-            let _slot = slot;
-            let result = fetch_client_blocks_from_peer(ip.clone(), req, true).await.1;
-            (None, ip, result)
-        });
-    }
-
+    // Stage 2: hedge across candidates — only reached when the active is absent, failed, or
+    // slow. Each candidate opens its own temporary live relationship (prewarm) first. An exclusive
+    // priority tier hedges its own peers first and the pool only once all of them have failed this
+    // request without a definitive (range) answer.
+    let prio = priority.candidates();
+    let pool_waits = priority.exclusive() && !prio.is_empty();
+    let mut round = if pool_waits {
+        let n = prio.len();
+        client_block_peer_candidates(prio, &[], rr, n)
+    } else {
+        client_block_peer_candidates(prio, peers, rr, 8)
+    };
+    let mut pool_hedged = !pool_waits;
     let mut terminal_from = String::new();
     let mut too_small_from = String::new();
-    while let Some(joined) = attempts.join_next().await {
-        let Ok((tag, ip, result)) = joined else {
-            continue;
-        };
-        let had_terminal = terminal.is_some();
-        let had_too_small = too_small.is_some();
-        if let Some(frame) = note_client_block_result(
-            node,
-            tag.as_ref(),
-            &ip,
-            result,
-            &mut failures,
-            &mut terminal,
-            &mut too_small,
-        ) {
-            attempts.abort_all();
-            let stage = if tag.is_some() { "active" } else { "hedge" };
-            if tag.is_none() && node.active_session_snapshot().is_none() {
-                *lock(&node.rpc_peer) = Some(ip.clone());
+    loop {
+        // the priority peers hedged in this round that haven't answered yet
+        let mut prio_pending: Vec<String> = Vec::new();
+        for ip in round {
+            if first_ip.as_deref() == Some(ip.as_str()) {
+                continue;
             }
-            log_client_blocks(node, priority, &ip, stage, &frame, started);
-            return Ok(frame);
+            let Some(slot) = prewarm_slot(&ip) else {
+                continue; // priority peer at its session cap
+            };
+            if !pool_hedged {
+                prio_pending.push(ip.clone());
+            }
+            let req = req.clone();
+            attempts.spawn(async move {
+                let _slot = slot;
+                let result = fetch_client_blocks_from_peer(ip.clone(), req, true).await.1;
+                (None, ip, result)
+            });
         }
-        if !had_terminal && terminal.is_some() {
-            terminal_from = ip.clone();
+
+        let round_deadline = (!pool_hedged).then_some(started + PRIORITY_4002_ROUND);
+        let mut round_timed_out = false;
+        loop {
+            let joined = match round_deadline {
+                Some(d) => match timeout(
+                    d.saturating_duration_since(Instant::now()),
+                    attempts.join_next(),
+                )
+                .await
+                {
+                    Ok(Some(j)) => j,
+                    Ok(None) => break,
+                    Err(_) => {
+                        // hung for this request: cool them down, like a hung live selection
+                        for ip in &prio_pending {
+                            priority.mark_failed(ip);
+                        }
+                        round_timed_out = true;
+                        gwlog!(
+                            "[gw] [{}] 4002 priority peers silent after {}s (hung={}); hedging the pool",
+                            node.ip,
+                            PRIORITY_4002_ROUND.as_secs(),
+                            prio_pending.len()
+                        );
+                        break;
+                    }
+                },
+                None => match attempts.join_next().await {
+                    Some(j) => j,
+                    None => break,
+                },
+            };
+            let Ok((tag, ip, result)) = joined else {
+                continue;
+            };
+            prio_pending.retain(|p| p != &ip);
+            let had_terminal = terminal.is_some();
+            let had_too_small = too_small.is_some();
+            if let Some(frame) = note_client_block_result(
+                node,
+                tag.as_ref(),
+                &ip,
+                result,
+                &mut failures,
+                &mut terminal,
+                &mut too_small,
+            ) {
+                attempts.abort_all();
+                let stage = if tag.is_some() { "active" } else { "hedge" };
+                if tag.is_none() && node.active_session_snapshot().is_none() {
+                    *lock(&node.rpc_peer) = Some(ip.clone());
+                }
+                log_client_blocks(node, priority, &ip, stage, &frame, started);
+                return Ok(frame);
+            }
+            if !had_terminal && terminal.is_some() {
+                terminal_from = ip.clone();
+            }
+            if !had_too_small && too_small.is_some() {
+                too_small_from = ip;
+            }
         }
-        if !had_too_small && too_small.is_some() {
-            too_small_from = ip;
+        if pool_hedged || terminal.is_some() || too_small.is_some() || peers.is_empty() {
+            break;
         }
+        pool_hedged = true;
+        if !round_timed_out {
+            gwlog!(
+                "[gw] [{}] 4002 every priority peer failed this request; hedging the pool",
+                node.ip
+            );
+        }
+        round = client_block_peer_candidates(Vec::new(), peers, rr, 8);
     }
     if let Some(frame) = terminal {
         log_client_blocks(node, priority, &terminal_from, "terminal", &frame, started);

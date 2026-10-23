@@ -47,11 +47,12 @@ async fn dial_active(
     // it). Marked lazy: this pin must not suppress a cache replay if the node is actually cold-starting
     // and its 4001 bootstrap greet simply hasn't arrived yet.
     // An existing pin is used even with an empty pool, and a priority-only deployment (empty
-    // pool) still has candidates: the priority tier.
+    // pool) still has candidates: the priority tier — as does an exclusive tier while any of its
+    // peers is usable.
     let target = match target {
         Some(t) => t,
         None => {
-            let t = if peers.is_empty() {
+            let t = if peers.is_empty() || !priority.pool_allowed() {
                 priority.candidates().into_iter().next()?
             } else {
                 peers[rr.fetch_add(1, Ordering::Relaxed) % peers.len()].clone()

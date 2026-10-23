@@ -52,7 +52,9 @@ services:
       # Tier P (see docs/hypersync-quicknode-upgrade-plan.html): stand-in public peers now, the
       # QuickNode sentry roots on swap day. Set in .env (gitignored), never here. Empty = off.
       HYPERSYNC_PRIORITY_PEERS: "${HYPERSYNC_PRIORITY_PEERS:-}"
-      HYPERSYNC_PRIORITY_BOOTSTRAP: "${HYPERSYNC_PRIORITY_BOOTSTRAP:-fallback}"
+      HYPERSYNC_PRIORITY_EXCLUSIVE: "${HYPERSYNC_PRIORITY_EXCLUSIVE:-1}"
+      # empty = prefer on an exclusive tier, fallback on a staged one
+      HYPERSYNC_PRIORITY_BOOTSTRAP: "${HYPERSYNC_PRIORITY_BOOTSTRAP:-}"
       HYPERSYNC_PRIORITY_MAX_SESSIONS: "${HYPERSYNC_PRIORITY_MAX_SESSIONS:-0}"
       HYPERSYNC_PRIORITY_STAGE_MS: "${HYPERSYNC_PRIORITY_STAGE_MS:-1500}"
       # IPs never dialed; also read from /pd/ip_blacklist.txt (= ./data/ip_blacklist.txt, re-read

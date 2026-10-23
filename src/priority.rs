@@ -54,6 +54,10 @@ pub(crate) struct PriorityTier {
     max_sessions: usize,
     pub(crate) stage: Duration,
     pub(crate) bootstrap: BootstrapPolicy,
+    // Keep nodes on the priority peers (QuickNode-style peering): the pool serves a node — live
+    // blocks, 4002, the 4001 fallback, abci_state, hot standbys — only while every priority peer is
+    // unusable (cooling down after a failure or lag, at its session cap, or blacklisted).
+    exclusive: bool,
 }
 
 impl PriorityTier {
@@ -71,14 +75,39 @@ impl PriorityTier {
             max_sessions,
             stage,
             bootstrap,
+            exclusive: false,
         }
     }
 
+    pub(crate) fn with_exclusive(mut self, exclusive: bool) -> Self {
+        self.exclusive = exclusive;
+        self
+    }
+
+    // Nodes stay on the priority tier while any priority peer is usable (see `exclusive`).
+    pub(crate) fn exclusive(&self) -> bool {
+        self.exclusive && !self.peers.is_empty()
+    }
+
+    // May a node be served from the pool right now?
+    pub(crate) fn pool_allowed(&self) -> bool {
+        !self.exclusive() || self.candidates().is_empty()
+    }
+
     // HYPERSYNC_PRIORITY_PEERS (comma-separated IPv4), HYPERSYNC_PRIORITY_MAX_SESSIONS,
-    // HYPERSYNC_PRIORITY_STAGE_MS, HYPERSYNC_PRIORITY_BOOTSTRAP. Unset = empty tier = today's
-    // single-pool behaviour.
+    // HYPERSYNC_PRIORITY_STAGE_MS, HYPERSYNC_PRIORITY_BOOTSTRAP, HYPERSYNC_PRIORITY_EXCLUSIVE.
+    // Unset = empty tier = today's single-pool behaviour.
     pub(crate) fn from_env() -> Self {
         let peers = priority_peers_from_env();
+        let exclusive = std::env::var("HYPERSYNC_PRIORITY_EXCLUSIVE").map_or(true, |v| {
+            !matches!(
+                v.trim()
+                    .trim_matches(|c| c == '"' || c == '\'')
+                    .to_ascii_lowercase()
+                    .as_str(),
+                "0" | "false" | "no" | "off"
+            )
+        });
         let max_sessions = std::env::var("HYPERSYNC_PRIORITY_MAX_SESSIONS")
             .ok()
             .and_then(|v| v.trim().parse().ok())
@@ -88,14 +117,16 @@ impl PriorityTier {
             .and_then(|v| v.trim().parse::<u64>().ok())
             .unwrap_or(DEFAULT_STAGE_MS)
             .clamp(200, 3000);
+        // unset: an exclusive tier also serves abci_state first, the pool only after it
         let bootstrap = match std::env::var("HYPERSYNC_PRIORITY_BOOTSTRAP") {
-            Ok(v) => BootstrapPolicy::parse(&v).unwrap_or_else(|| {
+            Ok(v) if !v.trim().is_empty() => BootstrapPolicy::parse(&v).unwrap_or_else(|| {
                 eprintln!(
                     "[gw] HYPERSYNC_PRIORITY_BOOTSTRAP={v:?} not one of fallback|never|prefer; using fallback"
                 );
                 BootstrapPolicy::Fallback
             }),
-            Err(_) => BootstrapPolicy::Fallback,
+            _ if exclusive => BootstrapPolicy::Prefer,
+            _ => BootstrapPolicy::Fallback,
         };
         Self::new(
             peers,
@@ -103,6 +134,7 @@ impl PriorityTier {
             Duration::from_millis(stage_ms),
             bootstrap,
         )
+        .with_exclusive(exclusive)
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -119,7 +151,7 @@ impl PriorityTier {
 
     pub(crate) fn describe(&self) -> String {
         format!(
-            "priority peers={} max_sessions={} stage={}ms bootstrap={}",
+            "priority peers={} max_sessions={} stage={}ms bootstrap={} exclusive={}",
             self.peers.len(),
             if self.max_sessions == 0 {
                 "none".to_string()
@@ -127,7 +159,8 @@ impl PriorityTier {
                 self.max_sessions.to_string()
             },
             self.stage.as_millis(),
-            self.bootstrap.as_str()
+            self.bootstrap.as_str(),
+            self.exclusive()
         )
     }
 
@@ -323,6 +356,41 @@ mod tests {
             Duration::from_millis(1500),
             BootstrapPolicy::Fallback,
         ))
+    }
+
+    // An exclusive tier lets the pool serve a node only while no priority peer is usable: each
+    // one cooling down, at its session cap or blacklisted. A staged or empty tier always may.
+    #[test]
+    fn the_pool_serves_an_exclusive_tier_only_when_no_priority_peer_is_usable() {
+        let t = Arc::new(
+            PriorityTier::new(
+                vec!["203.0.113.71".into(), "203.0.113.72".into()],
+                1,
+                Duration::from_millis(1500),
+                BootstrapPolicy::Prefer,
+            )
+            .with_exclusive(true),
+        );
+        assert!(t.exclusive());
+        assert!(!t.pool_allowed());
+        t.mark_failed("203.0.113.71");
+        assert!(!t.pool_allowed(), "one priority peer still serves");
+        let held = t.try_acquire("203.0.113.72").unwrap();
+        assert!(t.pool_allowed(), "one cooling down, the other full");
+        drop(held);
+        assert!(!t.pool_allowed());
+        assert!(tier(&["203.0.113.71"], 0).pool_allowed(), "staged tier");
+        let empty = PriorityTier::new(
+            Vec::new(),
+            0,
+            Duration::from_millis(1500),
+            BootstrapPolicy::Fallback,
+        )
+        .with_exclusive(true);
+        assert!(
+            !empty.exclusive() && empty.pool_allowed(),
+            "no priority peers"
+        );
     }
 
     #[test]
