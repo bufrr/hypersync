@@ -82,7 +82,8 @@ pub(crate) fn reload(tag: &str, dir: &Path) -> usize {
         let mut last = INVALID.lock().unwrap_or_else(PoisonError::into_inner);
         if *last != invalid {
             for tok in invalid.iter().filter(|t| !last.contains(t)) {
-                eprintln!("[{tag}] blacklist: invalid entry {tok:?} skipped");
+                // an invalid entry can still contain a priority IP (e.g. "ip:4001")
+                crate::priority::gwlog!("[{tag}] blacklist: invalid entry {tok:?} skipped");
             }
             *last = invalid;
         }

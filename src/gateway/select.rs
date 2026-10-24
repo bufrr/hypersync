@@ -28,6 +28,15 @@ const BOOTSTRAP_SELECT_MAX_INFLIGHT: usize = 4;
 
 pub(super) const BOOTSTRAP_SELECT_MAX_PEERS: usize = 32;
 
+// An exclusive tier's priority peers race alone this long; after it the pool may take free slots
+// even while a priority attempt is still pending. A stuck priority attempt can last ~26s (connect,
+// greeting and prefetch timeouts), longer than the whole selection window, so without a bound one
+// hung QuickNode peer would keep the pool out of every bootstrap retry.
+#[cfg(not(test))]
+const BOOTSTRAP_PRIORITY_HEAD_START: Duration = Duration::from_secs(8);
+#[cfg(test)]
+const BOOTSTRAP_PRIORITY_HEAD_START: Duration = Duration::from_millis(300);
+
 pub(super) struct BootstrapPeerSelection {
     pub(super) upc: TcpStream,
     pub(super) hdr: [u8; 5],
@@ -120,7 +129,7 @@ async fn try_fast_bootstrap_peer(
     let mut upc = stage(
         timeout(
             Duration::from_secs(5),
-            crate::blacklist::connect(&format!("{ip}:4001")),
+            crate::blacklist::connect(&addr_4001(&ip)),
         )
         .await,
         "connect",
@@ -187,13 +196,21 @@ pub(super) async fn select_fast_bootstrap_peer(
     let mut prio_in_flight = 0usize;
     let mut set = tokio::task::JoinSet::new();
     let mut fails: Vec<String> = Vec::new();
+    let pool_after = started + BOOTSTRAP_PRIORITY_HEAD_START;
 
     loop {
+        let mut pool_held = false;
         while launched < limit && in_flight < BOOTSTRAP_SELECT_MAX_INFLIGHT {
             let ip = peers[(start + launched) % n].clone();
             let is_priority = priority.contains(&ip);
-            // an exclusive tier's pool candidates wait until every priority attempt has failed
-            if !is_priority && prio_in_flight > 0 && priority.exclusive() {
+            // an exclusive tier's pool candidates wait until every priority attempt has failed,
+            // or the priority head start is over
+            if !is_priority
+                && prio_in_flight > 0
+                && priority.exclusive()
+                && Instant::now() < pool_after
+            {
+                pool_held = true;
                 break;
             }
             // a priority peer is only dialed with a free slot (HYPERSYNC_PRIORITY_MAX_SESSIONS)
@@ -227,7 +244,13 @@ pub(super) async fn select_fast_bootstrap_peer(
         if remaining.is_zero() {
             break;
         }
-        match timeout(remaining, set.join_next()).await {
+        // a held-back pool wakes the race when the head start ends
+        let wait = if pool_held {
+            remaining.min(pool_after.saturating_duration_since(Instant::now()))
+        } else {
+            remaining
+        };
+        match timeout(wait, set.join_next()).await {
             Ok(Some(joined)) => {
                 in_flight = in_flight.saturating_sub(1);
                 match joined {
@@ -247,6 +270,8 @@ pub(super) async fn select_fast_bootstrap_peer(
                 }
             }
             Ok(None) => break,
+            // the head start ended: launch the pool next to the pending priority attempts
+            Err(_) if pool_held && Instant::now() < deadline => {}
             Err(_) => break,
         }
     }
@@ -364,18 +389,21 @@ async fn open_live_peer_session_with_greet(
 
 // Connect to a peer's 4001, send `greet`, and read+vet its greeting (peer-full rejected).
 // The single shared prefix for every live-relationship opener.
+// "ip" normally; "ip:port" (custom ports, tests on ephemeral ports) is used as given
+fn addr_4001(ip: &str) -> String {
+    if ip.contains(':') {
+        ip.to_string()
+    } else {
+        format!("{ip}:4001")
+    }
+}
+
 pub(super) async fn connect_and_greet_4001(
     ip: &str,
     greet: [u8; 8],
     wait: Duration,
 ) -> std::io::Result<(TcpStream, Vec<u8>)> {
-    // "ip" normally; "ip:port" (custom ports, tests on ephemeral ports) is used as given
-    let addr = if ip.contains(':') {
-        ip.to_string()
-    } else {
-        format!("{ip}:4001")
-    };
-    let mut s = timeout(wait, crate::blacklist::connect(&addr)).await??;
+    let mut s = timeout(wait, crate::blacklist::connect(&addr_4001(ip))).await??;
     s.set_nodelay(true).ok();
     timeout(wait, s.write_all(&greet)).await??;
     let greeting = read_live_greeting_with_timeout(&mut s, wait).await?;
@@ -1001,6 +1029,60 @@ mod tests {
         assert_eq!(s.ip, o1);
         drop((s, held));
         for h in [h1, h2, h3] {
+            h.abort();
+        }
+    }
+
+    // A peer that answers a bootstrap greeting with a 5MB abci_state frame header and payload.
+    async fn fake_state_peer() -> (String, tokio::task::JoinHandle<()>) {
+        let l = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        let h = tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = l.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut greet = [0u8; 8];
+                    if s.read_exact(&mut greet).await.is_err() {
+                        return;
+                    }
+                    let len: u32 = 5_000_000;
+                    let mut hdr = len.to_be_bytes().to_vec();
+                    hdr.push(1);
+                    let _ = s.write_all(&hdr).await;
+                    let _ = s.write_all(&vec![0u8; len as usize]).await;
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                });
+            }
+        });
+        (addr, h)
+    }
+
+    // QuickNode first, but bounded: a priority peer that accepts and never answers holds the pool
+    // back only for the head start, not for the whole bootstrap window.
+    #[tokio::test]
+    async fn a_hung_priority_peer_holds_the_bootstrap_pool_back_only_briefly() {
+        let (silent, h1) = fake_live_peer(FakePeer::Silent).await;
+        let (state, h2) = fake_state_peer().await;
+        let tier = exclusive_tier(&[&silent], 0);
+        let t0 = Instant::now();
+        let sel = select_fast_bootstrap_peer(
+            &tier,
+            &[silent.clone(), state.clone()],
+            0,
+            crate::protocol::GREET_TRUE,
+        )
+        .await
+        .expect("the pool serves the state");
+        assert_eq!(sel.ip, state);
+        assert!(
+            t0.elapsed() >= BOOTSTRAP_PRIORITY_HEAD_START,
+            "{:?}",
+            t0.elapsed()
+        );
+        assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
+        for h in [h1, h2] {
             h.abort();
         }
     }

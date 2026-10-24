@@ -362,12 +362,19 @@ impl FreshestRound {
     }
 
     // The highest round streams from at least two different peers have reached; None with fewer.
+    // Judged against the tip as it is now: entries taken under an earlier, higher tip, or any while
+    // the tip is unknown, don't count.
     pub(crate) fn get(&self) -> Option<u32> {
+        let tip = self.net_tip.load(Ordering::Acquire);
+        if tip == 0 {
+            return None;
+        }
+        let ceiling = tip.saturating_add(FRESHEST_TIP_SLACK);
         let now = Instant::now();
         let mut per_peer: HashMap<&str, u32> = HashMap::new();
         let streams = lock(&self.streams);
         for (peer, round, at) in streams.values() {
-            if now.saturating_duration_since(*at) <= self.stale {
+            if now.saturating_duration_since(*at) <= self.stale && *round <= ceiling {
                 let best = per_peer.entry(peer.as_str()).or_insert(0);
                 *best = (*best).max(*round);
             }
@@ -1293,6 +1300,13 @@ mod tests {
         assert_eq!(f.get(), None, "past the tip's slack: nothing taken");
         a.offer(TIP + 100);
         b.offer(TIP + 100);
+        assert_eq!(f.get(), Some(TIP + 100));
+        // the tip becoming unknown, or moving down, retires what was taken under it
+        tip.store(0, Ordering::Release);
+        assert_eq!(f.get(), None, "tip unknown again");
+        tip.store(TIP - FRESHEST_TIP_SLACK, Ordering::Release);
+        assert_eq!(f.get(), None, "taken above the lower tip's slack");
+        tip.store(TIP, Ordering::Release);
         assert_eq!(f.get(), Some(TIP + 100));
     }
 

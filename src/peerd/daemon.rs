@@ -261,6 +261,34 @@ fn peer_pool_to_write<'a>(
     }
 }
 
+// When the previous pool is kept (this cycle found fewer live peers than it holds), it is still
+// updated rather than frozen: the fresh live peers go first, then the previous peers this cycle's
+// probes didn't see fail, then — only to keep the pool from thinning below
+// MIN_LIVE_SERVERS_TO_OVERWRITE — the ones that did. Without this a kept pool could hide every
+// newly verified peer and hold dead ones for as long as fewer than 8 peers probed live.
+fn merge_kept_pool(
+    ranked: &[String],
+    previous: &[String],
+    failed: &HashSet<String>,
+) -> Vec<String> {
+    let mut out: Vec<String> = ranked.to_vec();
+    let fresh = |ip: &String, out: &Vec<String>| !out.contains(ip);
+    for ip in previous.iter().filter(|ip| !failed.contains(*ip)) {
+        if fresh(ip, &out) {
+            out.push(ip.clone());
+        }
+    }
+    for ip in previous.iter().filter(|ip| failed.contains(*ip)) {
+        if out.len() >= MIN_LIVE_SERVERS_TO_OVERWRITE {
+            break;
+        }
+        if fresh(ip, &out) {
+            out.push(ip.clone());
+        }
+    }
+    out
+}
+
 pub(crate) async fn run_peerd(interval: u64) {
     use std::collections::{HashMap, HashSet};
     let data_dir = std::env::var("HYPERSYNC_DATA").unwrap_or_else(|_| "./data".to_string());
@@ -452,6 +480,7 @@ pub(crate) async fn run_peerd(interval: u64) {
         for ip in &live {
             fail_counts.remove(&ip.0);
         }
+        let failed_now: HashSet<String> = failed.iter().cloned().collect();
         let mut pruned = 0usize;
         for ip in failed {
             let c = fail_counts.entry(ip.clone()).or_insert(0);
@@ -473,8 +502,13 @@ pub(crate) async fn run_peerd(interval: u64) {
         let previous_trusted = previous_peer_pool_is_trusted(&previous_contents);
         let kept_previous =
             should_keep_previous_peer_pool(ranked.len(), previous_live, previous_trusted);
-        let published =
-            peer_pool_to_write(&ranked, &previous_live_ips, kept_previous, previous_tainted);
+        let merged;
+        let published = if kept_previous && !ranked.is_empty() {
+            merged = merge_kept_pool(&ranked, &previous_live_ips, &failed_now);
+            Some(merged.as_slice())
+        } else {
+            peer_pool_to_write(&ranked, &previous_live_ips, kept_previous, previous_tainted)
+        };
         // 3. write peers.json (hand-rolled: content is plain IPv4 strings, no escaping needed)
         let round_tip_json = round_tip
             .map(|round| round.to_string())
@@ -780,6 +814,30 @@ mod tests {
             previous_live_pool(prev, &HashSet::new()),
             (vec!["6.6.6.6".to_string(), "5.5.5.5".to_string()], false)
         );
+    }
+
+    // A kept previous pool still publishes the fresh live peers (first) and drops previous peers
+    // that just failed, unless they're needed to keep the pool from thinning below 8.
+    #[test]
+    fn a_kept_pool_takes_fresh_peers_and_sheds_failed_ones() {
+        let ip = |i: u32| format!("7.7.7.{i}");
+        let previous: Vec<String> = (1..=10).map(ip).collect();
+        let fresh = vec!["9.9.9.9".to_string()];
+        // two previous peers failed this cycle; 1 fresh + 8 surviving previous = 9 >= 8
+        let failed: HashSet<String> = [ip(1), ip(2)].into();
+        let out = merge_kept_pool(&fresh, &previous, &failed);
+        assert_eq!(out[0], "9.9.9.9");
+        assert_eq!(out.len(), 9);
+        assert!(!out.contains(&ip(1)) && !out.contains(&ip(2)));
+        // most previous peers failed: the failed ones only top the pool up to 8, after the rest
+        let failed: HashSet<String> = (1..=9).map(ip).collect();
+        let out = merge_kept_pool(&fresh, &previous, &failed);
+        assert_eq!(out.len(), 8);
+        assert_eq!(&out[..2], &["9.9.9.9".to_string(), ip(10)]);
+        // nothing duplicated when a fresh peer was also in the previous pool
+        let out = merge_kept_pool(&[ip(3)], &previous, &HashSet::new());
+        assert_eq!(out.len(), 10);
+        assert_eq!(out[0], ip(3));
     }
 
     #[test]

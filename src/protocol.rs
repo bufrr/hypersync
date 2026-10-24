@@ -107,11 +107,18 @@ pub(crate) fn block_round_full(payload: &[u8]) -> Option<u32> {
 
 // Full decode of a live-block payload, refusing a declared size no block can have.
 pub(crate) fn decompress_block(payload: &[u8]) -> Option<Vec<u8>> {
-    let declared = u32::from_le_bytes(payload.get(..4)?.try_into().ok()?) as usize;
-    if declared > MAX_DECOMPRESSED_BLOCK {
+    if !declared_size_ok(payload) {
         return None;
     }
     lz4_flex::block::decompress_size_prepended(payload).ok()
+}
+
+// The u32-LE decompressed-size prefix is within what a block can have. Checked before the bounded
+// header decode too: a frame declaring more is not a block, even if its first bytes decode to one.
+fn declared_size_ok(payload: &[u8]) -> bool {
+    payload.get(..4).is_some_and(|p| {
+        u32::from_le_bytes([p[0], p[1], p[2], p[3]]) as usize <= MAX_DECOMPRESSED_BLOCK
+    })
 }
 
 // Bounded LZ4 block decode: produce only the first `out.len()` bytes (the round lives in the
@@ -191,7 +198,7 @@ fn lz4_first_n(input: &[u8], out: &mut [u8]) -> Option<usize> {
 
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(crate) fn block_round(payload: &[u8]) -> Option<u32> {
-    if payload.len() < 5 {
+    if payload.len() < 5 || !declared_size_ok(payload) {
         return block_round_full(payload);
     }
     // skip the u32-LE uncompressed-size prefix; decode only the header we scan (blocks run to
@@ -205,7 +212,7 @@ pub(crate) fn block_round(payload: &[u8]) -> Option<u32> {
 
 // Like `block_round`, plus the block's parent round.
 pub(crate) fn block_round_parent(payload: &[u8]) -> Option<(u32, u32)> {
-    if payload.len() >= 5 {
+    if payload.len() >= 5 && declared_size_ok(payload) {
         let mut buf = [0u8; ROUND_SCAN_BYTES];
         if let Some(n) = lz4_first_n(&payload[4..], &mut buf) {
             return find_block_round_parent(&buf[..n]);
@@ -538,6 +545,12 @@ mod tests {
         assert_eq!(block_round_full(&[0xff, 0xff, 0xff, 0xff, 0x1f]), None);
         assert_eq!(block_round_parent(&[0xff, 0xff, 0xff, 0xff, 0x1f]), None);
         assert_eq!(block_round_full(&[0x01]), None);
+        // a valid block body whose prefix declares more than any block has is not a block either,
+        // though its first bytes decode to a round (the bounded header decode must not take it)
+        let mut oversized = test_block_payload(1_480_000_000, 7);
+        oversized[..4].copy_from_slice(&(MAX_DECOMPRESSED_BLOCK as u32 + 1).to_le_bytes());
+        assert_eq!(block_round(&oversized), None);
+        assert_eq!(block_round_parent(&oversized), None);
         // a real block is far below the limit
         assert_eq!(
             block_round_full(&test_block_payload(1_480_000_000, 7)),

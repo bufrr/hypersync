@@ -25,6 +25,13 @@ use super::*;
 const PACE_IDLE: Duration = Duration::from_secs(10);
 const PACE_RETRY: Duration = Duration::from_secs(2);
 const PACE_COOLDOWN: Duration = Duration::from_secs(60);
+// A reference whose stream never yields a decodable block round (only control or undecodable
+// frames, often enough to beat PACE_IDLE) paces nothing and holds a reference slot: replace it.
+// BlockProgress::stalled only arms after a first round, so this needs its own deadline.
+#[cfg(not(test))]
+const PACE_FIRST_BLOCK: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const PACE_FIRST_BLOCK: Duration = Duration::from_millis(400);
 pub(super) const PACE_REFERENCES: usize = 2;
 
 // One reference stream, forever. The references share `in_use` (a reference never follows a peer
@@ -93,9 +100,13 @@ async fn follow_pace(ip: &str, freshest: &Arc<FreshestRound>, net_tip: &AtomicU3
         Err(e) => return format!("connect: {e}").into(),
     };
     let feed = freshest.feed(ip);
-    let mut progress = BlockProgress::new(0, Instant::now());
+    let started = Instant::now();
+    let mut progress = BlockProgress::new(0, started);
     loop {
         let now = Instant::now();
+        if progress.last_round == 0 && now.duration_since(started) > PACE_FIRST_BLOCK {
+            return format!("no block round within {}s", PACE_FIRST_BLOCK.as_secs()).into();
+        }
         if progress.stalled(now) {
             return format!("no block above round {}", progress.last_round).into();
         }
@@ -155,6 +166,43 @@ mod tests {
             }
         });
         addr
+    }
+
+    // A reference peer that keeps the connection alive with control frames but never sends a block
+    // round is dropped (and cooled) once PACE_FIRST_BLOCK passes.
+    #[tokio::test]
+    async fn a_reference_that_never_sends_a_block_is_dropped() {
+        let l = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        let peer = tokio::spawn(async move {
+            let (mut s, _) = l.accept().await.unwrap();
+            let mut greet = [0u8; 8];
+            s.read_exact(&mut greet).await.unwrap();
+            s.write_all(&[0, 0, 0, 1, 0, 3]).await.unwrap();
+            // a type-0 control frame every 50ms, well inside PACE_IDLE
+            while s.write_all(&[0, 0, 0, 2, 0, 1, 2]).await.is_ok() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        });
+        let freshest = Arc::new(FreshestRound::new(
+            150,
+            Duration::from_secs(15),
+            Duration::from_secs(30),
+            Arc::new(AtomicU32::new(1_496_000_000)),
+        ));
+        let ended = tokio::time::timeout(
+            Duration::from_secs(5),
+            follow_pace(&addr, &freshest, &AtomicU32::new(0)),
+        )
+        .await
+        .expect("the reference ends");
+        assert!(
+            ended.reason.starts_with("no block round"),
+            "{}",
+            ended.reason
+        );
+        assert!(ended.cool);
+        peer.abort();
     }
 
     #[tokio::test]

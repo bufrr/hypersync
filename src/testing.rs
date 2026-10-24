@@ -9,6 +9,7 @@ use crate::gateway::{
     response_has_client_block_round_too_large, response_has_client_block_round_too_small,
     response_has_no_client_blocks, response_is_peer_only,
 };
+use crate::priority::gwlog;
 use crate::protocol::{
     block_round, block_round_full, RoundDedup, GREET_FALSE, GREET_TRUE,
     MIN_COMPLETE_BOOTSTRAP_BYTES, MIN_COMPLETE_BOOTSTRAP_FRAMES,
@@ -52,11 +53,11 @@ pub(crate) async fn run_cache(port: u16, upstream: String) {
                     break; // cache the rate-limited state exactly once, then stop hammering
                 }
                 if let Err(e) = feed_state(&upstream, &state, &live, &btx, cap).await {
-                    eprintln!("[cache] state feeder: {e} (retry)");
+                    gwlog!("[cache] state feeder: {e} (retry)");
                 }
                 tokio::time::sleep(Duration::from_secs(3)).await;
             }
-            eprintln!("[cache] abci_state cached; state feeder stopped");
+            gwlog!("[cache] abci_state cached; state feeder stopped");
         });
     }
     {
@@ -66,7 +67,7 @@ pub(crate) async fn run_cache(port: u16, upstream: String) {
         tokio::spawn(async move {
             loop {
                 if let Err(e) = feed_live(&upstream, &live, &btx, cap).await {
-                    eprintln!("[cache] live feeder: {e} (reconnect)");
+                    gwlog!("[cache] live feeder: {e} (reconnect)");
                 }
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
@@ -76,9 +77,10 @@ pub(crate) async fn run_cache(port: u16, upstream: String) {
     let l = TcpListener::bind(("0.0.0.0", port))
         .await
         .expect("cache bind");
-    eprintln!(
+    gwlog!(
         "[cache] :{} <- upstream {} (state cached once + continuous round-merged live)",
-        port, upstream
+        port,
+        upstream
     );
     loop {
         let (mut down, addr) = match l.accept().await {
@@ -103,7 +105,7 @@ pub(crate) async fn run_cache(port: u16, upstream: String) {
                 }
             };
             let Ok(st) = timeout(Duration::from_secs(60), wait_state).await else {
-                eprintln!("[cache] node {addr}: no state captured within 60s; closing");
+                gwlog!("[cache] node {addr}: no state captured within 60s; closing");
                 return;
             };
             let t0 = std::time::Instant::now();
@@ -116,7 +118,7 @@ pub(crate) async fn run_cache(port: u16, upstream: String) {
                     return;
                 }
             }
-            eprintln!(
+            gwlog!(
                 "[cache] node {addr}: state ({:.0}MB) + {} round-ordered live frames in {:.1}s; streaming live",
                 st.len() as f64 / 1e6, ordered.len(), t0.elapsed().as_secs_f64()
             );
@@ -167,7 +169,7 @@ async fn feed_state(
         let frame = Arc::new(frame);
         if len > 4_000_000 {
             *state.lock().unwrap() = Some(frame);
-            eprintln!("[cache] cached abci_state: {len} bytes");
+            gwlog!("[cache] cached abci_state: {len} bytes");
         } else if typ == 1 {
             if let Some(r) = block_round(&payload) {
                 if insert_live(live, r, frame.clone(), cap) {
@@ -234,7 +236,7 @@ pub(crate) fn run_bench(dir: &str, iters: usize) {
     let mut mism = 0;
     for (i, p) in payloads.iter().enumerate() {
         if block_round(p) != block_round_full(p) {
-            eprintln!(
+            gwlog!(
                 "[bench] VERIFY FAIL block{i}: fast={:?} full={:?}",
                 block_round(p),
                 block_round_full(p)
@@ -242,7 +244,7 @@ pub(crate) fn run_bench(dir: &str, iters: usize) {
             mism += 1;
         }
     }
-    eprintln!(
+    gwlog!(
         "[bench] verify: {} blocks, {} mismatch vs full-decompress oracle",
         payloads.len(),
         mism
@@ -263,7 +265,7 @@ pub(crate) fn run_bench(dir: &str, iters: usize) {
         }
     }
     let dt = t0.elapsed().as_secs_f64();
-    eprintln!(
+    gwlog!(
         "[bench] {} frames in {:.3}s = {:.1} kframes/s, {:.0} MB/s (compressed in), forwarded={}",
         iters,
         dt,
@@ -286,7 +288,7 @@ pub(crate) async fn run_mock(bind: String, dir: String, start: usize, end: usize
     }
     let frames = Arc::new(frames);
     let l = TcpListener::bind(&bind).await.expect("mock bind");
-    eprintln!(
+    gwlog!(
         "[mock] {} ready, blocks {}..{} ({} frames)",
         bind,
         start,
@@ -407,7 +409,7 @@ async fn fakenode_bootstrap(
             break;
         }
         if frames % 500 == 0 {
-            eprintln!(
+            gwlog!(
                 "[fakenode:{label}] bootstrap {} MB / {} frames",
                 bytes / 1_000_000,
                 frames
@@ -477,14 +479,14 @@ async fn fakenode_rpc_with_live_held(
 // which means the gateway routed us through a peer that doesn't know this node.
 async fn fakenode_rpc(gw_ip: &str, port: u16, max_round: u32, label: &str) -> bool {
     if max_round == 0 {
-        eprintln!("[fakenode:{label}] rpc needs a round from the live phase");
+        gwlog!("[fakenode:{label}] rpc needs a round from the live phase");
         return false;
     }
     let start_round = max_round.saturating_sub(1000);
     let req = build_client_block_range_request(start_round, start_round + 99);
     let Ok(Ok(mut c)) = timeout(Duration::from_secs(10), TcpStream::connect((gw_ip, port))).await
     else {
-        eprintln!("[fakenode:{label}] rpc dial {gw_ip}:{port} failed");
+        gwlog!("[fakenode:{label}] rpc dial {gw_ip}:{port} failed");
         return false;
     };
     c.set_nodelay(true).ok();
@@ -493,7 +495,7 @@ async fn fakenode_rpc(gw_ip: &str, port: u16, max_round: u32, label: &str) -> bo
     }
     let deadline = Instant::now() + Duration::from_secs(60);
     let Some((len, typ)) = fk_read_hdr(&mut c, deadline).await else {
-        eprintln!("[fakenode:{label}] rpc no response");
+        gwlog!("[fakenode:{label}] rpc no response");
         return false;
     };
     if typ == 0 && len <= 65536 {
@@ -505,7 +507,7 @@ async fn fakenode_rpc(gw_ip: &str, port: u16, max_round: u32, label: &str) -> bo
             return false;
         }
         if response_is_peer_only(&payload) {
-            eprintln!("[fakenode:{label}] rpc got leaked Peer-only rejection");
+            gwlog!("[fakenode:{label}] rpc got leaked Peer-only rejection");
             return false;
         }
         // the gateway hands these terminal range errors to the node as a last resort; for a
@@ -514,13 +516,13 @@ async fn fakenode_rpc(gw_ip: &str, port: u16, max_round: u32, label: &str) -> bo
             || response_has_client_block_round_too_large(&payload)
             || response_has_client_block_round_too_small(&payload)
         {
-            eprintln!(
+            gwlog!(
                 "[fakenode:{label}] rpc got a terminal range error: {}",
                 String::from_utf8_lossy(&payload[..len.min(120)])
             );
             return false;
         }
-        eprintln!(
+        gwlog!(
             "[fakenode:{label}] rpc response type=0 len={len}: {}",
             String::from_utf8_lossy(&payload[..len.min(120)])
         );
@@ -529,7 +531,7 @@ async fn fakenode_rpc(gw_ip: &str, port: u16, max_round: u32, label: &str) -> bo
     let mut buf = vec![0u8; 1_048_576];
     let ok = fk_drain(&mut c, len, deadline, &mut buf).await;
     if ok {
-        eprintln!("[fakenode:{label}] rpc response type={typ} len={len}");
+        gwlog!("[fakenode:{label}] rpc response type={typ} len={len}");
     }
     ok
 }
@@ -539,7 +541,7 @@ async fn fakenode_rpc(gw_ip: &str, port: u16, max_round: u32, label: &str) -> bo
 // Exit code bitmask: 0 all-pass, +1 bootstrap fail, +2 live fail, +4 rpc fail, 64 usage/dial.
 pub(crate) async fn run_fakenode(args: &[String]) -> i32 {
     let usage = || {
-        eprintln!(
+        gwlog!(
             "usage: hypersync fakenode <gw-ip[:base-port]> [--live-secs N] [--rpc] [--label NAME]"
         );
         64
@@ -591,7 +593,8 @@ pub(crate) async fn run_fakenode(args: &[String]) -> i32 {
         exit |= 4;
     }
     let s = |b: bool| if b { "PASS" } else { "FAIL" };
-    println!(
+    // stdout (the machine-readable summary), redacted like every log line
+    let summary = format!(
         "FAKENODE label={label} src={src} boot={} boot_bytes={boot_bytes} \
          boot_frames={boot_frames} boot_secs={boot_secs:.1} live={} \
          live_frames={live_frames} live_rounds={live_rounds} max_round={max_round} rpc={} \
@@ -601,6 +604,7 @@ pub(crate) async fn run_fakenode(args: &[String]) -> i32 {
         rpc.map_or("SKIP", s),
         s(exit == 0)
     );
+    println!("{}", crate::priority::redact(&summary));
     exit
 }
 
