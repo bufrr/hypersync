@@ -543,6 +543,7 @@ pub(crate) async fn run_gateway(node_peer_file: String, push: bool, cache_coldst
                             ctx.priority.clone(),
                             peers,
                             ctx.rr.clone(),
+                            ctx.freshest.clone(),
                         )
                         .await;
                     } else {

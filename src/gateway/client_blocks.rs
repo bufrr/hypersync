@@ -171,13 +171,14 @@ fn active_answers_first(priority: &PriorityTier, ip: &str) -> bool {
 }
 
 // A client-block range query (docs/hl-p2p-protocol.md §8a): a type-0 frame whose 11-byte payload
-// is the 0x00 tag and two 0xfc-prefixed u32 rounds.
-fn is_client_block_range_request(req: &[u8]) -> bool {
-    req.len() == 16
+// is the 0x00 tag and two 0xfc-prefixed u32 rounds. Returns its start round.
+fn client_block_range_start(req: &[u8]) -> Option<u32> {
+    let range = req.len() == 16
         && req[..5] == [0, 0, 0, 11, 0]
         && req[5] == 0
         && req[6] == 0xfc
-        && req[11] == 0xfc
+        && req[11] == 0xfc;
+    range.then(|| u32::from_le_bytes([req[7], req[8], req[9], req[10]]))
 }
 
 async fn wait_active_session(node: &NodeState, budget: Duration) -> Option<ActivePeer> {
@@ -515,6 +516,7 @@ pub(super) async fn serve_client_blocks(
     priority: Arc<PriorityTier>,
     peers: Vec<String>,
     rr: Arc<AtomicUsize>,
+    freshest: Arc<crate::push::FreshestRound>,
 ) {
     let mut down = down;
     let mut hdr = [0u8; 5];
@@ -537,7 +539,7 @@ pub(super) async fn serve_client_blocks(
     }
     let mut req = hdr.to_vec();
     req.extend_from_slice(&payload);
-    let range_query = is_client_block_range_request(&req);
+    let range_start = client_block_range_start(&req);
 
     // Gateway-wide bound on concurrent fetches: each one can hold up to ~9 upstream attempts with
     // multi-MB responses. A catch-up node sends one request at a time, so 8 is far above normal.
@@ -561,8 +563,9 @@ pub(super) async fn serve_client_blocks(
         Ok(frame) => {
             // only a batch answering a range query is catch-up: not a tip/terminal error frame
             // (type 0), nor a height query or query_peers
-            if range_query && frame.get(4) == Some(&1) {
-                node.mark_client_blocks_response(Instant::now());
+            if let Some(start) = range_start.filter(|_| frame.get(4) == Some(&1)) {
+                let behind = freshest.get().map(|tip| tip.saturating_sub(start));
+                node.mark_client_blocks_response(Instant::now(), behind);
             }
             let _ = timeout(NODE_WRITE_TIMEOUT, down.write_all(&frame)).await;
         }
@@ -670,12 +673,15 @@ mod tests {
         let range = [
             0, 0, 0, 11, 0, 0, 0xfc, 0x8e, 0x26, 0x81, 0x50, 0xfc, 0xf1, 0x26, 0x81, 0x50,
         ];
-        assert!(is_client_block_range_request(&range));
+        assert_eq!(
+            client_block_range_start(&range),
+            Some(u32::from_le_bytes([0x8e, 0x26, 0x81, 0x50]))
+        );
         let mut other_tag = range;
         other_tag[5] = 1;
-        assert!(!is_client_block_range_request(&other_tag));
-        assert!(!is_client_block_range_request(&range[..15]));
-        assert!(!is_client_block_range_request(&[0, 0, 0, 1, 0, 2]));
+        assert_eq!(client_block_range_start(&other_tag), None);
+        assert_eq!(client_block_range_start(&range[..15]), None);
+        assert_eq!(client_block_range_start(&[0, 0, 0, 1, 0, 2]), None);
     }
 
     #[test]

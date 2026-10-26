@@ -158,13 +158,45 @@ impl NodeState {
         active.is_some() && !self.lazy_active.load(Ordering::Acquire)
     }
 
-    pub(super) fn mark_client_blocks_response(&self, now: Instant) {
+    // A client-block batch was forwarded; `behind` = rounds between the gateway's freshest live
+    // round and the batch's requested start (None: tip unknown, counted as progress).
+    pub(super) fn mark_client_blocks_response(&self, now: Instant, behind: Option<u32>) {
         let mut run = lock(&self.last_client_blocks);
-        let since = match *run {
-            Some(r) if now.saturating_duration_since(r.last) < CATCHUP_RUN_GAP => r.since,
-            _ => now,
+        let next = match *run {
+            Some(r) if now.saturating_duration_since(r.last) < CATCHUP_RUN_GAP => {
+                let progressed = match (r.best_behind, behind) {
+                    (Some(best), Some(b)) => best.saturating_sub(b) >= CATCHUP_PROGRESS_ROUNDS,
+                    _ => true,
+                };
+                ClientBlockRun {
+                    last: now,
+                    behind,
+                    best_behind: if progressed { behind } else { r.best_behind },
+                    progress_at: if progressed { now } else { r.progress_at },
+                    ..r
+                }
+            }
+            _ => ClientBlockRun {
+                since: now,
+                last: now,
+                behind,
+                best_behind: behind,
+                progress_at: now,
+            },
         };
-        *run = Some(ClientBlockRun { since, last: now });
+        *run = Some(next);
+    }
+
+    // While the node is catching up (a batch within `quiet`): since when its distance behind
+    // hasn't shrunk by CATCHUP_PROGRESS_ROUNDS, and that distance now.
+    pub(super) fn client_blocks_stalled_since(
+        &self,
+        now: Instant,
+        quiet: Duration,
+    ) -> Option<(Instant, Option<u32>)> {
+        lock(&self.last_client_blocks)
+            .filter(|r| now.saturating_duration_since(r.last) < quiet)
+            .map(|r| (r.progress_at, r.behind))
     }
 
     // While the node is catching up (a batch within `quiet`): when its current run of batches
@@ -195,10 +227,18 @@ impl NodeState {
 // A gap this long between client-block batches ends the node's catch-up run.
 pub(super) const CATCHUP_RUN_GAP: Duration = Duration::from_secs(60);
 
+// A catch-up that closes less than this on the tip (~10 s of rounds) isn't making progress.
+const CATCHUP_PROGRESS_ROUNDS: u32 = 150;
+
 #[derive(Clone, Copy)]
 struct ClientBlockRun {
     since: Instant,
     last: Instant,
+    // the latest batch's distance behind, the best (smallest) one that counted as progress, and
+    // when that was
+    behind: Option<u32>,
+    best_behind: Option<u32>,
+    progress_at: Instant,
 }
 
 fn claim_every(last: &Mutex<Option<Instant>>, now: Instant, every: Duration) -> bool {
@@ -478,7 +518,7 @@ mod tests {
             node.client_blocks_run_since(t0, quiet).is_none(),
             "never fetched: quiet"
         );
-        node.mark_client_blocks_response(t0);
+        node.mark_client_blocks_response(t0, None);
         assert_eq!(
             node.client_blocks_run_since(t0 + Duration::from_secs(59), quiet),
             Some(t0)
@@ -487,20 +527,56 @@ mod tests {
     }
 
     #[test]
+    fn catch_up_progress_is_a_shrinking_distance_behind() {
+        let node = NodeState::new("10.0.0.1".parse().unwrap(), 1);
+        let t0 = Instant::now();
+        let s = Duration::from_secs;
+        let stalled = |t| node.client_blocks_stalled_since(t, CATCHUP_RUN_GAP);
+        // converging: every batch closes in on the tip
+        for (i, behind) in [12_000, 10_500, 9_000, 7_500].into_iter().enumerate() {
+            node.mark_client_blocks_response(t0 + s(i as u64 * 20), Some(behind));
+        }
+        assert_eq!(stalled(t0 + s(61)), Some((t0 + s(60), Some(7_500))));
+        // a constant distance (jitter under the threshold) is no progress
+        for (i, behind) in [7_450, 7_480, 7_420, 7_470].into_iter().enumerate() {
+            node.mark_client_blocks_response(t0 + s(80 + i as u64 * 20), Some(behind));
+        }
+        assert_eq!(stalled(t0 + s(141)), Some((t0 + s(60), Some(7_470))));
+        // an unknown tip counts as progress
+        node.mark_client_blocks_response(t0 + s(150), None);
+        assert_eq!(stalled(t0 + s(151)), Some((t0 + s(150), None)));
+        // exactly the threshold counts; one round short doesn't; no overflow at the top
+        node.mark_client_blocks_response(t0 + s(152), Some(5_000));
+        node.mark_client_blocks_response(t0 + s(154), Some(5_000 - CATCHUP_PROGRESS_ROUNDS));
+        assert_eq!(stalled(t0 + s(155)).map(|r| r.0), Some(t0 + s(154)));
+        node.mark_client_blocks_response(t0 + s(156), Some(5_001 - 2 * CATCHUP_PROGRESS_ROUNDS));
+        assert_eq!(stalled(t0 + s(157)).map(|r| r.0), Some(t0 + s(154)));
+        let top = NodeState::new("10.0.0.2".parse().unwrap(), 1);
+        top.mark_client_blocks_response(t0, Some(u32::MAX));
+        top.mark_client_blocks_response(t0 + s(10), Some(u32::MAX));
+        assert_eq!(
+            top.client_blocks_stalled_since(t0 + s(11), CATCHUP_RUN_GAP)
+                .map(|r| r.0),
+            Some(t0),
+            "a constant u32::MAX distance is no progress"
+        );
+    }
+
+    #[test]
     fn a_catch_up_run_ends_at_a_gap_seen_between_polls() {
         let node = NodeState::new("10.0.0.1".parse().unwrap(), 1);
         let t0 = Instant::now();
         let s = Duration::from_secs;
         assert_eq!(node.client_blocks_run_since(t0, CATCHUP_RUN_GAP), None);
-        node.mark_client_blocks_response(t0);
-        node.mark_client_blocks_response(t0 + s(30));
+        node.mark_client_blocks_response(t0, None);
+        node.mark_client_blocks_response(t0 + s(30), None);
         assert_eq!(
             node.client_blocks_run_since(t0 + s(31), CATCHUP_RUN_GAP),
             Some(t0)
         );
         // a 61 s gap between two batches starts a new run, whenever anyone looks
-        node.mark_client_blocks_response(t0 + s(91));
-        node.mark_client_blocks_response(t0 + s(95));
+        node.mark_client_blocks_response(t0 + s(91), None);
+        node.mark_client_blocks_response(t0 + s(95), None);
         assert_eq!(
             node.client_blocks_run_since(t0 + s(96), CATCHUP_RUN_GAP),
             Some(t0 + s(91))

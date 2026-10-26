@@ -833,8 +833,9 @@ pub(super) async fn wait_priority_return(
     }
 }
 
-// Resolves (once per node per `retry`) when the node's catch-up has run `catchup_max` without a
-// quiet gap, so the node reconnects. hl-node drops the live blocks that arrive while it fetches a
+// Resolves (once per node per `retry`) when the node's catch-up has made no progress for
+// `catchup_max` (batches keep coming, but its distance behind the freshest live round hasn't shrunk
+// by CATCHUP_PROGRESS_ROUNDS), so the node reconnects. hl-node drops the live blocks that arrive while it fetches a
 // missing range over 4002, so the next live block is missing its parent again: with ~1.7 s per
 // fetch it re-fetches only what the network produced meanwhile and stays a fixed distance behind
 // (~70 s seen) for as long as the session lasts. A fresh session hands it one large range instead,
@@ -844,12 +845,15 @@ pub(super) async fn wait_catchup_stuck(node: Arc<NodeState>, timing: RepinTiming
     let watch_start = Instant::now();
     loop {
         let now = Instant::now();
-        if let Some(since) = node.client_blocks_run_since(now, timing.catchup_quiet) {
-            let busy = now.saturating_duration_since(since.max(watch_start));
-            if busy >= timing.catchup_max && node.claim_catchup_cut(now, timing.retry) {
+        if let Some((progress_at, behind)) =
+            node.client_blocks_stalled_since(now, timing.catchup_quiet)
+        {
+            let stalled = now.saturating_duration_since(progress_at.max(watch_start));
+            if stalled >= timing.catchup_max && node.claim_catchup_cut(now, timing.retry) {
                 return format!(
-                    "{NODE_CATCHUP_STUCK} (client blocks for {}s without a quiet gap)",
-                    busy.as_secs()
+                    "{NODE_CATCHUP_STUCK} (no progress for {}s, {} rounds behind)",
+                    stalled.as_secs(),
+                    behind.map_or("?".to_string(), |b| b.to_string())
                 );
             }
         }
@@ -1476,7 +1480,7 @@ mod tests {
             let node = node.clone();
             tokio::spawn(async move {
                 loop {
-                    node.mark_client_blocks_response(Instant::now());
+                    node.mark_client_blocks_response(Instant::now(), None);
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
             })
@@ -1541,8 +1545,9 @@ mod tests {
         let feeder = {
             let node = node.clone();
             tokio::spawn(async move {
+                // the stuck loop: batches keep coming at a constant distance behind the tip
                 loop {
-                    node.mark_client_blocks_response(Instant::now());
+                    node.mark_client_blocks_response(Instant::now(), Some(900));
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
             })
@@ -1553,7 +1558,8 @@ mod tests {
             wait_catchup_stuck(node.clone(), fast_repin()),
         )
         .await
-        .expect("ends once the catch-up has run catchup_max");
+        .expect("ends once the catch-up has made no progress for catchup_max");
+        assert!(reason.contains("900 rounds behind"), "{reason}");
         assert!(
             t0.elapsed() >= Duration::from_secs(2),
             "not before catchup_max"
@@ -1571,9 +1577,29 @@ mod tests {
         .await
         .is_err());
         feeder.abort();
+        // a long catch-up that keeps closing in on the tip is never cut
+        let converging = Arc::new(NodeState::new("10.0.0.7".parse().unwrap(), 1));
+        let feeder = {
+            let node = converging.clone();
+            tokio::spawn(async move {
+                let mut behind = 60_000u32;
+                loop {
+                    node.mark_client_blocks_response(Instant::now(), Some(behind));
+                    behind = behind.saturating_sub(200);
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            })
+        };
+        assert!(timeout(
+            Duration::from_secs(3),
+            wait_catchup_stuck(converging, fast_repin())
+        )
+        .await
+        .is_err());
+        feeder.abort();
         // a node that catches up normally (quiet gaps) is never cut
         let calm = Arc::new(NodeState::new("10.0.0.8".parse().unwrap(), 1));
-        calm.mark_client_blocks_response(Instant::now());
+        calm.mark_client_blocks_response(Instant::now(), None);
         assert!(timeout(
             Duration::from_secs(3),
             wait_catchup_stuck(calm, fast_repin())
@@ -1592,7 +1618,7 @@ mod tests {
             let node = node.clone();
             tokio::spawn(async move {
                 loop {
-                    node.mark_client_blocks_response(Instant::now());
+                    node.mark_client_blocks_response(Instant::now(), None);
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
             })
