@@ -3,7 +3,7 @@ use crate::protocol::{
     block_round, is_plausible_mainnet_round, read_live_frame_with_timeout, response_is_peer_full,
     round_lag_from_tip, ACTIVE_ROUND_MAX_LAG, GREET_FALSE, MAX_LIVE_FRAME,
 };
-use crate::push::{MAX_ACTIVE_ROUND_JUMP, RETURNING_TO_PRIORITY};
+use crate::push::{MAX_ACTIVE_ROUND_JUMP, NODE_CATCHUP_STUCK, RETURNING_TO_PRIORITY};
 use crate::util::lock;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -758,7 +758,7 @@ pub(super) struct RepinTiming {
 
 pub(super) const REPIN: RepinTiming = RepinTiming {
     min_session: Duration::from_secs(60),
-    catchup_quiet: Duration::from_secs(60),
+    catchup_quiet: CATCHUP_RUN_GAP,
     catchup_max: Duration::from_secs(3 * 60),
     check_every: Duration::from_secs(15),
     retry: Duration::from_secs(5 * 60),
@@ -775,17 +775,15 @@ pub(super) async fn wait_priority_return(
     timing: RepinTiming,
 ) -> String {
     tokio::time::sleep(timing.min_session).await;
-    // when the node's current catch-up began, as far as this session has seen
-    let mut catching_up_since: Option<Instant> = None;
+    let watch_start = Instant::now();
     loop {
         let now = Instant::now();
-        let caught_up = if node.client_blocks_quiet_for(now, timing.catchup_quiet) {
-            catching_up_since = None;
-            true
-        } else {
-            now.saturating_duration_since(*catching_up_since.get_or_insert(now))
-                >= timing.catchup_max
-        };
+        // the node's current catch-up run, counted from this session's watch at the earliest
+        let caught_up = node
+            .client_blocks_run_since(now, timing.catchup_quiet)
+            .is_none_or(|since| {
+                now.saturating_duration_since(since.max(watch_start)) >= timing.catchup_max
+            });
         let candidates = if caught_up {
             priority.candidates()
         } else {
@@ -829,6 +827,30 @@ pub(super) async fn wait_priority_return(
             // no probe ran (every candidate filled up meanwhile): this node may try again next check
             if !probed {
                 node.forget_repin_attempt();
+            }
+        }
+        tokio::time::sleep(timing.check_every).await;
+    }
+}
+
+// Resolves (once per node per `retry`) when the node's catch-up has run `catchup_max` without a
+// quiet gap, so the node reconnects. hl-node drops the live blocks that arrive while it fetches a
+// missing range over 4002, so the next live block is missing its parent again: with ~1.7 s per
+// fetch it re-fetches only what the network produced meanwhile and stays a fixed distance behind
+// (~70 s seen) for as long as the session lasts. A fresh session hands it one large range instead,
+// fetched 100 rounds at a time, which it clears in about a minute.
+pub(super) async fn wait_catchup_stuck(node: Arc<NodeState>, timing: RepinTiming) -> String {
+    tokio::time::sleep(timing.min_session).await;
+    let watch_start = Instant::now();
+    loop {
+        let now = Instant::now();
+        if let Some(since) = node.client_blocks_run_since(now, timing.catchup_quiet) {
+            let busy = now.saturating_duration_since(since.max(watch_start));
+            if busy >= timing.catchup_max && node.claim_catchup_cut(now, timing.retry) {
+                return format!(
+                    "{NODE_CATCHUP_STUCK} (client blocks for {}s without a quiet gap)",
+                    busy.as_secs()
+                );
             }
         }
         tokio::time::sleep(timing.check_every).await;
@@ -1511,6 +1533,53 @@ mod tests {
         assert_eq!(tier.sessions(&serves), 0, "probe slot released");
         h1.abort();
         h2.abort();
+    }
+
+    #[tokio::test]
+    async fn a_catch_up_that_never_converges_ends_the_session_once() {
+        let node = Arc::new(NodeState::new("10.0.0.9".parse().unwrap(), 1));
+        let feeder = {
+            let node = node.clone();
+            tokio::spawn(async move {
+                loop {
+                    node.mark_client_blocks_response(Instant::now());
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            })
+        };
+        let t0 = Instant::now();
+        let reason = timeout(
+            Duration::from_secs(5),
+            wait_catchup_stuck(node.clone(), fast_repin()),
+        )
+        .await
+        .expect("ends once the catch-up has run catchup_max");
+        assert!(
+            t0.elapsed() >= Duration::from_secs(2),
+            "not before catchup_max"
+        );
+        assert!(reason.starts_with(NODE_CATCHUP_STUCK), "{reason}");
+        assert!(
+            !crate::push::push_exit_is_upstream_fault(&reason),
+            "the upstream did nothing wrong"
+        );
+        // the reconnect's session doesn't end again within `retry`
+        assert!(timeout(
+            Duration::from_secs(3),
+            wait_catchup_stuck(node.clone(), fast_repin())
+        )
+        .await
+        .is_err());
+        feeder.abort();
+        // a node that catches up normally (quiet gaps) is never cut
+        let calm = Arc::new(NodeState::new("10.0.0.8".parse().unwrap(), 1));
+        calm.mark_client_blocks_response(Instant::now());
+        assert!(timeout(
+            Duration::from_secs(3),
+            wait_catchup_stuck(calm, fast_repin())
+        )
+        .await
+        .is_err());
     }
 
     #[tokio::test]

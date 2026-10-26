@@ -170,6 +170,16 @@ fn active_answers_first(priority: &PriorityTier, ip: &str) -> bool {
     priority.contains(ip) || priority.pool_allowed()
 }
 
+// A client-block range query (docs/hl-p2p-protocol.md §8a): a type-0 frame whose 11-byte payload
+// is the 0x00 tag and two 0xfc-prefixed u32 rounds.
+fn is_client_block_range_request(req: &[u8]) -> bool {
+    req.len() == 16
+        && req[..5] == [0, 0, 0, 11, 0]
+        && req[5] == 0
+        && req[6] == 0xfc
+        && req[11] == 0xfc
+}
+
 async fn wait_active_session(node: &NodeState, budget: Duration) -> Option<ActivePeer> {
     let deadline = Instant::now() + budget;
     loop {
@@ -527,6 +537,7 @@ pub(super) async fn serve_client_blocks(
     }
     let mut req = hdr.to_vec();
     req.extend_from_slice(&payload);
+    let range_query = is_client_block_range_request(&req);
 
     // Gateway-wide bound on concurrent fetches: each one can hold up to ~9 upstream attempts with
     // multi-MB responses. A catch-up node sends one request at a time, so 8 is far above normal.
@@ -548,7 +559,11 @@ pub(super) async fn serve_client_blocks(
     });
     match fetched {
         Ok(frame) => {
-            node.mark_client_blocks_response(Instant::now());
+            // only a batch answering a range query is catch-up: not a tip/terminal error frame
+            // (type 0), nor a height query or query_peers
+            if range_query && frame.get(4) == Some(&1) {
+                node.mark_client_blocks_response(Instant::now());
+            }
             let _ = timeout(NODE_WRITE_TIMEOUT, down.write_all(&frame)).await;
         }
         Err(failure) => {
@@ -647,6 +662,20 @@ mod tests {
         assert_eq!(out, ["2.2.2.2", "9.9.9.9", "1.1.1.1"]);
         let out = client_block_peer_candidates(Vec::new(), &[], &rr, 3);
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn only_range_queries_count_as_catch_up() {
+        // the captured frame from docs/hl-p2p-protocol.md §8a
+        let range = [
+            0, 0, 0, 11, 0, 0, 0xfc, 0x8e, 0x26, 0x81, 0x50, 0xfc, 0xf1, 0x26, 0x81, 0x50,
+        ];
+        assert!(is_client_block_range_request(&range));
+        let mut other_tag = range;
+        other_tag[5] = 1;
+        assert!(!is_client_block_range_request(&other_tag));
+        assert!(!is_client_block_range_request(&range[..15]));
+        assert!(!is_client_block_range_request(&[0, 0, 0, 1, 0, 2]));
     }
 
     #[test]

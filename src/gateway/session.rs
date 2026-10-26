@@ -62,6 +62,19 @@ async fn serve_push_repinned(
             REPIN,
         )));
     }
+    // ...and any session ends (so the node reconnects) once its catch-up has stopped converging
+    if standbys == 0 {
+        let stuck = wait_catchup_stuck(node.clone(), REPIN);
+        cfg.end_when = Some(match cfg.end_when.take() {
+            Some(other) => Box::pin(async move {
+                tokio::select! {
+                    reason = other => reason,
+                    reason = stuck => reason,
+                }
+            }),
+            None => Box::pin(stuck),
+        });
+    }
     if standbys > 0 {
         // hot-standby session: the active upstream can change mid-session, so the 4002 pin and the
         // priority session accounting follow every switch. Its standbys already race the active

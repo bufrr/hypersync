@@ -65,9 +65,13 @@ pub(super) struct NodeState {
     // when this node last probed a priority peer to leave a pool session (see
     // select::wait_priority_return); kept across reconnects so re-pins stay rate-limited
     last_repin_attempt: Mutex<Option<Instant>>,
-    // when a client-block (4002) response was last forwarded to this node: a catching-up node
-    // pulls a batch every few seconds, one at the tip almost never
-    last_client_blocks: Mutex<Option<Instant>>,
+    // when a session of this node was last ended for a catch-up that wasn't converging (see
+    // select::wait_catchup_stuck); kept across reconnects so those ends stay rate-limited
+    last_catchup_cut: Mutex<Option<Instant>>,
+    // the last client-block (4002) batch forwarded to this node, and when its current run of
+    // batches began (a run: no CATCHUP_RUN_GAP between batches): a catching-up node pulls a
+    // batch every few seconds, one at the tip almost never
+    last_client_blocks: Mutex<Option<ClientBlockRun>>,
 }
 
 impl NodeState {
@@ -84,6 +88,7 @@ impl NodeState {
             rpc_peer: Mutex::new(None),
             replay_in_flight: AtomicBool::new(false),
             last_repin_attempt: Mutex::new(None),
+            last_catchup_cut: Mutex::new(None),
             last_client_blocks: Mutex::new(None),
         }
     }
@@ -154,12 +159,21 @@ impl NodeState {
     }
 
     pub(super) fn mark_client_blocks_response(&self, now: Instant) {
-        *lock(&self.last_client_blocks) = Some(now);
+        let mut run = lock(&self.last_client_blocks);
+        let since = match *run {
+            Some(r) if now.saturating_duration_since(r.last) < CATCHUP_RUN_GAP => r.since,
+            _ => now,
+        };
+        *run = Some(ClientBlockRun { since, last: now });
     }
 
-    // No client-block response forwarded to this node for `quiet`: it has finished catching up.
-    pub(super) fn client_blocks_quiet_for(&self, now: Instant, quiet: Duration) -> bool {
-        lock(&self.last_client_blocks).is_none_or(|t| now.saturating_duration_since(t) >= quiet)
+    // While the node is catching up (a batch within `quiet`): when its current run of batches
+    // began; None once it has been quiet that long (it has finished catching up). Gaps are judged
+    // at each batch, so none is missed between two polls.
+    pub(super) fn client_blocks_run_since(&self, now: Instant, quiet: Duration) -> Option<Instant> {
+        lock(&self.last_client_blocks)
+            .filter(|r| now.saturating_duration_since(r.last) < quiet)
+            .map(|r| r.since)
     }
 
     // An attempt that never probed (the slot was gone): doesn't count against the node.
@@ -169,13 +183,31 @@ impl NodeState {
 
     // One re-pin attempt per `retry` per node: true (and the attempt is recorded) if allowed now.
     pub(super) fn claim_repin_attempt(&self, now: Instant, retry: Duration) -> bool {
-        let mut last = lock(&self.last_repin_attempt);
-        if last.is_some_and(|t| now.saturating_duration_since(t) < retry) {
-            return false;
-        }
-        *last = Some(now);
-        true
+        claim_every(&self.last_repin_attempt, now, retry)
     }
+
+    // One stuck-catch-up session end per `retry` per node, likewise.
+    pub(super) fn claim_catchup_cut(&self, now: Instant, retry: Duration) -> bool {
+        claim_every(&self.last_catchup_cut, now, retry)
+    }
+}
+
+// A gap this long between client-block batches ends the node's catch-up run.
+pub(super) const CATCHUP_RUN_GAP: Duration = Duration::from_secs(60);
+
+#[derive(Clone, Copy)]
+struct ClientBlockRun {
+    since: Instant,
+    last: Instant,
+}
+
+fn claim_every(last: &Mutex<Option<Instant>>, now: Instant, every: Duration) -> bool {
+    let mut last = lock(last);
+    if last.is_some_and(|t| now.saturating_duration_since(t) < every) {
+        return false;
+    }
+    *last = Some(now);
+    true
 }
 
 // A pin to an IP blacklisted after it was set is dropped on sight, so no new connection of the
@@ -443,12 +475,40 @@ mod tests {
         let t0 = Instant::now();
         let quiet = Duration::from_secs(60);
         assert!(
-            node.client_blocks_quiet_for(t0, quiet),
+            node.client_blocks_run_since(t0, quiet).is_none(),
             "never fetched: quiet"
         );
         node.mark_client_blocks_response(t0);
-        assert!(!node.client_blocks_quiet_for(t0 + Duration::from_secs(59), quiet));
-        assert!(node.client_blocks_quiet_for(t0 + quiet, quiet));
+        assert_eq!(
+            node.client_blocks_run_since(t0 + Duration::from_secs(59), quiet),
+            Some(t0)
+        );
+        assert!(node.client_blocks_run_since(t0 + quiet, quiet).is_none());
+    }
+
+    #[test]
+    fn a_catch_up_run_ends_at_a_gap_seen_between_polls() {
+        let node = NodeState::new("10.0.0.1".parse().unwrap(), 1);
+        let t0 = Instant::now();
+        let s = Duration::from_secs;
+        assert_eq!(node.client_blocks_run_since(t0, CATCHUP_RUN_GAP), None);
+        node.mark_client_blocks_response(t0);
+        node.mark_client_blocks_response(t0 + s(30));
+        assert_eq!(
+            node.client_blocks_run_since(t0 + s(31), CATCHUP_RUN_GAP),
+            Some(t0)
+        );
+        // a 61 s gap between two batches starts a new run, whenever anyone looks
+        node.mark_client_blocks_response(t0 + s(91));
+        node.mark_client_blocks_response(t0 + s(95));
+        assert_eq!(
+            node.client_blocks_run_since(t0 + s(96), CATCHUP_RUN_GAP),
+            Some(t0 + s(91))
+        );
+        assert_eq!(
+            node.client_blocks_run_since(t0 + s(155), CATCHUP_RUN_GAP),
+            None
+        );
     }
 
     #[test]

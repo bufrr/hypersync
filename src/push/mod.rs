@@ -14,8 +14,8 @@ pub(crate) use self::legacy::{run_relay, serve};
 pub(crate) use self::live::{
     copy_node_to_upstream, node_queue_budget, push_exit_is_upstream_fault, queue_frame, serve_push,
     splice, splice_with_idle, AbortOnDrop, BlockProgress, FreshestRound, PushConfig, QueuedFrame,
-    Relayed, ACTIVE_BLOCK_STALL, FRESHEST_STALE, MAX_ACTIVE_ROUND_JUMP, NODE_WRITE_TIMEOUT,
-    PEER_LAG_GRACE, PEER_LAG_ROUNDS, RELAY_UPSTREAM_WRITE_TIMEOUT, RETURNING_TO_PRIORITY,
-    UPSTREAM_WRITE_TIMEOUT,
+    Relayed, ACTIVE_BLOCK_STALL, FRESHEST_STALE, MAX_ACTIVE_ROUND_JUMP, NODE_CATCHUP_STUCK,
+    NODE_WRITE_TIMEOUT, PEER_LAG_GRACE, PEER_LAG_ROUNDS, RELAY_UPSTREAM_WRITE_TIMEOUT,
+    RETURNING_TO_PRIORITY, UPSTREAM_WRITE_TIMEOUT,
 };
 pub(crate) use self::proxy::run_proxy;

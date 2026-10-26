@@ -445,6 +445,9 @@ pub(super) async fn wait_superseded(superseded: Option<(Arc<AtomicU64>, u64)>) {
 // The exit reason of a session ended to move its node back to a priority peer (the pool peer it
 // leaves did nothing wrong).
 pub(crate) const RETURNING_TO_PRIORITY: &str = "returning to a priority peer";
+// ...and of one ended because the node's catch-up stopped converging (the node's doing, not the
+// upstream's; see gateway::select::wait_catchup_stuck)
+pub(crate) const NODE_CATCHUP_STUCK: &str = "node catch-up not converging";
 
 pub(crate) fn push_exit_is_upstream_fault(reason: &str) -> bool {
     !(reason.starts_with("node outbound ended")
@@ -458,7 +461,8 @@ pub(crate) fn push_exit_is_upstream_fault(reason: &str) -> bool {
         || reason.starts_with("node write")
         || reason.starts_with("node greeting write")
         || reason.starts_with("active superseded")
-        || reason.starts_with(RETURNING_TO_PRIORITY))
+        || reason.starts_with(RETURNING_TO_PRIORITY)
+        || reason.starts_with(NODE_CATCHUP_STUCK))
 }
 
 // Per-session accounting of what the active stream forwarded and what the round gates dropped
