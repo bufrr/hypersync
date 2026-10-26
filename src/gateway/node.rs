@@ -55,7 +55,8 @@ pub(super) struct NodeState {
     // must not count as "has an active session" or it would suppress the node's cache replay.
     lazy_active: AtomicBool,
     // The upstream that last answered this node's client-block RPC as a hedge after the active
-    // stopped serving it (Peer-only, so the pin was cleared while the 4001 session stays up).
+    // stopped serving it (Peer-only, so the pin was cleared while the 4001 session stays up), or
+    // the priority peer that answered while a pool active is pinned on an exclusive tier.
     // Tried first, without waiting for a pin, until the next real 4001 session pins a new active;
     // otherwise every later 4002 request pays the pin wait plus the full hedge fan-out.
     pub(super) rpc_peer: Mutex<Option<String>>,

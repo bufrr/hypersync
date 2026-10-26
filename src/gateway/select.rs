@@ -747,15 +747,19 @@ pub(super) struct RepinTiming {
     // this long (a catching-up node pulls a 4002 batch every few seconds and reconnects 4001 on its
     // own, so ending its session then is pointless churn)
     pub(super) catchup_quiet: Duration,
+    // ...unless that catch-up has run this long without a quiet gap: it isn't converging (the
+    // pool's 4002 horizon can sit a fixed distance behind the tip), so moving on is the fix
+    pub(super) catchup_max: Duration,
     pub(super) check_every: Duration,
-    // at most one probe per node this often, whatever its outcome (a failed probe also cools the
-    // priority peer down like a failed selection)
+    // at most one probe attempt (every available priority peer in turn) per node this often,
+    // whatever its outcome (a failed probe also cools that peer down like a failed selection)
     pub(super) retry: Duration,
 }
 
 pub(super) const REPIN: RepinTiming = RepinTiming {
     min_session: Duration::from_secs(60),
     catchup_quiet: Duration::from_secs(60),
+    catchup_max: Duration::from_secs(3 * 60),
     check_every: Duration::from_secs(15),
     retry: Duration::from_secs(5 * 60),
 };
@@ -771,15 +775,27 @@ pub(super) async fn wait_priority_return(
     timing: RepinTiming,
 ) -> String {
     tokio::time::sleep(timing.min_session).await;
+    // when the node's current catch-up began, as far as this session has seen
+    let mut catching_up_since: Option<Instant> = None;
     loop {
-        let caught_up = node.client_blocks_quiet_for(Instant::now(), timing.catchup_quiet);
-        if let Some(ip) = priority
-            .candidates()
-            .into_iter()
-            .next()
-            .filter(|_| caught_up)
-        {
-            if node.claim_repin_attempt(Instant::now(), timing.retry) {
+        let now = Instant::now();
+        let caught_up = if node.client_blocks_quiet_for(now, timing.catchup_quiet) {
+            catching_up_since = None;
+            true
+        } else {
+            now.saturating_duration_since(*catching_up_since.get_or_insert(now))
+                >= timing.catchup_max
+        };
+        let candidates = if caught_up {
+            priority.candidates()
+        } else {
+            Vec::new()
+        };
+        if !candidates.is_empty() && node.claim_repin_attempt(Instant::now(), timing.retry) {
+            // every available priority peer in turn, not just the first: one still broken (e.g.
+            // restarting after an upgrade) would otherwise take every probe while another serves
+            let mut probed = false;
+            for ip in candidates {
                 let tip = net_tip.load(Ordering::Acquire);
                 let (_, _, probe) = live_attempt(
                     priority.clone(),
@@ -794,9 +810,10 @@ pub(super) async fn wait_priority_return(
                 match probe {
                     Ok(_serving) => return format!("{RETURNING_TO_PRIORITY} ({ip} is serving)"),
                     // another session took its last slot since candidates(): nothing wrong with
-                    // the peer, and no probe happened, so this node may try again next check
-                    Err(e) if e.to_string() == PRIORITY_CAP_REACHED => node.forget_repin_attempt(),
+                    // the peer, and no probe happened
+                    Err(e) if e.to_string() == PRIORITY_CAP_REACHED => {}
                     Err(e) => {
+                        probed = true;
                         gwlog!(
                             "[gw] [{}] priority peer {ip} still not serving: {e}",
                             node.ip
@@ -808,6 +825,10 @@ pub(super) async fn wait_priority_return(
                         }
                     }
                 }
+            }
+            // no probe ran (every candidate filled up meanwhile): this node may try again next check
+            if !probed {
+                node.forget_repin_attempt();
             }
         }
         tokio::time::sleep(timing.check_every).await;
@@ -1334,6 +1355,7 @@ mod tests {
         RepinTiming {
             min_session: Duration::from_millis(150),
             catchup_quiet: Duration::from_millis(300),
+            catchup_max: Duration::from_secs(2),
             check_every: Duration::from_millis(50),
             retry: Duration::from_secs(10),
         }
@@ -1460,6 +1482,70 @@ mod tests {
             !node.claim_repin_attempt(Instant::now(), fast_repin().retry),
             "only the probe that ran counted as the node's attempt"
         );
+        h.abort();
+    }
+
+    #[tokio::test]
+    async fn a_return_probe_tries_every_priority_peer_in_turn() {
+        let (refuses, h1) = fake_live_peer(FakePeer::Full).await;
+        let (serves, h2) = fake_live_peer(FakePeer::Healthy).await;
+        let tier = test_tier(&[&refuses, &serves], 300);
+        assert_eq!(tier.candidates()[0], refuses, "the broken one comes first");
+        let node = Arc::new(NodeState::new("10.0.0.9".parse().unwrap(), 1));
+        let reason = timeout(
+            Duration::from_secs(5),
+            wait_priority_return(
+                node.clone(),
+                tier.clone(),
+                Arc::new(AtomicU32::new(0)),
+                fast_repin(),
+            ),
+        )
+        .await
+        .expect("the second priority peer serves on the same attempt");
+        assert!(reason.contains(&serves), "{reason}");
+        assert!(
+            !node.claim_repin_attempt(Instant::now(), fast_repin().retry),
+            "one attempt covered both peers"
+        );
+        assert_eq!(tier.sessions(&serves), 0, "probe slot released");
+        h1.abort();
+        h2.abort();
+    }
+
+    #[tokio::test]
+    async fn a_catch_up_that_never_ends_stops_holding_the_return_back() {
+        let (p, h) = fake_live_peer(FakePeer::Healthy).await;
+        let tier = test_tier(&[&p], 300);
+        let node = Arc::new(NodeState::new("10.0.0.9".parse().unwrap(), 1));
+        // client-block batches never stop (a pool 4002 horizon stuck behind the tip)
+        let feeder = {
+            let node = node.clone();
+            tokio::spawn(async move {
+                loop {
+                    node.mark_client_blocks_response(Instant::now());
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            })
+        };
+        let t0 = Instant::now();
+        let reason = timeout(
+            Duration::from_secs(5),
+            wait_priority_return(
+                node.clone(),
+                tier.clone(),
+                Arc::new(AtomicU32::new(0)),
+                fast_repin(),
+            ),
+        )
+        .await
+        .expect("returns once the catch-up has run catchup_max");
+        assert!(
+            t0.elapsed() >= Duration::from_secs(2),
+            "not before catchup_max"
+        );
+        assert!(reason.starts_with(RETURNING_TO_PRIORITY), "{reason}");
+        feeder.abort();
         h.abort();
     }
 }

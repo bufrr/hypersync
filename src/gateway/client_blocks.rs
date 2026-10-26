@@ -162,6 +162,14 @@ const ACTIVE_4002_GRACE: Duration = Duration::from_millis(2000);
 // Priority answers take ~2s; this leaves the pool most of the request budget.
 const PRIORITY_4002_ROUND: Duration = Duration::from_secs(6);
 
+// Does the pinned active answer ALONE first? Not a pool active (a fallback session) on an
+// exclusive tier while a priority peer is usable: its requests go to the priority round like any
+// other, the pool only after it. A pool peer can serve 4002 from a horizon well behind the tip,
+// holding the node that far behind for as long as it stays the 4002 source.
+fn active_answers_first(priority: &PriorityTier, ip: &str) -> bool {
+    priority.contains(ip) || priority.pool_allowed()
+}
+
 async fn wait_active_session(node: &NodeState, budget: Duration) -> Option<ActivePeer> {
     let deadline = Instant::now() + budget;
     loop {
@@ -262,17 +270,23 @@ async fn fetch_client_blocks_raced(
     req: Arc<Vec<u8>>,
 ) -> Result<BudgetedFrame, String> {
     let started = Instant::now();
-    // a remembered hedge winner (see NodeState::rpc_peer) stands in for a missing pin right away
-    // (a remembered pool peer only while the pool may serve this node at all)
+    // a remembered hedge winner (see NodeState::rpc_peer) stands in for a missing or deferred pin
+    // right away (a remembered pool peer only while the pool may serve this node at all)
     let remembered = lock(&node.rpc_peer)
         .clone()
         .filter(|ip| !crate::blacklist::contains(ip))
         .filter(|ip| priority.contains(ip) || priority.pool_allowed());
-    let active = if remembered.is_some() {
+    let pinned = if remembered.is_some() {
         node.active_session_snapshot()
     } else {
         wait_active_session(node, ACTIVE_4002_PIN_WAIT).await
     };
+    // a pool active that may not answer first keeps its direct attempt for the pool phase
+    let (active, mut deferred) = match pinned {
+        Some(peer) if !active_answers_first(priority, &peer.ip) => (None, Some(peer)),
+        pinned => (pinned, None),
+    };
+    let deferred_pin = deferred.clone();
     // A prewarmed attempt opens its own live relationship, i.e. one more connection on that
     // peer: a priority peer is only used with a free slot, held for the attempt.
     let prewarm_slot = |ip: &str| -> Option<Option<PrioritySession>> {
@@ -344,10 +358,26 @@ async fn fetch_client_blocks_raced(
     let mut terminal_from = String::new();
     let mut too_small_from = String::new();
     loop {
+        // the pool may serve now: the deferred pool active answers over its own session, as in
+        // stage 1, next to the pool candidates
+        if pool_hedged {
+            if let Some(peer) = deferred.take() {
+                let req = req.clone();
+                attempts.spawn(async move {
+                    let ip = peer.ip.clone();
+                    let result = fetch_client_blocks_from_peer(ip.clone(), req, false)
+                        .await
+                        .1;
+                    (Some(peer), ip, result)
+                });
+            }
+        }
         // the priority peers hedged in this round that haven't answered yet
         let mut prio_pending: Vec<String> = Vec::new();
         for ip in round {
-            if first_ip.as_deref() == Some(ip.as_str()) {
+            if first_ip.as_deref() == Some(ip.as_str())
+                || deferred_pin.as_ref().is_some_and(|peer| peer.ip == ip)
+            {
                 continue;
             }
             let Some(slot) = prewarm_slot(&ip) else {
@@ -414,7 +444,14 @@ async fn fetch_client_blocks_raced(
             ) {
                 attempts.abort_all();
                 let stage = if tag.is_some() { "active" } else { "hedge" };
-                if tag.is_none() && node.active_session_snapshot().is_none() {
+                let remember = tag.is_none()
+                    && match &deferred_pin {
+                        // the pool pin stays: a priority winner serves its next batches first
+                        // (until the next 4001 session re-pins, which forgets it)
+                        Some(pin) => priority.contains(&ip) && node.active_is_current(pin),
+                        None => node.active_session_snapshot().is_none(),
+                    };
+                if remember {
                     *lock(&node.rpc_peer) = Some(ip.clone());
                 }
                 log_client_blocks(node, priority, &ip, stage, &frame, started);
@@ -427,7 +464,11 @@ async fn fetch_client_blocks_raced(
                 too_small_from = ip;
             }
         }
-        if pool_hedged || terminal.is_some() || too_small.is_some() || peers.is_empty() {
+        if pool_hedged
+            || terminal.is_some()
+            || too_small.is_some()
+            || (peers.is_empty() && deferred.is_none())
+        {
             break;
         }
         pool_hedged = true;
@@ -606,5 +647,127 @@ mod tests {
         assert_eq!(out, ["2.2.2.2", "9.9.9.9", "1.1.1.1"]);
         let out = client_block_peer_candidates(Vec::new(), &[], &rr, 3);
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn a_pool_active_answers_first_only_while_the_pool_is_allowed() {
+        let tier = |exclusive| {
+            PriorityTier::new(
+                vec!["9.9.9.9".to_string()],
+                0,
+                Duration::from_millis(300),
+                crate::priority::BootstrapPolicy::Fallback,
+            )
+            .with_exclusive(exclusive)
+        };
+        let exclusive = tier(true);
+        assert!(active_answers_first(&exclusive, "9.9.9.9"));
+        assert!(
+            !active_answers_first(&exclusive, "1.1.1.1"),
+            "a usable priority peer goes first"
+        );
+        exclusive.mark_failed("9.9.9.9");
+        assert!(
+            active_answers_first(&exclusive, "1.1.1.1"),
+            "every priority peer unusable: the pool active serves"
+        );
+        assert!(active_answers_first(&tier(false), "1.1.1.1"));
+    }
+
+    // A fake upstream on a loopback alias: 4001 answers the greeting (`live_ok`: as serving, else
+    // as peer full; None: no 4001 at all) and 4002 answers any request with `tag` as one frame.
+    // None if the ports are taken (e.g. a real node on this host owns :4001/:4002).
+    async fn fake_upstream(
+        ip: &str,
+        live_ok: Option<bool>,
+        tag: &'static [u8],
+    ) -> Option<Vec<tokio::task::JoinHandle<()>>> {
+        let mut tasks = Vec::new();
+        if let Some(ok) = live_ok {
+            let l = tokio::net::TcpListener::bind((ip, 4001)).await.ok()?;
+            tasks.push(tokio::spawn(async move {
+                while let Ok((mut s, _)) = l.accept().await {
+                    tokio::spawn(async move {
+                        let mut greet = [0u8; 8];
+                        if s.read_exact(&mut greet).await.is_ok() {
+                            let _ = s.write_all(&[0, 0, 0, 1, 0, if ok { 3 } else { 4 }]).await;
+                        }
+                        tokio::time::sleep(Duration::from_secs(10)).await;
+                    });
+                }
+            }));
+        }
+        let l = tokio::net::TcpListener::bind((ip, 4002)).await.ok()?;
+        tasks.push(tokio::spawn(async move {
+            while let Ok((mut s, _)) = l.accept().await {
+                tokio::spawn(async move {
+                    let mut req = [0u8; 64];
+                    if s.read(&mut req).await.unwrap_or(0) > 0 {
+                        let mut frame = (tag.len() as u32).to_be_bytes().to_vec();
+                        frame.push(0);
+                        frame.extend_from_slice(tag);
+                        let _ = s.write_all(&frame).await;
+                    }
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                });
+            }
+        }));
+        Some(tasks)
+    }
+
+    fn exclusive_tier(prio: &str) -> Arc<PriorityTier> {
+        Arc::new(
+            PriorityTier::new(
+                vec![prio.to_string()],
+                0,
+                Duration::from_millis(300),
+                crate::priority::BootstrapPolicy::Fallback,
+            )
+            .with_exclusive(true),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_pool_active_gets_4002_only_after_the_priority_peers() {
+        let (prio, pool) = ("127.0.0.42", "127.0.0.43");
+        // the pool active has no 4001 listener: it can only answer over its own session (direct)
+        let (Some(t1), Some(t2)) = (
+            fake_upstream(prio, Some(true), b"from-prio").await,
+            fake_upstream(pool, None, b"from-pool").await,
+        ) else {
+            eprintln!("skipped: loopback 4001/4002 taken");
+            return;
+        };
+        let node = NodeState::new("10.0.0.9".parse().unwrap(), 1);
+        let tier = exclusive_tier(prio);
+        node.pin_active(pool);
+        let rr = AtomicUsize::new(0);
+        let frame = fetch_client_blocks_raced(&node, &tier, &[], &rr, Arc::new(vec![1, 2, 3]))
+            .await
+            .expect("the priority peer serves");
+        assert!(frame.ends_with(b"from-prio"));
+        assert_eq!(
+            lock(&node.rpc_peer).as_deref(),
+            Some(prio),
+            "remembered while the pool pin stays"
+        );
+        // the priority peer stops serving (4001 says full): the pool active still answers, over
+        // its own session, once the priority round has failed
+        for t in t1 {
+            t.abort();
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let Some(t1) = fake_upstream(prio, Some(false), b"from-prio").await else {
+            eprintln!("skipped: loopback 4001/4002 taken");
+            return;
+        };
+        *lock(&node.rpc_peer) = None;
+        let frame = fetch_client_blocks_raced(&node, &tier, &[], &rr, Arc::new(vec![1, 2, 3]))
+            .await
+            .expect("the deferred pool active serves");
+        assert!(frame.ends_with(b"from-pool"));
+        for t in t1.into_iter().chain(t2) {
+            t.abort();
+        }
     }
 }

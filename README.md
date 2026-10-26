@@ -92,7 +92,7 @@ Set in `.env`; compose passes them through.
 
 The peer is then skipped for 30 s (priority peers via their own cooldown), so the reconnect lands on a different one unless every peer is cooling down.
 
-**Returning to priority peers.** A session that ended up on a pool peer (e.g. after a network-wide pause cooled the priority peers down) moves back once a priority peer serves again: after the session has run 60 s and the node has finished catching up (no client-block batch for 60 s), the gateway probes the least-loaded available priority peer with the same first-block vetting as selection and, if it passes, ends the session so the node reconnects to it. A failed probe cools that peer down; each node probes at most once per 5 minutes, since the reconnect costs it a few seconds of blocks. With hot standbys the switch happens on the same connection instead (below).
+**Returning to priority peers.** A session that ended up on a pool peer (e.g. after a network-wide pause cooled the priority peers down) moves back once a priority peer serves again: after the session has run 60 s and the node has finished catching up (no client-block batch for 60 s, or a catch-up still running after 3 minutes, which isn't converging), the gateway probes the available priority peers in turn, least-loaded first, with the same first-block vetting as selection and, once one passes, ends the session so the node reconnects to it. A failed probe cools that peer down; each node makes at most one probe attempt per 5 minutes, since the reconnect costs it a few seconds of blocks. With hot standbys the switch happens on the same connection instead (below).
 
 Live frames over 8 MB end the session (blocks average ~200 KB), at most 64 MB of frames are queued per node, and writes to a node are bounded to 30 s, so neither a hostile peer nor a stuck node can make a session hold more.
 
@@ -102,7 +102,7 @@ Live frames over 8 MB end the session (blocks average ~200 KB), at most 64 MB of
 
 **Bootstrap relay.** A state server that sends nothing for 60 s ends the relay so the node retries elsewhere; one that ends before delivering the whole abci_state is no longer tried first.
 
-**Client blocks (4002).** The node's active peer answers alone for 2 s, then up to 8 others are hedged in — on an exclusive tier the other priority peers first, and the pool only once every one of them has failed that request or 6 s have passed (a priority peer silent that long cools down). 15 s per request, at most 8 requests at once.
+**Client blocks (4002).** The node's active peer answers alone for 2 s (on an exclusive tier only a priority active; a pool active gets no head start while a priority peer is usable, since a pool peer's 4002 can lag the tip), then up to 8 others are hedged in — on an exclusive tier the other priority peers first, and the pool only once every one of them has failed that request or 6 s have passed (a priority peer silent that long cools down). 15 s per request, at most 8 requests at once.
 
 ## IP blacklist
 
