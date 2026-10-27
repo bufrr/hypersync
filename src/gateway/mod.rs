@@ -566,7 +566,7 @@ pub(crate) async fn run_gateway(node_peer_file: String, push: bool, cache_coldst
 
 pub(crate) use self::client_blocks::{
     response_has_client_block_round_too_large, response_has_client_block_round_too_small,
-    response_has_no_client_blocks, response_is_peer_only,
+    response_has_no_client_blocks, response_is_peer_only, response_is_structured_round_too_large,
 };
 
 #[cfg(test)]

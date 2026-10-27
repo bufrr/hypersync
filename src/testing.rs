@@ -7,7 +7,7 @@ use tokio::time::timeout;
 
 use crate::gateway::{
     response_has_client_block_round_too_large, response_has_client_block_round_too_small,
-    response_has_no_client_blocks, response_is_peer_only,
+    response_has_no_client_blocks, response_is_peer_only, response_is_structured_round_too_large,
 };
 use crate::priority::gwlog;
 use crate::protocol::{
@@ -514,6 +514,7 @@ async fn fakenode_rpc(gw_ip: &str, port: u16, max_round: u32, label: &str) -> bo
         // check that the RPC path works they are a failure, not a pass
         if response_has_no_client_blocks(&payload)
             || response_has_client_block_round_too_large(&payload)
+            || response_is_structured_round_too_large(&payload)
             || response_has_client_block_round_too_small(&payload)
         {
             gwlog!(

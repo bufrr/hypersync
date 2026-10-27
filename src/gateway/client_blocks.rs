@@ -30,6 +30,14 @@ pub(crate) fn response_has_client_block_round_too_large(payload: &[u8]) -> bool 
         .any(|w| w == b"client block round too large")
 }
 
+// The same error in its structured (bincode) form, as a short frame: 0x00, 0x01 (error), 0x06, then
+// the requested round and the peer's committed tip, each 0xfc + u32 LE. A real batch payload is an
+// LZ4 block with its 4-byte LE uncompressed size first; one starting 00 01 06 fc would declare
+// ~4.2 GB, impossible for a 13-byte payload, so the exact layout can't match a batch.
+pub(crate) fn response_is_structured_round_too_large(payload: &[u8]) -> bool {
+    payload.len() == 13 && payload[..4] == [0x00, 0x01, 0x06, 0xfc] && payload[8] == 0xfc
+}
+
 pub(crate) fn response_has_client_block_round_too_small(payload: &[u8]) -> bool {
     payload
         .windows(b"client block round too small".len())
@@ -129,8 +137,9 @@ async fn fetch_client_blocks_from_peer(
         if response_is_peer_only(rp) {
             return Ok(ClientBlockUpstreamResponse::PeerOnly);
         }
-        let terminal =
-            response_has_no_client_blocks(rp) || response_has_client_block_round_too_large(rp);
+        let terminal = response_has_no_client_blocks(rp)
+            || response_has_client_block_round_too_large(rp)
+            || response_is_structured_round_too_large(rp);
         let too_small = response_has_client_block_round_too_small(rp);
         let frame = BudgetedFrame {
             bytes: frame,
@@ -318,6 +327,8 @@ async fn fetch_client_blocks_raced(
     let mut failures = Vec::new();
     let mut terminal = None;
     let mut too_small = None;
+    let mut terminal_from = String::new();
+    let mut too_small_from = String::new();
 
     // Stage 1: the pinned active (or the remembered RPC peer) ALONE within a grace budget (one
     // upstream connection in the common case; no candidate can outrace it with a cross-peer
@@ -346,6 +357,13 @@ async fn fetch_client_blocks_raced(
                     log_client_blocks(node, priority, &ip, stage, &frame, started);
                     return Ok(frame);
                 }
+                // a last-resort answer from the first attempt: remember who gave it for the log
+                if terminal.is_some() {
+                    terminal_from = ip.clone();
+                }
+                if too_small.is_some() {
+                    too_small_from = ip;
+                }
             }
             Ok(_) => {}
             // grace expired: the first attempt stays in the set and keeps racing below
@@ -366,8 +384,6 @@ async fn fetch_client_blocks_raced(
         client_block_peer_candidates(prio, peers, rr, 8)
     };
     let mut pool_hedged = !pool_waits;
-    let mut terminal_from = String::new();
-    let mut too_small_from = String::new();
     loop {
         // the pool may serve now: the deferred pool active answers over its own session, as in
         // stage 1, next to the pool candidates
@@ -668,6 +684,60 @@ mod tests {
     }
 
     #[test]
+    fn a_structured_round_too_large_reply_is_terminal() {
+        // captured from a priority peer whose committed store lagged: requested 1502221505,
+        // committed tip 1502220797
+        let reply = [
+            0x00, 0x01, 0x06, 0xfc, 0xc1, 0x14, 0x8a, 0x59, 0xfc, 0xfd, 0x11, 0x8a, 0x59,
+        ];
+        assert!(response_is_structured_round_too_large(&reply));
+        assert!(!response_is_structured_round_too_large(&reply[..12]));
+        let mut other_variant = reply;
+        other_variant[2] = 0x05;
+        assert!(!response_is_structured_round_too_large(&other_variant));
+        // a batch starts with its LE uncompressed size
+        let batch = [
+            0x80, 0x96, 0x98, 0x00, 0x1f, 0x00, 0x01, 0xfc, 0, 0, 0, 0, 0,
+        ];
+        assert!(!response_is_structured_round_too_large(&batch));
+    }
+
+    #[tokio::test]
+    async fn a_lagging_peers_instant_error_does_not_beat_the_actives_batch() {
+        const ERR: &[u8] = &[
+            0x00, 0x01, 0x06, 0xfc, 0xc1, 0x14, 0x8a, 0x59, 0xfc, 0xfd, 0x11, 0x8a, 0x59,
+        ];
+        let (active, lagging) = ("127.0.0.44", "127.0.0.45");
+        // the active answers past its 2 s grace (heavy blocks); the hedged peer errors at once
+        let (Some(t1), Some(t2)) = (
+            fake_upstream_after(active, Some(true), b"real-batch", 2600).await,
+            fake_upstream(lagging, Some(true), ERR).await,
+        ) else {
+            eprintln!("skipped: loopback 4001/4002 taken");
+            return;
+        };
+        let tier = Arc::new(
+            PriorityTier::new(
+                vec![active.to_string(), lagging.to_string()],
+                0,
+                Duration::from_millis(300),
+                crate::priority::BootstrapPolicy::Fallback,
+            )
+            .with_exclusive(true),
+        );
+        let node = NodeState::new("10.0.0.9".parse().unwrap(), 1);
+        node.pin_active(active);
+        let rr = AtomicUsize::new(0);
+        let frame = fetch_client_blocks_raced(&node, &tier, &[], &rr, Arc::new(vec![1, 2, 3]))
+            .await
+            .expect("the active's batch is served");
+        assert!(frame.ends_with(b"real-batch"));
+        for t in t1.into_iter().chain(t2) {
+            t.abort();
+        }
+    }
+
+    #[test]
     fn only_range_queries_count_as_catch_up() {
         // the captured frame from docs/hl-p2p-protocol.md §8a
         let range = [
@@ -717,6 +787,16 @@ mod tests {
         live_ok: Option<bool>,
         tag: &'static [u8],
     ) -> Option<Vec<tokio::task::JoinHandle<()>>> {
+        fake_upstream_after(ip, live_ok, tag, 0).await
+    }
+
+    // ...answering 4002 only after `delay_ms`
+    async fn fake_upstream_after(
+        ip: &str,
+        live_ok: Option<bool>,
+        tag: &'static [u8],
+        delay_ms: u64,
+    ) -> Option<Vec<tokio::task::JoinHandle<()>>> {
         let mut tasks = Vec::new();
         if let Some(ok) = live_ok {
             let l = tokio::net::TcpListener::bind((ip, 4001)).await.ok()?;
@@ -738,6 +818,7 @@ mod tests {
                 tokio::spawn(async move {
                     let mut req = [0u8; 64];
                     if s.read(&mut req).await.unwrap_or(0) > 0 {
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                         let mut frame = (tag.len() as u32).to_be_bytes().to_vec();
                         frame.push(0);
                         frame.extend_from_slice(tag);

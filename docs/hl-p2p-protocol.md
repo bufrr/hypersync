@@ -127,6 +127,7 @@ The node logs `querying client blocks [X, Y]` → `got N client blocks first=X l
 - **height query**: `querying height` → `got heights [ip→height]` (the node asks peers their height before deciding what to fetch).
 - **query_peers**: peer discovery; the response is a peer table (IP list).
 - **Error frames** [confirmed]: a type=0 frame whose payload is `0x03` + an ASCII reason, e.g. `client block round too large` (you requested rounds ahead of the peer's *committed* client-block store, which lags the live tip) or `Peer-only request`. A gateway answering from a cache should likewise only serve rounds it has, and return a comparable type=0 error otherwise.
+- **Structured error replies** [confirmed 2026-10-26]: a peer can also answer a range query with a short bincode error instead of the ASCII form. Seen for `client block round too large`: a 13-byte payload `00 01 06 fc <requested round u32 LE> fc <committed tip u32 LE>` (hl-node logs it as `client block round too large: <requested> > <tip>`). It must be treated like the ASCII error, not as a batch: a lagging peer returns it at once and would otherwise outrace a slower peer's real batch.
 
 ## 9. Full node lifecycle after startup
 
