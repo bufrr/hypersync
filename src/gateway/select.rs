@@ -3,7 +3,9 @@ use crate::protocol::{
     block_round, is_plausible_mainnet_round, read_live_frame_with_timeout, response_is_peer_full,
     round_lag_from_tip, ACTIVE_ROUND_MAX_LAG, GREET_FALSE, MAX_LIVE_FRAME,
 };
-use crate::push::{MAX_ACTIVE_ROUND_JUMP, NODE_CATCHUP_STUCK, RETURNING_TO_PRIORITY};
+use crate::push::{
+    FreshestRound, MAX_ACTIVE_ROUND_JUMP, NODE_CATCHUP_STUCK, RETURNING_TO_PRIORITY,
+};
 use crate::util::lock;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -65,7 +67,7 @@ fn stage<T>(
 fn peer_error_class(e: &str) -> &'static str {
     if e.contains("peer full") {
         "peer_full"
-    } else if e.contains("lagged") {
+    } else if e.contains("lagged") || e.contains("behind the freshest") {
         "lagged"
     } else if e.contains("not serving abci_state") {
         "small_frame"
@@ -328,6 +330,8 @@ async fn open_live_peer_session_with_greet(
     wait: Duration,
     min_round_exclusive: u32,
     net_tip: u32,
+    // the gateway's lag guard; its floor is read when the first block arrives
+    freshest: Option<Arc<FreshestRound>>,
 ) -> std::io::Result<LivePeerSession> {
     let connect_ip = ip.clone();
     let (stream, greeting, prefetched_frames, first_round) = timeout(wait, async move {
@@ -369,6 +373,14 @@ async fn open_live_peer_session_with_greet(
                 if let Some(lag) = round_lag_from_tip(round, net_tip, ACTIVE_ROUND_MAX_LAG) {
                     return Err(std::io::Error::other(format!(
                         "live block lagged round={round} net_tip={net_tip} lag={lag} max_lag={ACTIVE_ROUND_MAX_LAG}"
+                    )));
+                }
+                // behind the gateway's freshest stream by more than the lag guard allows
+                // (FreshestRound::select_floor): it would be cut seconds into the session
+                let floor = freshest.as_ref().map_or(0, |f| f.select_floor());
+                if round < floor {
+                    return Err(std::io::Error::other(format!(
+                        "live block behind the freshest stream round={round} floor={floor}"
                     )));
                 }
                 kept.push(frame);
@@ -423,6 +435,7 @@ const PRIORITY_CAP_REACHED: &str = "priority session cap reached";
 // selections for several nodes can't overrun HYPERSYNC_PRIORITY_MAX_SESSIONS; a full peer counts
 // as a failed attempt. The slot travels with the session, or is released when the attempt fails
 // or loses the race.
+#[allow(clippy::too_many_arguments)]
 async fn live_attempt(
     priority: Arc<PriorityTier>,
     ip: String,
@@ -431,6 +444,7 @@ async fn live_attempt(
     wait: Duration,
     min_round_exclusive: u32,
     net_tip: u32,
+    freshest: Option<Arc<FreshestRound>>,
 ) -> (String, bool, std::io::Result<LivePeerSession>) {
     let slot = if is_priority {
         match priority.try_acquire(&ip) {
@@ -446,13 +460,19 @@ async fn live_attempt(
     } else {
         None
     };
-    let r =
-        open_live_peer_session_with_greet(ip.clone(), greet, wait, min_round_exclusive, net_tip)
-            .await
-            .map(|mut s| {
-                s.prio_session = slot;
-                s
-            });
+    let r = open_live_peer_session_with_greet(
+        ip.clone(),
+        greet,
+        wait,
+        min_round_exclusive,
+        net_tip,
+        freshest.clone(),
+    )
+    .await
+    .map(|mut s| {
+        s.prio_session = slot;
+        s
+    });
     (ip, is_priority, r)
 }
 
@@ -475,6 +495,7 @@ pub(super) async fn select_live_peer(
     greet: [u8; 8],
     min_round_exclusive: u32,
     net_tip: u32,
+    freshest: Option<Arc<FreshestRound>>,
 ) -> Option<LivePeerSession> {
     let prio = priority.candidates();
     if peers.is_empty() && prio.is_empty() {
@@ -504,6 +525,7 @@ pub(super) async fn select_live_peer(
             LIVE_SELECT_WAIT,
             min_round_exclusive,
             net_tip,
+            freshest.clone(),
         ));
         prio_in_flight += 1;
     }
@@ -525,6 +547,7 @@ pub(super) async fn select_live_peer(
                     wait,
                     min_round_exclusive,
                     net_tip,
+                    freshest.clone(),
                 ));
                 launched += 1;
                 pool_in_flight += 1;
@@ -773,6 +796,8 @@ pub(super) async fn wait_priority_return(
     priority: Arc<PriorityTier>,
     net_tip: Arc<AtomicU32>,
     timing: RepinTiming,
+    // the push session's lag guard: a candidate behind it would be cut right after the return
+    freshest: Option<Arc<FreshestRound>>,
 ) -> String {
     tokio::time::sleep(timing.min_session).await;
     let watch_start = Instant::now();
@@ -803,6 +828,7 @@ pub(super) async fn wait_priority_return(
                     LIVE_SELECT_WAIT,
                     0,
                     tip,
+                    freshest.clone(),
                 )
                 .await;
                 match probe {
@@ -951,6 +977,8 @@ mod tests {
         Full,
         // like Healthy, but only after this many ms
         Slow(u64),
+        // like Healthy, starting at this round
+        At(u32),
     }
 
     // A fake upstream 4001 on an ephemeral 127.0.0.1 port; returns ("127.0.0.1:port", task).
@@ -977,6 +1005,10 @@ mod tests {
                         FakePeer::Healthy => {
                             let _ = s.write_all(&[0, 0, 0, 1, 0, 3]).await;
                             let _ = s.write_all(&live_block_frame(1_400_000_000)).await;
+                        }
+                        FakePeer::At(round) => {
+                            let _ = s.write_all(&[0, 0, 0, 1, 0, 3]).await;
+                            let _ = s.write_all(&live_block_frame(round)).await;
                         }
                         FakePeer::Full => {
                             let _ = s.write_all(&[0, 0, 0, 1, 0, 4]).await;
@@ -1021,6 +1053,65 @@ mod tests {
         )
     }
 
+    // A priority peer starting more than the lag guard allows behind the freshest stream is
+    // refused at selection (and cools down) instead of being cut seconds into the session: seen
+    // 2026-10-28 at the US open, a QuickNode sentry ~1,200 rounds behind was picked again and cut
+    // after 5s, twice, each time costing the node a reconnect.
+    #[tokio::test]
+    async fn a_priority_peer_behind_the_freshest_stream_is_not_selected() {
+        let (behind, h1) = fake_live_peer(FakePeer::Healthy).await; // round 1_400_000_000
+        let (fresh, h2) = fake_live_peer(FakePeer::At(1_400_001_200)).await;
+        let pool = vec![fresh.clone()];
+        // two other streams at 1_400_001_200: the floor is 100 below
+        let freshest = Arc::new(FreshestRound::new(
+            100,
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+            Arc::new(AtomicU32::new(1_400_001_000)),
+        ));
+        let (fa, fb) = (freshest.feed("a"), freshest.feed("b"));
+        fa.offer(1_400_001_200);
+        fb.offer(1_400_001_200);
+        let floor = Some(freshest.clone());
+
+        // no freshest round known: the priority peer is taken as before
+        let tier = exclusive_tier(&[&behind], 0);
+        let s = select_live_peer(&tier, &pool, 0, GREET_FALSE, 0, 0, None)
+            .await
+            .unwrap();
+        assert_eq!(s.ip, behind);
+        drop(s);
+
+        // behind the floor: refused and cooled down, so the exclusive tier opens the pool
+        let tier = exclusive_tier(&[&behind], 0);
+        let s = select_live_peer(&tier, &pool, 0, GREET_FALSE, 0, 0, floor.clone())
+            .await
+            .unwrap();
+        assert_eq!(s.ip, fresh);
+        assert!(tier.pool_allowed(), "the lagging priority peer cools down");
+        drop(s);
+
+        // a peer at or above the floor is taken
+        let tier = exclusive_tier(&[&fresh], 0);
+        let s = select_live_peer(&tier, &[], 0, GREET_FALSE, 0, 0, floor.clone())
+            .await
+            .unwrap();
+        assert_eq!(s.ip, fresh);
+        drop(s);
+
+        // one of the two streams behind the floor ends: no freshest round, no floor
+        drop(fb);
+        let tier = exclusive_tier(&[&behind], 0);
+        let s = select_live_peer(&tier, &pool, 0, GREET_FALSE, 0, 0, floor)
+            .await
+            .unwrap();
+        assert_eq!(s.ip, behind);
+        drop((s, fa));
+        for h in [h1, h2] {
+            h.abort();
+        }
+    }
+
     // QuickNode-style peering: a node stays on the priority peers while any of them serves —
     // a slow one is waited for past the stage, never outraced by the pool — and the pool takes
     // over only once every priority peer has failed or is unusable.
@@ -1034,7 +1125,7 @@ mod tests {
 
         // a priority peer answering well past the 300ms stage still beats a healthy pool peer
         let tier = exclusive_tier(&[&slow], 0);
-        let s = select_live_peer(&tier, &pool, 0, GREET_FALSE, 0, 0)
+        let s = select_live_peer(&tier, &pool, 0, GREET_FALSE, 0, 0, None)
             .await
             .unwrap();
         assert_eq!(s.ip, slow);
@@ -1043,7 +1134,7 @@ mod tests {
 
         // every priority peer refuses: the pool opens at once
         let tier = exclusive_tier(&[&refused], 0);
-        let s = select_live_peer(&tier, &pool, 0, GREET_FALSE, 0, 0)
+        let s = select_live_peer(&tier, &pool, 0, GREET_FALSE, 0, 0, None)
             .await
             .unwrap();
         assert_eq!(s.ip, o1);
@@ -1056,11 +1147,11 @@ mod tests {
         // one priority peer refuses, the other hangs: no pool while the hung one might answer;
         // once the window has cooled it down too, the next selection may use the pool
         let tier = exclusive_tier(&[&refused, &silent], 0);
-        assert!(select_live_peer(&tier, &pool, 0, GREET_FALSE, 0, 0)
+        assert!(select_live_peer(&tier, &pool, 0, GREET_FALSE, 0, 0, None)
             .await
             .is_none());
         assert!(tier.pool_allowed());
-        let s = select_live_peer(&tier, &pool, 0, GREET_FALSE, 0, 0)
+        let s = select_live_peer(&tier, &pool, 0, GREET_FALSE, 0, 0, None)
             .await
             .unwrap();
         assert_eq!(s.ip, o1);
@@ -1070,7 +1161,7 @@ mod tests {
         let tier = exclusive_tier(&[&slow], 1);
         let held = tier.try_acquire(&slow).unwrap();
         assert!(tier.pool_allowed());
-        let s = select_live_peer(&tier, &pool, 0, GREET_FALSE, 0, 0)
+        let s = select_live_peer(&tier, &pool, 0, GREET_FALSE, 0, 0, None)
             .await
             .unwrap();
         assert_eq!(s.ip, o1);
@@ -1175,7 +1266,7 @@ mod tests {
 
         // healthy priority peer wins even though the pool is healthy too
         let tier = test_tier(&[&p1], 300);
-        let s = select_live_peer(&tier, &pool, 0, GREET_FALSE, 0, 0)
+        let s = select_live_peer(&tier, &pool, 0, GREET_FALSE, 0, 0, None)
             .await
             .unwrap();
         assert_eq!(s.ip, p1);
@@ -1191,7 +1282,7 @@ mod tests {
         // goes into cooldown
         let tier = test_tier(&[&refused], 2000);
         let t0 = Instant::now();
-        let s = select_live_peer(&tier, &pool, 0, GREET_FALSE, 0, 0)
+        let s = select_live_peer(&tier, &pool, 0, GREET_FALSE, 0, 0, None)
             .await
             .unwrap();
         assert_eq!(s.ip, o1);
@@ -1208,7 +1299,7 @@ mod tests {
         // silent priority peer: the pool opens at the stage boundary and wins
         let tier = test_tier(&[&slow], 300);
         let t0 = Instant::now();
-        let s = select_live_peer(&tier, &pool, 0, GREET_FALSE, 0, 0)
+        let s = select_live_peer(&tier, &pool, 0, GREET_FALSE, 0, 0, None)
             .await
             .unwrap();
         assert_eq!(s.ip, o1);
@@ -1220,7 +1311,7 @@ mod tests {
 
         // empty tier = plain pool race
         let tier = test_tier(&[], 300);
-        let s = select_live_peer(&tier, &pool, 0, GREET_FALSE, 0, 0)
+        let s = select_live_peer(&tier, &pool, 0, GREET_FALSE, 0, 0, None)
             .await
             .unwrap();
         assert_eq!(s.ip, o1);
@@ -1236,7 +1327,7 @@ mod tests {
         let pool = vec![o1.clone()];
         let tier = test_tier_capped(&[&p1], 300, 1);
         let held = tier.try_acquire(&p1).unwrap(); // another node holds the only slot
-        let s = select_live_peer(&tier, &pool, 0, GREET_FALSE, 0, 0)
+        let s = select_live_peer(&tier, &pool, 0, GREET_FALSE, 0, 0, None)
             .await
             .unwrap();
         assert_eq!(s.ip, o1, "a full priority peer is skipped");
@@ -1258,7 +1349,7 @@ mod tests {
         // a priority peer that accepts and greets nothing never errors; when the window runs out
         // it must still be cooled down so the fallback doesn't re-dial it first
         let tier = test_tier(&[&silent], 300);
-        assert!(select_live_peer(&tier, &[], 0, GREET_FALSE, 0, 0)
+        assert!(select_live_peer(&tier, &[], 0, GREET_FALSE, 0, 0, None)
             .await
             .is_none());
         assert!(
@@ -1358,6 +1449,7 @@ mod tests {
             "no live block before deadline",
             "deadline has elapsed",
             "live block lagged round=10 net_tip=20 lag=10 max_lag=5",
+            "live block behind the freshest stream round=10 floor=20",
         ]
         .iter()
         .map(|s| s.to_string())
@@ -1371,7 +1463,7 @@ mod tests {
             "timeout=2",
             "peer_full=1",
             "no_block=1",
-            "lagged=1",
+            "lagged=2",
         ] {
             assert!(s.contains(part), "missing {part} in {s}");
         }
@@ -1387,6 +1479,35 @@ mod tests {
         }
     }
 
+    // ...but not to one that starts behind the session's freshest stream by more than its lag
+    // guard allows: the guard would cut it seconds after the return
+    #[tokio::test]
+    async fn a_pool_session_does_not_return_to_a_lagging_priority_peer() {
+        let (p, h) = fake_live_peer(FakePeer::Healthy).await; // round 1_400_000_000
+        let tier = test_tier_capped(&[&p], 300, 1);
+        let node = Arc::new(NodeState::new("10.0.0.9".parse().unwrap(), 1));
+        let tip = Arc::new(AtomicU32::new(1_400_001_000));
+        let freshest = Arc::new(FreshestRound::new(
+            100,
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+            tip.clone(),
+        ));
+        let (a, b) = (freshest.feed("a"), freshest.feed("b"));
+        a.offer(1_400_001_200);
+        b.offer(1_400_001_200);
+        assert_eq!(freshest.select_floor(), 1_400_001_100);
+        let wait = timeout(
+            Duration::from_secs(2),
+            wait_priority_return(node, tier.clone(), tip, fast_repin(), Some(freshest)),
+        )
+        .await;
+        assert!(wait.is_err(), "no return to a peer behind the floor");
+        assert!(tier.pool_allowed(), "the lagging priority peer cools down");
+        drop((a, b));
+        h.abort();
+    }
+
     #[tokio::test]
     async fn a_pool_session_returns_once_a_priority_peer_serves() {
         let (p, h) = fake_live_peer(FakePeer::Healthy).await;
@@ -1400,6 +1521,7 @@ mod tests {
                 tier.clone(),
                 Arc::new(AtomicU32::new(0)),
                 fast_repin(),
+                None,
             ),
         )
         .await
@@ -1432,7 +1554,7 @@ mod tests {
         let n = node();
         assert!(timeout(
             Duration::from_millis(600),
-            wait_priority_return(n.clone(), cooling, tip(), fast_repin())
+            wait_priority_return(n.clone(), cooling, tip(), fast_repin(), None)
         )
         .await
         .is_err());
@@ -1445,7 +1567,7 @@ mod tests {
         let _held = full.try_acquire(&p).unwrap();
         assert!(timeout(
             Duration::from_millis(600),
-            wait_priority_return(node(), full.clone(), tip(), fast_repin())
+            wait_priority_return(node(), full.clone(), tip(), fast_repin(), None)
         )
         .await
         .is_err());
@@ -1458,7 +1580,7 @@ mod tests {
         let n = node();
         assert!(timeout(
             Duration::from_millis(800),
-            wait_priority_return(n.clone(), tier.clone(), tip(), fast_repin())
+            wait_priority_return(n.clone(), tier.clone(), tip(), fast_repin(), None)
         )
         .await
         .is_err());
@@ -1490,6 +1612,7 @@ mod tests {
             tier.clone(),
             Arc::new(AtomicU32::new(0)),
             fast_repin(),
+            None,
         ));
         tokio::time::sleep(Duration::from_millis(800)).await;
         assert!(
@@ -1525,6 +1648,7 @@ mod tests {
                 tier.clone(),
                 Arc::new(AtomicU32::new(0)),
                 fast_repin(),
+                None,
             ),
         )
         .await
@@ -1631,6 +1755,7 @@ mod tests {
                 tier.clone(),
                 Arc::new(AtomicU32::new(0)),
                 fast_repin(),
+                None,
             ),
         )
         .await

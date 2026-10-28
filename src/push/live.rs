@@ -361,10 +361,25 @@ impl FreshestRound {
         }
     }
 
+    // The lowest first round a newly selected peer may start at: the freshest round less the lag
+    // the guard allows (0 = none known). A fresh 4001 stream starts at its peer's own tip, so one
+    // starting below this would be cut by the guard a few seconds into the session, costing the
+    // node a reconnect for nothing. Counted only from entries young enough to still count once the
+    // guard's grace has run, so it never holds a peer to a round the guard would have dropped.
+    pub(crate) fn select_floor(&self) -> u32 {
+        self.get_within(self.stale.saturating_sub(self.grace))
+            .map_or(0, |f| f.saturating_sub(self.lag_rounds))
+    }
+
     // The highest round streams from at least two different peers have reached; None with fewer.
     // Judged against the tip as it is now: entries taken under an earlier, higher tip, or any while
     // the tip is unknown, don't count.
     pub(crate) fn get(&self) -> Option<u32> {
+        self.get_within(self.stale)
+    }
+
+    // get(), counting only entries whose round rose within `max_age`
+    fn get_within(&self, max_age: Duration) -> Option<u32> {
         let tip = self.net_tip.load(Ordering::Acquire);
         if tip == 0 {
             return None;
@@ -374,7 +389,7 @@ impl FreshestRound {
         let mut per_peer: HashMap<&str, u32> = HashMap::new();
         let streams = lock(&self.streams);
         for (peer, round, at) in streams.values() {
-            if now.saturating_duration_since(*at) <= self.stale && *round <= ceiling {
+            if now.saturating_duration_since(*at) <= max_age && *round <= ceiling {
                 let best = per_peer.entry(peer.as_str()).or_insert(0);
                 *best = (*best).max(*round);
             }
@@ -937,6 +952,23 @@ async fn process_live_frame(
 mod tests {
     use super::*;
     use tokio::net::TcpListener;
+
+    // The selection floor counts only streams that will still count after the guard's grace: one
+    // whose round last rose 26 s ago (of a 30 s stale window, 5 s grace) holds no peer to it.
+    #[test]
+    fn the_select_floor_ignores_streams_about_to_go_stale() {
+        let tip = Arc::new(AtomicU32::new(1_000_000));
+        let f = FreshestRound::new(100, Duration::from_secs(5), Duration::from_secs(30), tip);
+        let now = Instant::now();
+        let old = now - Duration::from_secs(26);
+        f.offer(1, "a", 1_000_500, old);
+        f.offer(2, "b", 1_000_500, old);
+        assert_eq!(f.get(), Some(1_000_500), "the guard still counts them");
+        assert_eq!(f.select_floor(), 0, "selection does not");
+        f.offer(3, "c", 1_000_400, now);
+        f.offer(4, "d", 1_000_400, now);
+        assert_eq!(f.select_floor(), 1_000_300);
+    }
 
     // A 4001 relay whose upstream goes silent ends (the node reconnects elsewhere), while one
     // whose upstream keeps sending is never cut by the idle limit.

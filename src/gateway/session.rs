@@ -17,6 +17,12 @@ use tokio::time::timeout;
 #[allow(unused_imports)]
 use super::*;
 
+// The lag guard a newly selected live peer is held to (FreshestRound::select_floor), or the guard
+// would cut it seconds in. Hot-standby sessions don't use the guard, so none.
+fn select_guard(ctx: &GatewayCtx) -> Option<Arc<FreshestRound>> {
+    (FailoverConfig::get().standbys == 0).then(|| ctx.freshest.clone())
+}
+
 // Run a 4001 push session with the node's 4002 RPC pinned to the same upstream: pin the active
 // peer for the session's lifetime, run serve_push, log the exit; the guard clears the pin on any
 // exit (incl. a panic in serve_push). Shared by every push-serving path (cache-live, live, fallback).
@@ -60,6 +66,7 @@ async fn serve_push_repinned(
             priority.clone(),
             cfg.net_round_tip.clone(),
             REPIN,
+            cfg.freshest.clone(),
         )));
     }
     // ...and any session ends (so the node reconnects) once its catch-up has stopped converging
@@ -334,6 +341,7 @@ async fn replay_cache_then_live(
         live_greet,
         cache_floor,
         ctx.net_round_tip.load(Ordering::Acquire),
+        select_guard(&ctx),
     )
     .await
     {
@@ -532,6 +540,7 @@ pub(super) async fn handle_4001_live(
             greet,
             0,
             ctx.net_round_tip.load(Ordering::Acquire),
+            select_guard(&ctx),
         )
         .await
         {
