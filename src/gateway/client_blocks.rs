@@ -12,11 +12,16 @@ use tokio::time::timeout;
 #[allow(unused_imports)]
 use super::*;
 
+// Also in its structured (bincode) form, which mainnet peers send today: exactly 00 01 00 (error,
+// variant 0). A batch payload starts with its 4-byte LE uncompressed size, so it can't be 3 bytes.
 pub(crate) fn response_is_peer_only(payload: &[u8]) -> bool {
-    payload
-        .windows(b"Peer-only request".len())
-        .any(|w| w == b"Peer-only request")
+    payload == STRUCTURED_PEER_ONLY
+        || payload
+            .windows(b"Peer-only request".len())
+            .any(|w| w == b"Peer-only request")
 }
+
+const STRUCTURED_PEER_ONLY: [u8; 3] = [0x00, 0x01, 0x00];
 
 pub(crate) fn response_has_no_client_blocks(payload: &[u8]) -> bool {
     payload
@@ -626,6 +631,11 @@ mod tests {
     fn peer_only_response_is_detected_without_parsing_rpc() {
         assert!(response_is_peer_only(br#"{"Error":"Peer-only request"}"#));
         assert!(!response_is_peer_only(br#"{"Ok":{"blocks":[]}}"#));
+        // structured form, captured 2026-10-28 from pool peers asked for a range without a 4001
+        // relationship (the same peers served the range once one was open)
+        assert!(response_is_peer_only(&[0x00, 0x01, 0x00]));
+        assert!(!response_is_peer_only(&[0x00, 0x01, 0x00, 0x00]));
+        assert!(!response_is_peer_only(&[0x00, 0x01, 0x06]));
     }
 
     #[test]
