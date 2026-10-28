@@ -60,6 +60,7 @@ Set in `.env`; compose passes them through.
 | `HL_SELF_IP` | – | Comma-separated public IPs of **all** your nodes; never used as upstreams. |
 | `HYPERSYNC_IP_BLACKLIST` | – | Comma-separated IPs never connected to (see [IP blacklist](#ip-blacklist)). |
 | `HYPERSYNC_PRIORITY_PEERS` | – | Comma-separated priority peer IPs. Logged as `prio-N`, never by IP. |
+| `HYPERSYNC_PRIORITY_PEERS_EXPECTED` | – | How many priority peers there must be (e.g. `3` for QuickNode). Set, a missing, short or partly invalid list stops startup instead of quietly leaving nodes on the pool. |
 | `HYPERSYNC_PRIORITY_MAX_SESSIONS` | `0` | Max node sessions per priority peer (`0` = unlimited). |
 | `HYPERSYNC_PRIORITY_EXCLUSIVE` | `1` | Keep nodes on the priority peers (QuickNode-style peering): the pool serves a node only while every priority peer is unusable. `0` = staged: the pool joins after `HYPERSYNC_PRIORITY_STAGE_MS`. |
 | `HYPERSYNC_PRIORITY_STAGE_MS` | `1500` | Staged tier only: how long priority peers race alone before the pool joins. |

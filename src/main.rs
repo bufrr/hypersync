@@ -10,6 +10,7 @@
 // Subcommand `mock <bind:port> <dir> <start> <end>` replays captured blocks[start..end] for testing.
 
 mod blacklist;
+mod env_check;
 mod failover;
 mod gateway;
 mod peerd;
@@ -55,6 +56,16 @@ async fn main() {
         eprintln!("[main] WARN mallopt(M_MMAP_THRESHOLD) failed; 4002 buffers may stay resident");
     }
     let args: Vec<String> = env::args().collect();
+    // Invalid settings stop the process before it starts (see env_check): the priority peer list
+    // in every mode, the tier and failover knobs in the gateway that reads them.
+    let gateway = args.get(1).map(String::as_str) == Some("gateway");
+    let problems = env_check::problems(|k| env::var(k).ok(), gateway);
+    if !problems.is_empty() {
+        for p in &problems {
+            eprintln!("[main] invalid environment: {p}");
+        }
+        std::process::exit(2);
+    }
     // Priority (Tier P) IPs are redacted to prio-N in every log line of every mode (a sentry IP
     // can also be given to proxy/relay as a plain upstream).
     priority::init_redaction(&priority::priority_peers_from_env());

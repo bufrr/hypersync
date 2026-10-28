@@ -35,7 +35,7 @@ pub(crate) enum BootstrapPolicy {
 }
 
 impl BootstrapPolicy {
-    fn parse(v: &str) -> Option<Self> {
+    pub(crate) fn parse(v: &str) -> Option<Self> {
         match v.trim().to_ascii_lowercase().as_str() {
             "fallback" => Some(Self::Fallback),
             "never" => Some(Self::Never),
@@ -295,10 +295,14 @@ impl Drop for PrioritySession {
 // Valid, deduplicated IPv4s from HYPERSYNC_PRIORITY_PEERS, in the configured order. Invalid
 // entries are counted, never echoed: a typo'd sentry IP is still close to a real one.
 pub(crate) fn priority_peers_from_env() -> Vec<String> {
-    let raw = std::env::var("HYPERSYNC_PRIORITY_PEERS").unwrap_or_default();
+    priority_peers_from_raw(&std::env::var("HYPERSYNC_PRIORITY_PEERS").unwrap_or_default())
+}
+
+// The parse env_check validates against: same split, same address parse.
+pub(crate) fn priority_peers_from_raw(raw: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut invalid = 0usize;
-    for item in split_csv(&raw) {
+    for item in split_csv(raw) {
         match item.parse::<Ipv4Addr>() {
             Ok(ip) => {
                 let s = ip.to_string();

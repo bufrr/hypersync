@@ -52,6 +52,8 @@ services:
       # Tier P (see docs/hypersync-quicknode-upgrade-plan.html): stand-in public peers now, the
       # QuickNode sentry roots on swap day. Set in .env (gitignored), never here. Empty = off.
       HYPERSYNC_PRIORITY_PEERS: "${HYPERSYNC_PRIORITY_PEERS:-}"
+      # how many priority peers there must be: set, a missing or short list stops startup
+      HYPERSYNC_PRIORITY_PEERS_EXPECTED: "${HYPERSYNC_PRIORITY_PEERS_EXPECTED:-}"
       HYPERSYNC_PRIORITY_EXCLUSIVE: "${HYPERSYNC_PRIORITY_EXCLUSIVE:-1}"
       # empty = prefer on an exclusive tier, fallback on a staged one
       HYPERSYNC_PRIORITY_BOOTSTRAP: "${HYPERSYNC_PRIORITY_BOOTSTRAP:-}"
@@ -91,6 +93,7 @@ services:
       HL_SELF_IP: "${HL_SELF_IP:-}"
       # priority peers are excluded from discovery/probing (the gateway judges them itself)
       HYPERSYNC_PRIORITY_PEERS: "${HYPERSYNC_PRIORITY_PEERS:-}"
+      HYPERSYNC_PRIORITY_PEERS_EXPECTED: "${HYPERSYNC_PRIORITY_PEERS_EXPECTED:-}"
       # never queried, probed or published (plus /pd/ip_blacklist.txt, re-read every cycle)
       HYPERSYNC_IP_BLACKLIST: "${HYPERSYNC_IP_BLACKLIST:-}"
       # optional, comma-separated tcp_lz4_stats dirs (co-located only; see the colocated overlay)
