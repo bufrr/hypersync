@@ -332,6 +332,10 @@ fn labels() -> &'static [String] {
     LABELS.get().map(Vec::as_slice).unwrap_or(&[])
 }
 
+pub(crate) fn is_priority(ip: &str) -> bool {
+    labels().iter().any(|p| p == ip)
+}
+
 pub(crate) fn redact(line: &str) -> Cow<'_, str> {
     redact_with(line, labels())
 }

@@ -17,6 +17,7 @@ mod peerd;
 mod priority;
 mod protocol;
 mod push;
+mod responder;
 mod testing;
 mod util;
 
@@ -95,6 +96,12 @@ async fn main() {
         let start: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(0);
         let end: usize = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(12);
         run_mock(bind, dir, start, end).await;
+        return;
+    }
+    if args.get(1).map(|s| s.as_str()) == Some("responder") {
+        // `responder [<bind-ip>]` — the public 4001/4002 probe answerer (src/responder.rs)
+        let bind = args.get(2).cloned().unwrap_or_else(|| "0.0.0.0".into());
+        responder::run_responder(&bind).await;
         return;
     }
     if args.get(1).map(|s| s.as_str()) == Some("fakenode") {
@@ -181,7 +188,7 @@ async fn main() {
     let port: u16 = match args.get(1) {
         None => {
             eprintln!(
-                "usage: hypersync <gateway|peerd|proxy|relay|cache|mock|fakenode|bench> ... | hypersync <port> [peers]"
+                "usage: hypersync <gateway|peerd|responder|proxy|relay|cache|mock|fakenode|bench> ... | hypersync <port> [peers]"
             );
             std::process::exit(2);
         }
@@ -189,7 +196,7 @@ async fn main() {
             Ok(p) => p,
             Err(_) => {
                 eprintln!(
-                    "unknown mode {a:?}; usage: hypersync <gateway|peerd|proxy|relay|cache|mock|fakenode|bench> ... | hypersync [port] [peers]"
+                    "unknown mode {a:?}; usage: hypersync <gateway|peerd|responder|proxy|relay|cache|mock|fakenode|bench> ... | hypersync [port] [peers]"
                 );
                 std::process::exit(2);
             }

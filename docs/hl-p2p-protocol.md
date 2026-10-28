@@ -128,6 +128,26 @@ The node logs `querying client blocks [X, Y]` → `got N client blocks first=X l
 - **query_peers**: peer discovery; the response is a peer table (IP list).
 - **Error frames** [confirmed]: a type=0 frame whose payload is `0x03` + an ASCII reason, e.g. `client block round too large` (you requested rounds ahead of the peer's *committed* client-block store, which lags the live tip) or `Peer-only request`. A gateway answering from a cache should likewise only serve rounds it has, and return a comparable type=0 error otherwise.
 - **Structured error replies** [confirmed 2026-10-26]: a peer can also answer a range query with a short bincode error instead of the ASCII form. Seen for `client block round too large`: a 13-byte payload `00 01 06 fc <requested round u32 LE> fc <committed tip u32 LE>` (hl-node logs it as `client block round too large: <requested> > <tip>`). It must be treated like the ASCII error, not as a batch: a lagging peer returns it at once and would otherwise outrace a slower peer's real batch.
+- **Structured Peer-only** [confirmed 2026-10-28]: mainnet peers now refuse a range query from an IP with no 4001 relationship with the 3-byte payload `00 01 00` (error, variant 0) instead of the ASCII `Peer-only request`. The same peers serve the range once a 4001 session is open, and answer a future range with the structured round-too-large (variant 6).
+
+### 8c. What peers send to a node's public ports [confirmed 2026-10-28]
+
+One hour of everything except the gateway reaching node1's public 4001/4002 (node1 dials only the
+gateway, so all of it is other peers' doing):
+
+| Who | Count | What |
+|---|---|---|
+| QuickNode sentry (one of three) | 344 + 344, every ~10.5 s | 4001: connect, close without a byte. 4002: `query_peers` (`00 00 00 01 00 01`). Nothing else. |
+| Pool peers | ~4,200 + ~4,300 | the same reachability check and `query_peers` |
+| Pool peers | 243 | 4002 height query `00 00 00 01 00 02`; answered `02 01 fc <u32> fc <height u32> …` to anyone |
+| Pool peers | 20 | 4002 range queries (§8a); node1 served 128 MB |
+| Pool peers | 94 | 4001 greetings, 29 of them `send_abci:true`; node1 accepted the live ones (status `03`) and uploaded 6.5 GB in the hour |
+
+So a node's public ports mostly answer reachability checks, and otherwise serve strangers. The
+gateway's probe responder (README "Public probe responder") answers the checks in its place:
+connect-only probes are held until the peer closes, a greeting gets the peer-full status
+`00 00 00 01 00 04`, `query_peers` an empty table `00 00 00 02 00 01 00`, any other RPC the
+structured Peer-only (§8b). No block is served.
 
 ## 9. Full node lifecycle after startup
 

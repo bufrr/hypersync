@@ -10,5 +10,7 @@ mod probe;
 #[allow(unused_imports)]
 use self::{crawl::*, daemon::*, peers_file::*, probe::*};
 
+#[cfg(test)]
+pub(crate) use self::crawl::parse_query_peers_response;
 pub(crate) use self::daemon::run_peerd;
 pub(crate) use self::peers_file::{extract_round_tip, peer_candidates_path, read_node_peers};

@@ -8,15 +8,16 @@
 # Deployment modes:
 #   co-located (nodes on this machine):  node compose projects join the attachable gwnet below
 #     as an external network (name: hypersync_gwnet) and dial the gw's static IP 172.28.0.10.
-#     Leave gw `ports:` disabled; the host's public 4001/4002 should stay owned by the real
-#     HL node, not the gateway. Container-internal 4001/4002 do not conflict with the node.
+#     Leave gw `ports:` disabled. The host's public 4001/4002 are answered either by the node
+#     or, with `--profile public`, by the responder below (then the node publishes no ports).
+#     Container-internal 4001/4002 do not conflict with the node.
 #     Optionally add stats harvesting: docker compose -f docker-compose.yml \
 #       -f docker-compose.colocated.yml up -d
 #   remote (nodes on other machines):    expose gw only on a PRIVATE/VPN interface and firewall
 #     to node IPs. If a real HL node also runs on this host, it cannot already bind
 #     0.0.0.0:4000-4010; bind the node to the public IP and gw to the private/VPN IP. A
 #     gateway-only public IP without real HL node 4001/4002 behavior may be deprioritized by
-#     upstream peers.
+#     upstream peers: run the responder below (`--profile public`) on it.
 #
 # Env (.env): HL_SELF_IP = comma-separated public IPs of ALL your nodes (keeps your own nodes out
 # of the upstream pool — otherwise the gateway can end up relaying your nodes to each other).
@@ -80,6 +81,25 @@ services:
     # Never publish gw on the same public 4001/4002 that belongs to the real HL node:
     # ports:
     #   - "${GW_BIND_IP:?set GW_BIND_IP to a private interface IP}:4000-4010:4000-4010"
+
+  # The only public listener (README "Public probe responder"): answers upstream peers' probes of
+  # this host's 4001/4002 so the nodes need no public ports. Opt-in, because it takes the host
+  # ports a node publishes: stop publishing them from the node, then
+  #   docker compose --profile public up -d responder
+  responder:
+    image: hypersync:latest
+    container_name: hypersync-responder
+    restart: unless-stopped
+    profiles: ["public"]
+    mem_limit: 256m
+    command: ["responder"]
+    environment:
+      # only to count probes from priority peers; never logged as addresses
+      HYPERSYNC_PRIORITY_PEERS: "${HYPERSYNC_PRIORITY_PEERS:-}"
+      HYPERSYNC_PRIORITY_PEERS_EXPECTED: "${HYPERSYNC_PRIORITY_PEERS_EXPECTED:-}"
+    ports:
+      - "4001:4001"
+      - "4002:4002"
 
   peerd:
     image: hypersync:latest

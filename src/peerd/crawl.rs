@@ -53,7 +53,7 @@ fn read_hl_varint(b: &[u8]) -> Option<(u64, usize)> {
 // Parse a query_peers response payload (the bytes AFTER the 5-byte frame header). Defensive:
 // stops at the first malformed/unknown entry and returns whatever was parsed so far, never panics.
 // An error frame (payload starts 0x03) or any non-Peers payload yields an empty vec.
-fn parse_query_peers_response(payload: &[u8]) -> Vec<String> {
+pub(crate) fn parse_query_peers_response(payload: &[u8]) -> Vec<String> {
     if payload.first() != Some(&0x01) {
         return Vec::new();
     }

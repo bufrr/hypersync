@@ -15,6 +15,7 @@ priority peers ──┼─▶ hypersync gateway ─▶ your hl-node(s)
 - **peerd** discovers peers (`gossipRootIps` API + a `query_peers` crawl), probes which ones serve live blocks, and writes `peers.json` for the gateway every cycle.
 - **Priority peers** (e.g. dedicated sentries) are tried first; the public pool is the backup.
 - A node only ingests blocks from peers it dials, so each node points `root_node_ips` at the gateway and dials nothing else.
+- **responder** (optional) answers the probes upstream peers send back to the gateway host's public 4001/4002, so the nodes need no public ports (below).
 
 ## Quick start (docker compose)
 
@@ -33,7 +34,7 @@ Point each node at the gateway in `override_gossip_config.json` and restart it:
 - **Other hosts:** publish the gateway's 4000-4010 only on a private/VPN address, firewalled to your nodes. If a real node on the same host owns the public 4000-4010, bind that node to the public IP and the gateway to the private one.
 - Smoke test: `docker run --rm --network hypersync_gwnet hypersync:latest fakenode 172.28.0.10 --rpc --label smoke`
 
-> **Never publish the gateway on the internet.** Anyone who reaches it can trigger a ~5.8 GB bootstrap relay. The public 4001/4002 on your egress IP should belong to a real hl-node; upstream peers deprioritise IPs whose 4001/4002 don't answer.
+> **Never publish the gateway on the internet.** Anyone who reaches it can trigger a ~5.8 GB bootstrap relay. Upstream peers deprioritise IPs whose 4001/4002 don't answer, so the public 4001/4002 on your egress IP should be answered by a real hl-node or by the [probe responder](#public-probe-responder) — the only hypersync listener meant for the internet.
 
 ## Modes
 
@@ -43,6 +44,7 @@ Point each node at the gateway in `override_gossip_config.json` and restart it:
 | `peerd [interval-secs]` | Peer discovery and probing (default 300 s; compose uses 120). Run as its own container. |
 | `proxy <ip1,ip2,...> [--push]` | Failover proxy over a fixed upstream list instead of peerd's pool. |
 | `relay <ip>` | Plain relay of 4000-4010 to one upstream. |
+| `responder [<bind-ip>]` | Answers peers' probes on the public 4001/4002 (compose profile `public`). |
 | `fakenode <gw-ip> [--rpc] [--live-secs N] [--label X]` | Synthetic node for testing a gateway. |
 | `cache`, `mock`, `bench`, `<port> <peers>` | Testing only. |
 
@@ -50,6 +52,23 @@ Gateway flags:
 
 - **`--push`** (recommended): live blocks pass through the gateway's checks (below) instead of a raw splice, and a bad upstream ends the session so the node reconnects to a fresh one.
 - **`--cache`**: keep the full bootstrap (~5.8 GB) in memory and on disk and replay it to cold-starting nodes, avoiding the per-IP abci_state rate limit. Holds up to ~3 bootstraps at once (~17 GB: the cache plus a refresh capture and a fallback tap), which pushed a 64 GB host shared with an hl-node past hl-visor's low-memory restart threshold — so it is off by default. A capture is installed only if it ends in live blocks, but a hostile state peer could still append a few fake ones to an incomplete state; enable it only with state peers you trust. Without it, a node restart bootstraps from a peer that is serving state right now (the gateway remembers recent state servers).
+
+## Public probe responder
+
+Upstream peers, QuickNode's sentries included, check the IP that peers with them: they open its
+4001 and close it without a byte, and ask its 4002 for `query_peers`. Some pool peers also greet
+4001 to pull a live stream or ask 4002 for heights. Without an answer there, a node had to own the
+host's public 4001/4002. The responder answers instead, and nothing else:
+
+- 4001: a probe is held until the peer closes it; a greeting gets the "peer full" status, then the
+  connection closes. No block is ever sent.
+- 4002: `query_peers` gets an empty peer table; anything else gets the structured Peer-only error.
+
+It never dials out, so nothing it receives reaches a node or an upstream. Every 10 minutes it logs
+how many probes it answered and how many came from priority peers.
+
+To use it, stop publishing 4000-4010 from the node, then
+`docker compose --profile public up -d responder`.
 
 ## Configuration
 
