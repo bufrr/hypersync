@@ -859,9 +859,9 @@ pub(super) async fn wait_priority_return(
     }
 }
 
-// Resolves (once per node per `retry`) when the node's catch-up has made no progress for
-// `catchup_max` (batches keep coming, but its distance behind the freshest live round hasn't shrunk
-// by CATCHUP_PROGRESS_ROUNDS), so the node reconnects. hl-node drops the live blocks that arrive while it fetches a
+// Resolves (once per node per `retry`) when the node's catch-up has sat at one distance for
+// `catchup_max` (batches keep coming, but every distance behind the freshest live round stayed
+// within CATCHUP_PROGRESS_ROUNDS; NodeState::client_blocks_stalled), so the node reconnects. hl-node drops the live blocks that arrive while it fetches a
 // missing range over 4002, so the next live block is missing its parent again: with ~1.7 s per
 // fetch it re-fetches only what the network produced meanwhile and stays a fixed distance behind
 // (~70 s seen) for as long as the session lasts. A fresh session hands it one large range instead,
@@ -871,14 +871,16 @@ pub(super) async fn wait_catchup_stuck(node: Arc<NodeState>, timing: RepinTiming
     let watch_start = Instant::now();
     loop {
         let now = Instant::now();
-        if let Some((progress_at, behind)) =
-            node.client_blocks_stalled_since(now, timing.catchup_quiet)
+        if let Some((true, behind)) =
+            node.client_blocks_stalled(now, timing.catchup_quiet, timing.catchup_max)
         {
-            let stalled = now.saturating_duration_since(progress_at.max(watch_start));
-            if stalled >= timing.catchup_max && node.claim_catchup_cut(now, timing.retry) {
+            // watched for a full window in this session, too
+            if now.saturating_duration_since(watch_start) >= timing.catchup_max
+                && node.claim_catchup_cut(now, timing.retry)
+            {
                 return format!(
                     "{NODE_CATCHUP_STUCK} (no progress for {}s, {} rounds behind)",
-                    stalled.as_secs(),
+                    timing.catchup_max.as_secs(),
                     behind.map_or("?".to_string(), |b| b.to_string())
                 );
             }

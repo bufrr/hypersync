@@ -1,6 +1,6 @@
 use crate::protocol::unix_secs;
 use crate::util::lock;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -172,44 +172,75 @@ impl NodeState {
     }
 
     // A client-block batch was forwarded; `behind` = rounds between the gateway's freshest live
-    // round and the batch's requested start (None: tip unknown, counted as progress).
+    // round and the batch's requested start (None: tip unknown, which keeps the catch-up from
+    // counting as stalled).
     pub(super) fn mark_client_blocks_response(&self, now: Instant, behind: Option<u32>) {
         let mut run = lock(&self.last_client_blocks);
-        let next = match *run {
+        match run.as_mut() {
             Some(r) if now.saturating_duration_since(r.last) < CATCHUP_RUN_GAP => {
-                let progressed = match (r.best_behind, behind) {
-                    (Some(best), Some(b)) => best.saturating_sub(b) >= CATCHUP_PROGRESS_ROUNDS,
-                    _ => true,
-                };
-                ClientBlockRun {
-                    last: now,
-                    behind,
-                    best_behind: if progressed { behind } else { r.best_behind },
-                    progress_at: if progressed { now } else { r.progress_at },
-                    ..r
+                r.last = now;
+                r.samples.push_back((now, behind));
+                while r
+                    .samples
+                    .front()
+                    .is_some_and(|(t, _)| now.saturating_duration_since(*t) > CATCHUP_SAMPLE_SPAN)
+                {
+                    r.samples.pop_front();
+                }
+                // past the count cap: dropped samples may lie inside a window, so the run counts
+                // as starting after them (no stalled verdict until a full window is kept again)
+                while r.samples.len() > CATCHUP_MAX_SAMPLES {
+                    if let Some((t, _)) = r.samples.pop_front() {
+                        r.since = r.since.max(t);
+                    }
                 }
             }
-            _ => ClientBlockRun {
-                since: now,
-                last: now,
-                behind,
-                best_behind: behind,
-                progress_at: now,
-            },
-        };
-        *run = Some(next);
+            _ => {
+                *run = Some(ClientBlockRun {
+                    since: now,
+                    last: now,
+                    samples: VecDeque::from([(now, behind)]),
+                })
+            }
+        }
     }
 
-    // While the node is catching up (a batch within `quiet`): since when its distance behind
-    // hasn't shrunk by CATCHUP_PROGRESS_ROUNDS, and that distance now.
-    pub(super) fn client_blocks_stalled_since(
+    // While the node is catching up (a batch within `quiet`): whether its catch-up sat still over
+    // the last `window`, and its distance behind now. Still: every batch in the window stayed
+    // within CATCHUP_PROGRESS_ROUNDS of the others — hl-node's stuck loop, which re-fetches only
+    // what the network produced meanwhile and so holds a constant distance (~70 s, within a few
+    // rounds). Anything that moves is not cut: a catch-up closing in, one that lost ground and is
+    // closing in again (2026-10-28: cut while gaining 1,500 rounds), or one falling behind under
+    // heavy blocks, where a new session would only start the same catch-up over. Not still before
+    // the run is a full window old, or with an unknown tip in the window.
+    pub(super) fn client_blocks_stalled(
         &self,
         now: Instant,
         quiet: Duration,
-    ) -> Option<(Instant, Option<u32>)> {
-        lock(&self.last_client_blocks)
-            .filter(|r| now.saturating_duration_since(r.last) < quiet)
-            .map(|r| (r.progress_at, r.behind))
+        window: Duration,
+    ) -> Option<(bool, Option<u32>)> {
+        let run = lock(&self.last_client_blocks);
+        let r = run
+            .as_ref()
+            .filter(|r| now.saturating_duration_since(r.last) < quiet)?;
+        let behind = r.samples.back().and_then(|(_, b)| *b);
+        let Some(from) = now.checked_sub(window) else {
+            return Some((false, behind));
+        };
+        if r.since > from {
+            return Some((false, behind));
+        }
+        let mut in_window = r.samples.iter().filter(|(t, _)| *t > from).map(|(_, b)| *b);
+        let mut band: Option<(u32, u32)> = None;
+        let mut known = true;
+        for b in in_window.by_ref() {
+            match b {
+                Some(b) => band = Some(band.map_or((b, b), |(lo, hi)| (lo.min(b), hi.max(b)))),
+                None => known = false,
+            }
+        }
+        let still = known && band.is_some_and(|(lo, hi)| hi - lo < CATCHUP_PROGRESS_ROUNDS);
+        Some((still, behind))
     }
 
     // While the node is catching up (a batch within `quiet`): when its current run of batches
@@ -217,6 +248,7 @@ impl NodeState {
     // at each batch, so none is missed between two polls.
     pub(super) fn client_blocks_run_since(&self, now: Instant, quiet: Duration) -> Option<Instant> {
         lock(&self.last_client_blocks)
+            .as_ref()
             .filter(|r| now.saturating_duration_since(r.last) < quiet)
             .map(|r| r.since)
     }
@@ -240,18 +272,19 @@ impl NodeState {
 // A gap this long between client-block batches ends the node's catch-up run.
 pub(super) const CATCHUP_RUN_GAP: Duration = Duration::from_secs(60);
 
-// A catch-up that closes less than this on the tip (~10 s of rounds) isn't making progress.
+// A catch-up whose distance behind stays within this band (~10 s of rounds) is sitting still.
 const CATCHUP_PROGRESS_ROUNDS: u32 = 150;
 
-#[derive(Clone, Copy)]
+// How long a run's batch distances are kept: the stuck-catch-up watchdog's window
+// (select::REPIN.catchup_max, 3 min) plus slack; and at most this many (a batch every ~1 s or more).
+const CATCHUP_SAMPLE_SPAN: Duration = Duration::from_secs(5 * 60);
+const CATCHUP_MAX_SAMPLES: usize = 1024;
+
 struct ClientBlockRun {
     since: Instant,
     last: Instant,
-    // the latest batch's distance behind, the best (smallest) one that counted as progress, and
-    // when that was
-    behind: Option<u32>,
-    best_behind: Option<u32>,
-    progress_at: Instant,
+    // each recent batch: when, and its distance behind (None: tip unknown)
+    samples: VecDeque<(Instant, Option<u32>)>,
 }
 
 fn claim_every(last: &Mutex<Option<Instant>>, now: Instant, every: Duration) -> bool {
@@ -540,38 +573,94 @@ mod tests {
     }
 
     #[test]
-    fn catch_up_progress_is_a_shrinking_distance_behind() {
-        let node = NodeState::new("10.0.0.1".parse().unwrap(), 1);
-        let t0 = Instant::now();
+    fn only_a_catch_up_sitting_at_one_distance_is_stalled() {
         let s = Duration::from_secs;
-        let stalled = |t| node.client_blocks_stalled_since(t, CATCHUP_RUN_GAP);
-        // converging: every batch closes in on the tip
-        for (i, behind) in [12_000, 10_500, 9_000, 7_500].into_iter().enumerate() {
-            node.mark_client_blocks_response(t0 + s(i as u64 * 20), Some(behind));
+        let w = s(180);
+        // a run of batches every 10 s from t0 with the given distances; stalled at batch `at`?
+        let run_at = |distances: &[Option<u32>], at: usize| {
+            let node = NodeState::new("10.0.0.1".parse().unwrap(), 1);
+            let t0 = Instant::now();
+            for (i, b) in distances.iter().take(at + 1).enumerate() {
+                node.mark_client_blocks_response(t0 + s(i as u64 * 10), *b);
+            }
+            node.client_blocks_stalled(t0 + s(at as u64 * 10), CATCHUP_RUN_GAP, w)
+                .map(|r| r.0)
+        };
+        let run = |d: &[Option<u32>]| run_at(d, d.len() - 1);
+        let steps = |from: u32, step: i64, n: usize| -> Vec<Option<u32>> {
+            (0..n)
+                .map(|i| Some((from as i64 + step * i as i64) as u32))
+                .collect()
+        };
+        // hl-node's stuck loop: a constant distance, a few rounds of jitter
+        let jitter: Vec<_> = (0..40).map(|i| Some(1_060 + (i % 3) * 7)).collect();
+        assert_eq!(run(&jitter), Some(true));
+        // closing in ~20 rounds a batch
+        assert_eq!(run(&steps(9_000, -20, 40)), Some(false));
+        // the live case: lost ground (3,943 -> ~5,400) then closing in 40 a batch — at no batch of
+        // the recovery is it stalled, even while still behind where the run began
+        let mut lost = steps(3_943, 50, 30);
+        lost.extend(steps(5_400, -40, 37));
+        for at in 18..lost.len() {
+            assert_eq!(run_at(&lost, at), Some(false), "batch {at}");
         }
-        assert_eq!(stalled(t0 + s(61)), Some((t0 + s(60), Some(7_500))));
-        // a constant distance (jitter under the threshold) is no progress
-        for (i, behind) in [7_450, 7_480, 7_420, 7_470].into_iter().enumerate() {
-            node.mark_client_blocks_response(t0 + s(80 + i as u64 * 20), Some(behind));
-        }
-        assert_eq!(stalled(t0 + s(141)), Some((t0 + s(60), Some(7_470))));
-        // an unknown tip counts as progress
-        node.mark_client_blocks_response(t0 + s(150), None);
-        assert_eq!(stalled(t0 + s(151)), Some((t0 + s(150), None)));
-        // exactly the threshold counts; one round short doesn't; no overflow at the top
-        node.mark_client_blocks_response(t0 + s(152), Some(5_000));
-        node.mark_client_blocks_response(t0 + s(154), Some(5_000 - CATCHUP_PROGRESS_ROUNDS));
-        assert_eq!(stalled(t0 + s(155)).map(|r| r.0), Some(t0 + s(154)));
-        node.mark_client_blocks_response(t0 + s(156), Some(5_001 - 2 * CATCHUP_PROGRESS_ROUNDS));
-        assert_eq!(stalled(t0 + s(157)).map(|r| r.0), Some(t0 + s(154)));
-        let top = NodeState::new("10.0.0.2".parse().unwrap(), 1);
-        top.mark_client_blocks_response(t0, Some(u32::MAX));
-        top.mark_client_blocks_response(t0 + s(10), Some(u32::MAX));
+        // ...then stuck at the tip's fixed distance: stalled once a full window sits still
+        let turn = lost.len();
+        lost.extend(vec![Some(3_960); 19]);
         assert_eq!(
-            top.client_blocks_stalled_since(t0 + s(11), CATCHUP_RUN_GAP)
+            run_at(&lost, turn + 10),
+            Some(false),
+            "the window still holds the recovery"
+        );
+        assert_eq!(run_at(&lost, turn + 18), Some(true));
+        // falling behind under heavy blocks, or swinging widely: not cut (a new session would
+        // only start the same catch-up over)
+        assert_eq!(run(&steps(5_000, 15, 40)), Some(false));
+        let swing: Vec<_> = (0..40)
+            .map(|i| Some(if i % 2 == 0 { 5_000 } else { 5_200 }))
+            .collect();
+        assert_eq!(run(&swing), Some(false));
+        // not before a full window, nor with an unknown tip in it
+        assert_eq!(run(&[Some(900); 18]), Some(false));
+        let mut unknown = vec![Some(900); 40];
+        unknown[35] = None;
+        assert_eq!(run(&unknown), Some(false));
+        // the band: 149 rounds of spread is still, 150 is moving; no overflow at the top
+        let spread = |hi: u32| -> Vec<Option<u32>> {
+            (0..40)
+                .map(|i| Some(if i % 2 == 0 { 5_000 } else { hi }))
+                .collect()
+        };
+        assert_eq!(
+            run(&spread(5_000 + CATCHUP_PROGRESS_ROUNDS - 1)),
+            Some(true)
+        );
+        assert_eq!(run(&spread(5_000 + CATCHUP_PROGRESS_ROUNDS)), Some(false));
+        assert_eq!(run(&[Some(u32::MAX); 40]), Some(true));
+        // past the count cap the run counts as starting after the dropped samples
+        let capped = NodeState::new("10.0.0.3".parse().unwrap(), 1);
+        let t0 = Instant::now();
+        // 10 batches/s for 200 s: the run is a full window old, the kept 1,024 span ~102 s
+        let n = 2_000;
+        for i in 0..n {
+            capped
+                .mark_client_blocks_response(t0 + Duration::from_millis(i as u64 * 100), Some(900));
+        }
+        let end = t0 + Duration::from_millis((n as u64 - 1) * 100);
+        assert_eq!(
+            capped
+                .client_blocks_stalled(end, CATCHUP_RUN_GAP, w)
                 .map(|r| r.0),
-            Some(t0),
-            "a constant u32::MAX distance is no progress"
+            Some(false),
+            "the kept samples span under a window"
+        );
+        // quiet past `quiet`: not catching up at all
+        let node = NodeState::new("10.0.0.2".parse().unwrap(), 1);
+        let t0 = Instant::now();
+        node.mark_client_blocks_response(t0, Some(900));
+        assert_eq!(
+            node.client_blocks_stalled(t0 + CATCHUP_RUN_GAP, CATCHUP_RUN_GAP, w),
+            None
         );
     }
 
