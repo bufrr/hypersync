@@ -72,6 +72,8 @@ pub(super) struct NodeState {
     // batches began (a run: no CATCHUP_RUN_GAP between batches): a catching-up node pulls a
     // batch every few seconds, one at the tip almost never
     last_client_blocks: Mutex<Option<ClientBlockRun>>,
+    // the next client-block range, fetched while the node processes the current one
+    pub(super) prefetch: Mutex<Option<super::client_blocks::Prefetch>>,
 }
 
 impl NodeState {
@@ -90,6 +92,7 @@ impl NodeState {
             last_repin_attempt: Mutex::new(None),
             last_catchup_cut: Mutex::new(None),
             last_client_blocks: Mutex::new(None),
+            prefetch: Mutex::new(None),
         }
     }
 
@@ -102,11 +105,19 @@ impl NodeState {
             ip: ip.to_string(),
             epoch: self.next_active_epoch.fetch_add(1, Ordering::AcqRel) + 1,
         };
+        // a client-block range prefetched for the previous session is neither served into this
+        // one nor left running (its fetch would keep acting on the old session's peers)
+        drop(lock(&self.prefetch).take());
         let mut active = lock(&self.active);
         *active = Some(peer.clone());
         self.lazy_active.store(false, Ordering::Release);
         *lock(&self.rpc_peer) = None;
         peer
+    }
+
+    // Changes whenever a new pin (real or lazy) is made; unpinning alone leaves it.
+    pub(super) fn pin_generation(&self) -> u64 {
+        self.next_active_epoch.load(Ordering::Acquire)
     }
 
     pub(super) fn pin_lazy_active(&self, ip: &str) -> ActivePeer {
@@ -119,6 +130,8 @@ impl NodeState {
             ip: ip.to_string(),
             epoch: self.next_active_epoch.fetch_add(1, Ordering::AcqRel) + 1,
         };
+        // as in pin_active: a prefetch from before this pin is neither served nor left running
+        drop(lock(&self.prefetch).take());
         *active = Some(peer.clone());
         self.lazy_active.store(true, Ordering::Release);
         peer

@@ -185,14 +185,201 @@ fn active_answers_first(priority: &PriorityTier, ip: &str) -> bool {
 }
 
 // A client-block range query (docs/hl-p2p-protocol.md §8a): a type-0 frame whose 11-byte payload
-// is the 0x00 tag and two 0xfc-prefixed u32 rounds. Returns its start round.
-fn client_block_range_start(req: &[u8]) -> Option<u32> {
+// is the 0x00 tag and two 0xfc-prefixed u32 rounds. Returns its closed range [start, end].
+fn client_block_range(req: &[u8]) -> Option<(u32, u32)> {
     let range = req.len() == 16
         && req[..5] == [0, 0, 0, 11, 0]
         && req[5] == 0
         && req[6] == 0xfc
         && req[11] == 0xfc;
-    range.then(|| u32::from_le_bytes([req[7], req[8], req[9], req[10]]))
+    range.then(|| {
+        (
+            u32::from_le_bytes([req[7], req[8], req[9], req[10]]),
+            u32::from_le_bytes([req[12], req[13], req[14], req[15]]),
+        )
+    })
+}
+
+fn client_block_range_request(start: u32, end: u32) -> Vec<u8> {
+    let mut req = vec![0, 0, 0, 11, 0, 0, 0xfc];
+    req.extend_from_slice(&start.to_le_bytes());
+    req.push(0xfc);
+    req.extend_from_slice(&end.to_le_bytes());
+    req
+}
+
+// ---- next-range prefetch ----
+//
+// A catching-up node walks contiguous ranges one request at a time: it asks for [e+1, e+W] only
+// once it has processed [s, e]. Under heavy blocks (30-40 MB per 100 rounds, ~4.5 s from the
+// upstream plus ~3.5 s in the node) that is ~12.5 rounds/s, below mainnet's ~14.8, so a node that
+// fell behind never caught up (2026-10-28: 800+ s behind for an hour). Once a batch is answered,
+// the next range is fetched while the node works through this one, and served when asked.
+
+// a prefetch not taken by then is dropped, with its batch and memory budget (the node stalled or
+// went elsewhere; it re-asks anyway)
+const PREFETCH_MAX_AGE: Duration = Duration::from_secs(20);
+// prefetches running at once, gateway-wide: their own limit, so they never take the fetch slots
+// real requests need (4 x a 64 MB batch is also well inside the shared response byte budget)
+static PREFETCH_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+static PREFETCH_IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+// only while the next range ends this far below the freshest live round: peers serve committed
+// client blocks, which trail the live tip, and refuse past them ("round too large")
+const PREFETCH_TIP_MARGIN: u32 = 300;
+// the widest range prefetched (nodes ask for 100 rounds)
+const PREFETCH_MAX_WIDTH: u32 = 1_000;
+
+// The range to prefetch after [start, end] was answered, if the node is still behind enough.
+fn next_prefetch_range(start: u32, end: u32, freshest: u32) -> Option<(u32, u32)> {
+    let width = end.checked_sub(start)?.checked_add(1)?;
+    if width > PREFETCH_MAX_WIDTH {
+        return None;
+    }
+    let next_start = end.checked_add(1)?;
+    let next_end = end.checked_add(width)?;
+    (freshest.checked_sub(next_end)? >= PREFETCH_TIP_MARGIN).then_some((next_start, next_end))
+}
+
+// One node's prefetched next range; the fetch is aborted when this is dropped unused.
+//
+// The fetch is the node's own next request made early, so its side effects are the ones that
+// request would have: a priority peer that fails it cools down, a hedge winner is remembered, an
+// active answering Peer-only is unpinned. A new pin cancels it (NodeState::pin_active).
+pub(super) struct Prefetch {
+    id: u64,
+    start: u32,
+    end: u32,
+    // the node's pin generation when the fetch began: a batch fetched under one session isn't
+    // served into another (an unpin, e.g. the active refusing it as Peer-only, keeps it valid:
+    // the fetch hedged elsewhere exactly as the node's request would have)
+    generation: u64,
+    at: Instant,
+    task: Option<tokio::task::JoinHandle<Result<BudgetedFrame, String>>>,
+}
+
+impl Drop for Prefetch {
+    fn drop(&mut self) {
+        if let Some(t) = self.task.take() {
+            t.abort();
+        }
+    }
+}
+
+impl Prefetch {
+    fn serves(&self, start: u32, end: u32, generation: u64, now: Instant) -> bool {
+        self.start == start
+            && self.end == end
+            && self.generation == generation
+            && now.saturating_duration_since(self.at) <= PREFETCH_MAX_AGE
+    }
+}
+
+// The node's prefetch for exactly [start, end] under its current pin generation, if any.
+// Whatever was prefetched is taken out either way: a node asking for anything else has moved on.
+fn take_prefetch(node: &NodeState, start: u32, end: u32) -> Option<Prefetch> {
+    let p = lock(&node.prefetch).take()?;
+    p.serves(start, end, node.pin_generation(), Instant::now())
+        .then_some(p)
+}
+
+// Drop prefetch `id` if it is still waiting to be taken.
+fn expire_prefetch(node: &std::sync::Weak<NodeState>, id: u64) {
+    let Some(node) = node.upgrade() else {
+        return;
+    };
+    let mut slot = lock(&node.prefetch);
+    if slot.as_ref().is_some_and(|p| p.id == id) {
+        let stale = slot.take();
+        drop(slot);
+        drop(stale);
+    }
+}
+
+// Fetch [start, end] for the node in the background, replacing any earlier prefetch; dropped
+// after PREFETCH_MAX_AGE if not taken. Skipped when PREFETCH_SLOTS are all busy.
+fn start_prefetch(
+    node: &Arc<NodeState>,
+    priority: &Arc<PriorityTier>,
+    peers: &[String],
+    rr: &Arc<AtomicUsize>,
+    (start, end): (u32, u32),
+) {
+    let Ok(slot) = PREFETCH_SLOTS.try_acquire() else {
+        return;
+    };
+    let generation = node.pin_generation();
+    let id = PREFETCH_IDS.fetch_add(1, Ordering::Relaxed);
+    let (n, prio, peers, rr) = (node.clone(), priority.clone(), peers.to_vec(), rr.clone());
+    let task = tokio::spawn(async move {
+        let _slot = slot;
+        let req = Arc::new(client_block_range_request(start, end));
+        timeout(
+            CLIENT_BLOCK_FETCH_DEADLINE,
+            fetch_client_blocks_raced(&n, &prio, &peers, &rr, req),
+        )
+        .await
+        .unwrap_or_else(|_| Err("prefetch deadline".to_string()))
+    });
+    let p = Prefetch {
+        id,
+        start,
+        end,
+        generation,
+        at: Instant::now(),
+        task: Some(task),
+    };
+    {
+        // installed under the slot's lock, after re-checking the generation: pin_active bumps the
+        // generation before it takes this lock, so a re-pin either is seen here or drops it there
+        let mut slot = lock(&node.prefetch);
+        if node.pin_generation() != generation {
+            drop(slot);
+            drop(p);
+            return;
+        }
+        *slot = Some(p);
+    }
+    let weak = Arc::downgrade(node);
+    tokio::spawn(async move {
+        tokio::time::sleep(PREFETCH_MAX_AGE).await;
+        expire_prefetch(&weak, id);
+    });
+}
+
+// how often a request waiting on a prefetch checks for a re-pin
+const PREFETCH_PIN_CHECK: Duration = Duration::from_millis(100);
+
+// Wait (within the request's budget) for a prefetched batch; None when it failed, isn't a batch,
+// or the node was re-pinned meanwhile (then the fetch is aborted at once rather than awaited), so
+// the request is fetched as usual.
+async fn await_prefetch(mut p: Prefetch, node: &NodeState) -> Option<BudgetedFrame> {
+    let started = Instant::now();
+    let deadline = started + CLIENT_BLOCK_FETCH_DEADLINE;
+    let mut task = p.task.take()?;
+    let joined = loop {
+        if node.pin_generation() != p.generation || Instant::now() >= deadline {
+            task.abort();
+            return None;
+        }
+        if let Ok(joined) = timeout(PREFETCH_PIN_CHECK, &mut task).await {
+            break joined;
+        }
+    };
+    let frame = match joined {
+        Ok(Ok(frame)) if frame.get(4) == Some(&1) => frame,
+        _ => return None,
+    };
+    if node.pin_generation() != p.generation {
+        return None;
+    }
+    gwlog!(
+        "[gw] [{}] 4002 prefetched range {}..={} served (waited {}ms)",
+        node.ip,
+        p.start,
+        p.end,
+        started.elapsed().as_millis()
+    );
+    Some(frame)
 }
 
 async fn wait_active_session(node: &NodeState, budget: Duration) -> Option<ActivePeer> {
@@ -560,33 +747,51 @@ pub(super) async fn serve_client_blocks(
     }
     let mut req = hdr.to_vec();
     req.extend_from_slice(&payload);
-    let range_start = client_block_range_start(&req);
+    let range = client_block_range(&req);
 
-    // Gateway-wide bound on concurrent fetches: each one can hold up to ~9 upstream attempts with
-    // multi-MB responses. A catch-up node sends one request at a time, so 8 is far above normal.
-    let Ok(Ok(_slot)) = timeout(Duration::from_secs(5), CLIENT_BLOCK_FETCH_SLOTS.acquire()).await
-    else {
-        gwlog!("[gw] [{}] 4002 client-block fetch busy; closing", node.ip);
-        return;
+    let prefetched = match range.and_then(|(s, e)| take_prefetch(&node, s, e)) {
+        Some(p) => await_prefetch(p, &node).await,
+        None => None,
     };
-    let fetched = timeout(
-        CLIENT_BLOCK_FETCH_DEADLINE,
-        fetch_client_blocks_raced(&node, &priority, &peers, &rr, Arc::new(req)),
-    )
-    .await
-    .unwrap_or_else(|_| {
-        Err(format!(
-            "deadline {}s",
-            CLIENT_BLOCK_FETCH_DEADLINE.as_secs()
-        ))
-    });
+    let fetched = match prefetched {
+        Some(frame) => Ok(frame),
+        None => {
+            // Gateway-wide bound on concurrent fetches: each one can hold up to ~9 upstream
+            // attempts with multi-MB responses. A catch-up node sends one request at a time (plus
+            // one prefetch), so 8 is far above normal.
+            let Ok(Ok(_slot)) =
+                timeout(Duration::from_secs(5), CLIENT_BLOCK_FETCH_SLOTS.acquire()).await
+            else {
+                gwlog!("[gw] [{}] 4002 client-block fetch busy; closing", node.ip);
+                return;
+            };
+            timeout(
+                CLIENT_BLOCK_FETCH_DEADLINE,
+                fetch_client_blocks_raced(&node, &priority, &peers, &rr, Arc::new(req)),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(format!(
+                    "deadline {}s",
+                    CLIENT_BLOCK_FETCH_DEADLINE.as_secs()
+                ))
+            })
+        }
+    };
     match fetched {
         Ok(frame) => {
             // only a batch answering a range query is catch-up: not a tip/terminal error frame
             // (type 0), nor a height query or query_peers
-            if let Some(start) = range_start.filter(|_| frame.get(4) == Some(&1)) {
-                let behind = freshest.get().map(|tip| tip.saturating_sub(start));
-                node.mark_client_blocks_response(Instant::now(), behind);
+            if let Some((start, end)) = range.filter(|_| frame.get(4) == Some(&1)) {
+                let tip = freshest.get();
+                node.mark_client_blocks_response(
+                    Instant::now(),
+                    tip.map(|t| t.saturating_sub(start)),
+                );
+                // the node's next request, fetched while it processes this batch
+                if let Some(next) = tip.and_then(|t| next_prefetch_range(start, end, t)) {
+                    start_prefetch(&node, &priority, &peers, &rr, next);
+                }
             }
             let _ = timeout(NODE_WRITE_TIMEOUT, down.write_all(&frame)).await;
         }
@@ -753,15 +958,243 @@ mod tests {
         let range = [
             0, 0, 0, 11, 0, 0, 0xfc, 0x8e, 0x26, 0x81, 0x50, 0xfc, 0xf1, 0x26, 0x81, 0x50,
         ];
-        assert_eq!(
-            client_block_range_start(&range),
-            Some(u32::from_le_bytes([0x8e, 0x26, 0x81, 0x50]))
+        let (start, end) = (
+            u32::from_le_bytes([0x8e, 0x26, 0x81, 0x50]),
+            u32::from_le_bytes([0xf1, 0x26, 0x81, 0x50]),
         );
+        assert_eq!(client_block_range(&range), Some((start, end)));
+        assert_eq!(client_block_range_request(start, end), range);
         let mut other_tag = range;
         other_tag[5] = 1;
-        assert_eq!(client_block_range_start(&other_tag), None);
-        assert_eq!(client_block_range_start(&range[..15]), None);
-        assert_eq!(client_block_range_start(&[0, 0, 0, 1, 0, 2]), None);
+        assert_eq!(client_block_range(&other_tag), None);
+        assert_eq!(client_block_range(&range[..15]), None);
+        assert_eq!(client_block_range(&[0, 0, 0, 1, 0, 2]), None);
+    }
+
+    #[test]
+    fn the_next_range_is_prefetched_only_well_behind_the_tip() {
+        // the node's next 100 rounds, while they end 300+ below the freshest round
+        assert_eq!(
+            next_prefetch_range(1_000, 1_099, 1_499),
+            Some((1_100, 1_199))
+        );
+        assert_eq!(next_prefetch_range(1_000, 1_099, 1_498), None);
+        // malformed or huge ranges, and overflow at the top of u32
+        assert_eq!(next_prefetch_range(1_099, 1_000, u32::MAX), None);
+        assert_eq!(next_prefetch_range(0, 5_000, u32::MAX), None);
+        assert_eq!(next_prefetch_range(u32::MAX - 50, u32::MAX, u32::MAX), None);
+        // the margin holds at the top of u32 too
+        assert_eq!(
+            next_prefetch_range(u32::MAX - 250, u32::MAX - 151, u32::MAX),
+            None
+        );
+    }
+
+    fn test_prefetch(id: u64, generation: u64, at: Instant) -> Prefetch {
+        Prefetch {
+            id,
+            start: 100,
+            end: 199,
+            generation,
+            at,
+            task: None,
+        }
+    }
+
+    // a type-1 batch holding its share of the response byte budget, after `delay_ms`
+    fn delayed_batch(delay_ms: u64) -> tokio::task::JoinHandle<Result<BudgetedFrame, String>> {
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            let budget = CLIENT_BLOCK_RESPONSE_BYTES.acquire_many(6).await.unwrap();
+            Ok(BudgetedFrame {
+                bytes: vec![0, 0, 0, 1, 1, 0],
+                _budget: budget,
+            })
+        })
+    }
+
+    #[test]
+    fn a_prefetch_serves_only_its_range_under_the_same_pin_generation_while_fresh() {
+        let now = Instant::now();
+        assert!(test_prefetch(1, 3, now).serves(100, 199, 3, now));
+        assert!(!test_prefetch(1, 3, now).serves(100, 198, 3, now));
+        assert!(!test_prefetch(1, 3, now).serves(100, 199, 4, now));
+        let old = now - PREFETCH_MAX_AGE - Duration::from_secs(1);
+        assert!(!test_prefetch(1, 3, old).serves(100, 199, 3, now));
+    }
+
+    // A started prefetch is installed under the current pin generation, and a re-pin drops it.
+    // (The window between reading the generation and installing is closed by the re-check under
+    // the slot's lock; it is too narrow to hit reliably from a test.)
+    #[tokio::test]
+    async fn a_started_prefetch_carries_its_generation_and_a_re_pin_drops_it() {
+        let node = Arc::new(NodeState::new("10.0.0.9".parse().unwrap(), 1));
+        node.pin_active("1.2.3.4");
+        let tier = exclusive_tier("127.0.0.1");
+        let rr = Arc::new(AtomicUsize::new(0));
+        let before = node.pin_generation();
+        start_prefetch(&node, &tier, &[], &rr, (100, 199));
+        assert!(lock(&node.prefetch)
+            .as_ref()
+            .is_some_and(|p| p.generation == before));
+        node.pin_active("5.6.7.8");
+        assert!(lock(&node.prefetch).is_none());
+    }
+
+    #[test]
+    fn a_new_pin_cancels_a_prefetch_and_an_unpin_keeps_it() {
+        let node = NodeState::new("10.0.0.9".parse().unwrap(), 1);
+        let pin = node.pin_active("1.2.3.4");
+        // the active refusing the fetch as Peer-only unpins it: the hedged batch stays usable
+        *lock(&node.prefetch) = Some(test_prefetch(1, node.pin_generation(), Instant::now()));
+        node.clear_active_if_current(&pin);
+        assert!(take_prefetch(&node, 100, 199).is_some());
+        // a new session drops it at once
+        *lock(&node.prefetch) = Some(test_prefetch(2, node.pin_generation(), Instant::now()));
+        node.pin_active("1.2.3.4");
+        assert!(lock(&node.prefetch).is_none());
+        // asking for another range takes it out too
+        *lock(&node.prefetch) = Some(test_prefetch(3, node.pin_generation(), Instant::now()));
+        assert!(take_prefetch(&node, 200, 299).is_none());
+        assert!(lock(&node.prefetch).is_none(), "taken out either way");
+    }
+
+    // An unused prefetch is dropped on its own (with its batch and byte budget), not only when the
+    // node asks again; a later prefetch in the slot is left alone.
+    #[tokio::test]
+    async fn an_abandoned_prefetch_expires_and_releases_its_batch() {
+        let node = Arc::new(NodeState::new("10.0.0.9".parse().unwrap(), 1));
+        let task = delayed_batch(0);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            task.is_finished(),
+            "the batch was fetched and is being held"
+        );
+        let mut p = test_prefetch(7, node.pin_generation(), Instant::now());
+        p.task = Some(task);
+        *lock(&node.prefetch) = Some(p);
+        expire_prefetch(&Arc::downgrade(&node), 8);
+        assert!(lock(&node.prefetch).is_some(), "another id: not this one");
+        expire_prefetch(&Arc::downgrade(&node), 7);
+        assert!(lock(&node.prefetch).is_none());
+    }
+
+    // A re-pin while the node waits on an in-flight prefetch: the old session's batch isn't served.
+    #[tokio::test]
+    async fn a_re_pin_during_the_wait_discards_the_prefetched_batch() {
+        let node = Arc::new(NodeState::new("10.0.0.9".parse().unwrap(), 1));
+        node.pin_active("1.2.3.4");
+        let mut p = test_prefetch(1, node.pin_generation(), Instant::now());
+        p.task = Some(delayed_batch(300));
+        *lock(&node.prefetch) = Some(p);
+        let taken = take_prefetch(&node, 100, 199).expect("valid when taken");
+        let n = node.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            n.pin_active("5.6.7.8");
+        });
+        let t0 = Instant::now();
+        assert!(await_prefetch(taken, &node).await.is_none());
+        assert!(
+            t0.elapsed() < Duration::from_millis(280),
+            "the old fetch is abandoned at the re-pin, not awaited"
+        );
+        // without a re-pin the same wait serves it
+        let mut p = test_prefetch(2, node.pin_generation(), Instant::now());
+        p.task = Some(delayed_batch(100));
+        assert!(await_prefetch(p, &node).await.is_some());
+    }
+
+    // End to end: after the node's batch for one range, the gateway asks the upstream for the next
+    // range by itself, and the node's request for it is answered from that without a second ask.
+    #[tokio::test]
+    async fn a_catching_up_node_gets_its_next_range_prefetched() {
+        let up = "127.0.0.47";
+        let Ok(l) = tokio::net::TcpListener::bind((up, 4002)).await else {
+            eprintln!("skipped: loopback 4002 taken");
+            return;
+        };
+        let seen: Arc<std::sync::Mutex<Vec<(u32, u32)>>> = Arc::default();
+        let log = seen.clone();
+        let upstream = tokio::spawn(async move {
+            while let Ok((mut s, _)) = l.accept().await {
+                let log = log.clone();
+                tokio::spawn(async move {
+                    let mut req = [0u8; 16];
+                    if s.read_exact(&mut req).await.is_ok() {
+                        let r = client_block_range(&req).unwrap();
+                        lock(&log).push(r);
+                        // a type-1 batch whose payload names the range it answers
+                        let mut frame = 11u32.to_be_bytes().to_vec();
+                        frame.push(1);
+                        frame.extend_from_slice(&req[5..]);
+                        let _ = s.write_all(&frame).await;
+                    }
+                });
+            }
+        });
+        let tier = exclusive_tier(up);
+        let node = Arc::new(NodeState::new("10.0.0.9".parse().unwrap(), 1));
+        node.pin_active(up);
+        let tip = Arc::new(std::sync::atomic::AtomicU32::new(1_000_000));
+        let freshest = Arc::new(crate::push::FreshestRound::new(
+            100,
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+            tip,
+        ));
+        let (fa, fb) = (freshest.feed("a"), freshest.feed("b"));
+        fa.offer(1_000_000);
+        fb.offer(1_000_000);
+        let rr = Arc::new(AtomicUsize::new(0));
+        let ask = |start: u32| {
+            let (node, tier, freshest, rr) =
+                (node.clone(), tier.clone(), freshest.clone(), rr.clone());
+            async move {
+                let gw = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = gw.local_addr().unwrap();
+                let serve = tokio::spawn(async move {
+                    let (down, _) = gw.accept().await.unwrap();
+                    serve_client_blocks(down, node, tier, Vec::new(), rr, freshest).await;
+                });
+                let mut c = TcpStream::connect(addr).await.unwrap();
+                c.write_all(&client_block_range_request(start, start + 99))
+                    .await
+                    .unwrap();
+                let mut out = vec![0u8; 16];
+                timeout(Duration::from_secs(10), c.read_exact(&mut out))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                serve.await.unwrap();
+                out
+            }
+        };
+        let first = ask(990_000).await;
+        assert_eq!(
+            client_block_range(&[&[0, 0, 0, 11, 0][..], &first[5..]].concat()),
+            Some((990_000, 990_099))
+        );
+        // the gateway asked for the next range on its own
+        for _ in 0..50 {
+            if lock(&seen).contains(&(990_100, 990_199)) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(*lock(&seen), [(990_000, 990_099), (990_100, 990_199)]);
+        // ...and the node's request for it is answered from that, not asked again
+        let second = ask(990_100).await;
+        assert_eq!(&second[7..11], &990_100u32.to_le_bytes());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let seen = lock(&seen).clone();
+        assert_eq!(seen.iter().filter(|r| r.0 == 990_100).count(), 1);
+        assert!(
+            seen.contains(&(990_200, 990_299)),
+            "the next one is prefetched"
+        );
+        drop((fa, fb));
+        upstream.abort();
     }
 
     #[test]
