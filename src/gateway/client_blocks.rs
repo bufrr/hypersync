@@ -787,6 +787,7 @@ pub(super) async fn serve_client_blocks(
                 node.mark_client_blocks_response(
                     Instant::now(),
                     tip.map(|t| t.saturating_sub(start)),
+                    end.saturating_sub(start).saturating_add(1),
                 );
                 // the node's next request, fetched while it processes this batch
                 if let Some(next) = tip.and_then(|t| next_prefetch_range(start, end, t)) {

@@ -1604,7 +1604,7 @@ mod tests {
             let node = node.clone();
             tokio::spawn(async move {
                 loop {
-                    node.mark_client_blocks_response(Instant::now(), None);
+                    node.mark_client_blocks_response(Instant::now(), None, 100);
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
             })
@@ -1673,7 +1673,8 @@ mod tests {
             tokio::spawn(async move {
                 // the stuck loop: batches keep coming at a constant distance behind the tip
                 loop {
-                    node.mark_client_blocks_response(Instant::now(), Some(900));
+                    // the stuck loop: small ranges at a constant distance
+                    node.mark_client_blocks_response(Instant::now(), Some(900), 27);
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
             })
@@ -1710,7 +1711,7 @@ mod tests {
             tokio::spawn(async move {
                 let mut behind = 60_000u32;
                 loop {
-                    node.mark_client_blocks_response(Instant::now(), Some(behind));
+                    node.mark_client_blocks_response(Instant::now(), Some(behind), 100);
                     behind = behind.saturating_sub(200);
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
@@ -1725,7 +1726,7 @@ mod tests {
         feeder.abort();
         // a node that catches up normally (quiet gaps) is never cut
         let calm = Arc::new(NodeState::new("10.0.0.8".parse().unwrap(), 1));
-        calm.mark_client_blocks_response(Instant::now(), None);
+        calm.mark_client_blocks_response(Instant::now(), None, 100);
         assert!(timeout(
             Duration::from_secs(3),
             wait_catchup_stuck(calm, fast_repin())
@@ -1744,7 +1745,7 @@ mod tests {
             let node = node.clone();
             tokio::spawn(async move {
                 loop {
-                    node.mark_client_blocks_response(Instant::now(), None);
+                    node.mark_client_blocks_response(Instant::now(), None, 100);
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
             })

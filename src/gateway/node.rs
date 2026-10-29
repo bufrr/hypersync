@@ -173,24 +173,27 @@ impl NodeState {
 
     // A client-block batch was forwarded; `behind` = rounds between the gateway's freshest live
     // round and the batch's requested start (None: tip unknown, which keeps the catch-up from
-    // counting as stalled).
-    pub(super) fn mark_client_blocks_response(&self, now: Instant, behind: Option<u32>) {
+    // counting as stalled); `width` = rounds the request asked for.
+    pub(super) fn mark_client_blocks_response(
+        &self,
+        now: Instant,
+        behind: Option<u32>,
+        width: u32,
+    ) {
         let mut run = lock(&self.last_client_blocks);
         match run.as_mut() {
             Some(r) if now.saturating_duration_since(r.last) < CATCHUP_RUN_GAP => {
                 r.last = now;
-                r.samples.push_back((now, behind));
-                while r
-                    .samples
-                    .front()
-                    .is_some_and(|(t, _)| now.saturating_duration_since(*t) > CATCHUP_SAMPLE_SPAN)
-                {
+                r.samples.push_back((now, behind, width));
+                while r.samples.front().is_some_and(|(t, _, _)| {
+                    now.saturating_duration_since(*t) > CATCHUP_SAMPLE_SPAN
+                }) {
                     r.samples.pop_front();
                 }
                 // past the count cap: dropped samples may lie inside a window, so the run counts
                 // as starting after them (no stalled verdict until a full window is kept again)
                 while r.samples.len() > CATCHUP_MAX_SAMPLES {
-                    if let Some((t, _)) = r.samples.pop_front() {
+                    if let Some((t, _, _)) = r.samples.pop_front() {
                         r.since = r.since.max(t);
                     }
                 }
@@ -199,7 +202,7 @@ impl NodeState {
                 *run = Some(ClientBlockRun {
                     since: now,
                     last: now,
-                    samples: VecDeque::from([(now, behind)]),
+                    samples: VecDeque::from([(now, behind, width)]),
                 })
             }
         }
@@ -223,7 +226,7 @@ impl NodeState {
         let r = run
             .as_ref()
             .filter(|r| now.saturating_duration_since(r.last) < quiet)?;
-        let behind = r.samples.back().and_then(|(_, b)| *b);
+        let behind = r.samples.back().and_then(|(_, b, _)| *b);
         let Some(from) = now.checked_sub(window) else {
             return Some((false, behind));
         };
@@ -233,8 +236,8 @@ impl NodeState {
         let in_window: Option<Vec<u32>> = r
             .samples
             .iter()
-            .filter(|(t, _)| *t > from)
-            .map(|(_, b)| *b)
+            .filter(|(t, _, _)| *t > from)
+            .map(|(_, b, _)| *b)
             .collect();
         let Some(d) = in_window.filter(|d| !d.is_empty()) else {
             return Some((false, behind));
@@ -247,7 +250,18 @@ impl NodeState {
         let third = (d.len() / 3).max(1);
         let closing = median(&d[..third]).saturating_sub(median(&d[d.len() - third..]))
             >= CATCHUP_CLOSING_ROUNDS;
-        let still = hi - lo < CATCHUP_PROGRESS_ROUNDS && !closing;
+        // ...and asking for the loop's small ranges: it re-fetches only what the network produced
+        // during its last fetch (~20-40 rounds), while a catch-up that merely keeps pace with heavy
+        // blocks walks full 100-round windows (2026-10-29: cut at 7,008 behind, plateaued, all
+        // 100-round requests; a new session can't help that)
+        let widths: Vec<u32> = r
+            .samples
+            .iter()
+            .filter(|(t, _, _)| *t > from)
+            .map(|(_, _, w)| *w)
+            .collect();
+        let small_ranges = median(&widths) < CATCHUP_LOOP_MAX_WIDTH;
+        let still = hi - lo < CATCHUP_PROGRESS_ROUNDS && !closing && small_ranges;
         Some((still, behind))
     }
 
@@ -285,6 +299,9 @@ const CATCHUP_PROGRESS_ROUNDS: u32 = 150;
 // ...unless it closed in by this much over the window (~3 s of rounds; the loop's jitter nets ~0)
 const CATCHUP_CLOSING_ROUNDS: u32 = 50;
 
+// The stuck loop's ranges are ~20-40 rounds (live: 19-37, median 27); a walking catch-up asks for 100.
+const CATCHUP_LOOP_MAX_WIDTH: u32 = 64;
+
 fn median(v: &[u32]) -> u32 {
     let mut s = v.to_vec();
     s.sort_unstable();
@@ -299,8 +316,8 @@ const CATCHUP_MAX_SAMPLES: usize = 1024;
 struct ClientBlockRun {
     since: Instant,
     last: Instant,
-    // each recent batch: when, and its distance behind (None: tip unknown)
-    samples: VecDeque<(Instant, Option<u32>)>,
+    // each recent batch: when, its distance behind (None: tip unknown), and its range's width
+    samples: VecDeque<(Instant, Option<u32>, u32)>,
 }
 
 fn claim_every(last: &Mutex<Option<Instant>>, now: Instant, every: Duration) -> bool {
@@ -407,6 +424,9 @@ impl NodeRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // the stuck loop's request width (live: 19-37 rounds, median 27)
+    const LOOP_WIDTH: u32 = 27;
     use crate::priority::BootstrapPolicy;
 
     #[test]
@@ -580,7 +600,7 @@ mod tests {
             node.client_blocks_run_since(t0, quiet).is_none(),
             "never fetched: quiet"
         );
-        node.mark_client_blocks_response(t0, None);
+        node.mark_client_blocks_response(t0, None, 100);
         assert_eq!(
             node.client_blocks_run_since(t0 + Duration::from_secs(59), quiet),
             Some(t0)
@@ -591,13 +611,30 @@ mod tests {
     #[test]
     fn only_a_catch_up_sitting_at_one_distance_is_stalled() {
         let s = Duration::from_secs;
+        // a flat distance walked in full 100-round windows is a catch-up keeping pace with heavy
+        // blocks (the live case: plateaued at 7,008 behind), not the small-range loop
+        let walking = NodeState::new("10.0.0.4".parse().unwrap(), 1);
+        let t0 = Instant::now();
+        for i in 0..40u64 {
+            walking.mark_client_blocks_response(
+                t0 + s(i * 10),
+                Some(7_000 + (i % 3) as u32 * 5),
+                100,
+            );
+        }
+        assert_eq!(
+            walking
+                .client_blocks_stalled(t0 + s(390), CATCHUP_RUN_GAP, s(180))
+                .map(|r| r.0),
+            Some(false)
+        );
         let w = s(180);
         // a run of batches every 10 s from t0 with the given distances; stalled at batch `at`?
         let run_at = |distances: &[Option<u32>], at: usize| {
             let node = NodeState::new("10.0.0.1".parse().unwrap(), 1);
             let t0 = Instant::now();
             for (i, b) in distances.iter().take(at + 1).enumerate() {
-                node.mark_client_blocks_response(t0 + s(i as u64 * 10), *b);
+                node.mark_client_blocks_response(t0 + s(i as u64 * 10), *b, LOOP_WIDTH);
             }
             node.client_blocks_stalled(t0 + s(at as u64 * 10), CATCHUP_RUN_GAP, w)
                 .map(|r| r.0)
@@ -664,8 +701,11 @@ mod tests {
         // 10 batches/s for 200 s: the run is a full window old, the kept 1,024 span ~102 s
         let n = 2_000;
         for i in 0..n {
-            capped
-                .mark_client_blocks_response(t0 + Duration::from_millis(i as u64 * 100), Some(900));
+            capped.mark_client_blocks_response(
+                t0 + Duration::from_millis(i as u64 * 100),
+                Some(900),
+                LOOP_WIDTH,
+            );
         }
         let end = t0 + Duration::from_millis((n as u64 - 1) * 100);
         assert_eq!(
@@ -678,7 +718,7 @@ mod tests {
         // quiet past `quiet`: not catching up at all
         let node = NodeState::new("10.0.0.2".parse().unwrap(), 1);
         let t0 = Instant::now();
-        node.mark_client_blocks_response(t0, Some(900));
+        node.mark_client_blocks_response(t0, Some(900), LOOP_WIDTH);
         assert_eq!(
             node.client_blocks_stalled(t0 + CATCHUP_RUN_GAP, CATCHUP_RUN_GAP, w),
             None
@@ -691,15 +731,15 @@ mod tests {
         let t0 = Instant::now();
         let s = Duration::from_secs;
         assert_eq!(node.client_blocks_run_since(t0, CATCHUP_RUN_GAP), None);
-        node.mark_client_blocks_response(t0, None);
-        node.mark_client_blocks_response(t0 + s(30), None);
+        node.mark_client_blocks_response(t0, None, 100);
+        node.mark_client_blocks_response(t0 + s(30), None, 100);
         assert_eq!(
             node.client_blocks_run_since(t0 + s(31), CATCHUP_RUN_GAP),
             Some(t0)
         );
         // a 61 s gap between two batches starts a new run, whenever anyone looks
-        node.mark_client_blocks_response(t0 + s(91), None);
-        node.mark_client_blocks_response(t0 + s(95), None);
+        node.mark_client_blocks_response(t0 + s(91), None, 100);
+        node.mark_client_blocks_response(t0 + s(95), None, 100);
         assert_eq!(
             node.client_blocks_run_since(t0 + s(96), CATCHUP_RUN_GAP),
             Some(t0 + s(91))
