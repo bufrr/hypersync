@@ -230,16 +230,24 @@ impl NodeState {
         if r.since > from {
             return Some((false, behind));
         }
-        let mut in_window = r.samples.iter().filter(|(t, _)| *t > from).map(|(_, b)| *b);
-        let mut band: Option<(u32, u32)> = None;
-        let mut known = true;
-        for b in in_window.by_ref() {
-            match b {
-                Some(b) => band = Some(band.map_or((b, b), |(lo, hi)| (lo.min(b), hi.max(b)))),
-                None => known = false,
-            }
-        }
-        let still = known && band.is_some_and(|(lo, hi)| hi - lo < CATCHUP_PROGRESS_ROUNDS);
+        let in_window: Option<Vec<u32>> = r
+            .samples
+            .iter()
+            .filter(|(t, _)| *t > from)
+            .map(|(_, b)| *b)
+            .collect();
+        let Some(d) = in_window.filter(|d| !d.is_empty()) else {
+            return Some((false, behind));
+        };
+        let (lo, hi) = (*d.iter().min().unwrap_or(&0), *d.iter().max().unwrap_or(&0));
+        // ...and not closing in, however slowly: under heavy blocks a catch-up can gain less than
+        // the band in a window (2026-10-29: ~90 rounds in 3 min at 2,467 behind, cut as "still"),
+        // while the stuck loop's distance only jitters. Compared by the median of the window's
+        // first and last third, so one stray batch doesn't decide it.
+        let third = (d.len() / 3).max(1);
+        let closing = median(&d[..third]).saturating_sub(median(&d[d.len() - third..]))
+            >= CATCHUP_CLOSING_ROUNDS;
+        let still = hi - lo < CATCHUP_PROGRESS_ROUNDS && !closing;
         Some((still, behind))
     }
 
@@ -274,6 +282,14 @@ pub(super) const CATCHUP_RUN_GAP: Duration = Duration::from_secs(60);
 
 // A catch-up whose distance behind stays within this band (~10 s of rounds) is sitting still.
 const CATCHUP_PROGRESS_ROUNDS: u32 = 150;
+// ...unless it closed in by this much over the window (~3 s of rounds; the loop's jitter nets ~0)
+const CATCHUP_CLOSING_ROUNDS: u32 = 50;
+
+fn median(v: &[u32]) -> u32 {
+    let mut s = v.to_vec();
+    s.sort_unstable();
+    s.get(s.len() / 2).copied().unwrap_or(0)
+}
 
 // How long a run's batch distances are kept: the stuck-catch-up watchdog's window
 // (select::REPIN.catchup_max, 3 min) plus slack; and at most this many (a batch every ~1 s or more).
@@ -613,6 +629,11 @@ mod tests {
             "the window still holds the recovery"
         );
         assert_eq!(run_at(&lost, turn + 18), Some(true));
+        // closing in slower than the band under heavy blocks (the live case: ~90 rounds in a
+        // window at 2,467 behind) is not still; the same distance with jitter is
+        assert_eq!(run(&steps(2_667, -5, 40)), Some(false));
+        let slow_jitter: Vec<_> = (0..40).map(|i| Some(2_500 + (i % 4) * 20)).collect();
+        assert_eq!(run(&slow_jitter), Some(true));
         // falling behind under heavy blocks, or swinging widely: not cut (a new session would
         // only start the same catch-up over)
         assert_eq!(run(&steps(5_000, 15, 40)), Some(false));
