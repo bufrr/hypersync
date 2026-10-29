@@ -97,9 +97,11 @@ services:
       # only to count probes from priority peers; never logged as addresses
       HYPERSYNC_PRIORITY_PEERS: "${HYPERSYNC_PRIORITY_PEERS:-}"
       HYPERSYNC_PRIORITY_PEERS_EXPECTED: "${HYPERSYNC_PRIORITY_PEERS_EXPECTED:-}"
+    # on every address (IPv4 and IPv6) by default; set HYPERSYNC_RESPONDER_BIND (.env) to the public IP when the
+    # gateway is also published on this host (e.g. on a VPN address for remote nodes)
     ports:
-      - "4001:4001"
-      - "4002:4002"
+      - "${HYPERSYNC_RESPONDER_BIND:+${HYPERSYNC_RESPONDER_BIND}:}4001:4001"
+      - "${HYPERSYNC_RESPONDER_BIND:+${HYPERSYNC_RESPONDER_BIND}:}4002:4002"
 
   peerd:
     image: hypersync:latest

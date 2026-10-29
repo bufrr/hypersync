@@ -68,7 +68,9 @@ It never dials out, so nothing it receives reaches a node or an upstream. Every 
 how many probes it answered and how many came from priority peers.
 
 To use it, stop publishing 4000-4010 from the node, then
-`docker compose --profile public up -d responder`.
+`docker compose --profile public up -d responder`. It binds every address by default; set
+`HYPERSYNC_RESPONDER_BIND` in `.env` to the public IP when the gateway is also published on this
+host (e.g. on a WireGuard address for remote nodes), so both can use 4001/4002.
 
 ## Configuration
 
