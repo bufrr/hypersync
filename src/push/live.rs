@@ -283,6 +283,49 @@ impl BlockProgress {
     }
 }
 
+// The active stream stopped, or nearly, while the gateway's other streams advance (see
+// STALL_LAG_ROUNDS). Judged on a timer from the stream's own highest round, since a silent stream
+// gives BlockProgress no block to judge it on.
+struct StalledBehind {
+    rounds: u32,
+    grace: Duration,
+    widen: u32,
+    // when the stream got `rounds` behind, and how far behind it was then
+    since: Option<(Instant, u32)>,
+}
+
+impl StalledBehind {
+    fn new(rounds: u32, grace: Duration, widen: u32) -> Self {
+        StalledBehind {
+            rounds,
+            grace,
+            widen,
+            since: None,
+        }
+    }
+
+    // Rounds the stream trails `freshest` by, once it has stayed `rounds` behind for the grace and
+    // fallen another `widen` behind meanwhile. No round of its own yet, no freshest round, or a
+    // node not draining its queue (the node then holds the stream back) clears the timer.
+    fn check(
+        &mut self,
+        own_round: u32,
+        freshest: Option<u32>,
+        node_backed_up: bool,
+        now: Instant,
+    ) -> Option<u32> {
+        let behind = freshest.map_or(0, |f| f.saturating_sub(own_round));
+        if own_round == 0 || node_backed_up || behind < self.rounds {
+            self.since = None;
+            return None;
+        }
+        let (at, start) = *self.since.get_or_insert((now, behind));
+        (now.saturating_duration_since(at) >= self.grace
+            && behind >= start.saturating_add(self.widen))
+        .then_some(behind)
+    }
+}
+
 // The freshest block round this gateway's upstream streams have reached: a reference far fresher
 // than peerd's probe tip (minutes old). Every live push session and the pace reference streams
 // feed it, each with rounds that passed its own plausibility and jump gates. It is the highest
@@ -310,6 +353,18 @@ pub(crate) struct FreshestRound {
 pub(crate) const PEER_LAG_ROUNDS: u32 = 100;
 pub(crate) const PEER_LAG_GRACE: Duration = Duration::from_secs(5);
 pub(crate) const FRESHEST_STALE: Duration = Duration::from_secs(30);
+// The faster cut for an active stream that stops (or nearly stops) while the others advance: it
+// trails the freshest round by STALL_LAG_ROUNDS (~3 s) and, over the STALL_LAG_GRACE that follows,
+// falls a further STALL_LAG_WIDEN behind. The 10 s idle timeout and the 100-round/5 s guard above
+// took 12-16 s for these (soak 10-30: a stand-in went silent, another trickled 210 rounds behind);
+// this takes ~6 s. On recorded streams of 8 healthy peers (5.2 peer-hours) it fired only on two
+// real stalls (304 and 548 rounds behind); no healthy stream ever trailed by more than 26 rounds.
+// A stream that sits behind at full pace isn't widening, so it stays the 100-round guard's.
+const STALL_LAG_ROUNDS: u32 = 45;
+const STALL_LAG_GRACE: Duration = Duration::from_secs(3);
+const STALL_LAG_WIDEN: u32 = 30;
+// how often serve_push checks for it: the stream's own reads can't, a silent one has none
+const STALL_CHECK_EVERY: Duration = Duration::from_millis(250);
 // Frames queued for a node that is not draining them (~2s of blocks): the node, not its upstream,
 // is then what holds the stream back, so the lag guard doesn't blame the peer.
 const NODE_BACKLOG_EXEMPT_FRAMES: usize = 32;
@@ -343,6 +398,7 @@ impl FreshestRound {
             freshest: self.clone(),
             id: self.next_id.fetch_add(1, Ordering::Relaxed),
             peer: peer.to_string(),
+            own: Arc::new(AtomicU32::new(0)),
         }
     }
 
@@ -405,13 +461,21 @@ pub(crate) struct FreshestFeed {
     freshest: Arc<FreshestRound>,
     id: u64,
     peer: String,
+    // the stream's own highest round offered, whatever FreshestRound took of it
+    own: Arc<AtomicU32>,
 }
 
 impl FreshestFeed {
     // A round that passed the stream's own gates.
     pub(crate) fn offer(&self, round: u32) {
+        self.own.fetch_max(round, Ordering::AcqRel);
         self.freshest
             .offer(self.id, &self.peer, round, Instant::now());
+    }
+
+    // The stream's own highest round, readable after the feed moved into its reader.
+    fn own_round(&self) -> Arc<AtomicU32> {
+        self.own.clone()
     }
 
     pub(crate) fn freshest(&self) -> &FreshestRound {
@@ -706,6 +770,8 @@ pub(crate) async fn serve_push(node: TcpStream, active_conn: TcpStream, cfg: Pus
             }
         })
     });
+    // the active stream's own round, for the stalled-behind check (only with a lag guard)
+    let own_round = feed.as_ref().map(FreshestFeed::own_round);
     // active peer -> node: the transparent backbone (forwards non-block frames + blocks). If the
     // active stream stalls or dies the session is torn down so the node reconnects and a fresh
     // active is elected — a mid-session replacement peer would start at its own tip and hand the
@@ -740,11 +806,25 @@ pub(crate) async fn serve_push(node: TcpStream, active_conn: TcpStream, cfg: Pus
     let active_host = cfg.hosts.get(cfg.active_idx).cloned().unwrap_or_default();
     let blacklisted = crate::blacklist::wait_blacklisted(&active_host);
     tokio::pin!(blacklisted);
+    let mut stall_check = tokio::time::interval(STALL_CHECK_EVERY);
+    stall_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut stalled_behind = StalledBehind::new(STALL_LAG_ROUNDS, STALL_LAG_GRACE, STALL_LAG_WIDEN);
     let exit_reason = loop {
         tokio::select! {
             _ = &mut superseded => break "active superseded by failover".to_string(),
             _ = &mut blacklisted => break "active peer blacklisted".to_string(),
             reason = &mut end_when => break reason,
+            _ = stall_check.tick(), if own_round.is_some() => {
+                let (Some(own), Some(freshest)) = (&own_round, &cfg.freshest) else { continue };
+                if let Some(behind) = stalled_behind.check(
+                    own.load(Ordering::Acquire),
+                    freshest.get(),
+                    tx.backed_up(),
+                    Instant::now(),
+                ) {
+                    break format!("active peer stalled behind the freshest stream by {behind} rounds");
+                }
+            }
             maybe = rx.recv() => match maybe {
                 // Bounded like the node -> peer direction: a half-open node (no RST) would
                 // otherwise park write_all until the kernel gives up (~15 min), holding the
@@ -1356,6 +1436,132 @@ mod tests {
         p.hold(t0 + Duration::from_secs(25));
         assert!(!p.stalled(t0 + Duration::from_secs(50)));
         assert!(p.stalled(t0 + Duration::from_secs(56)));
+    }
+
+    // A stream that stops while the freshest round moves on is flagged once it has trailed by the
+    // threshold for the grace AND fallen further behind meanwhile; a dip it recovers from, or a
+    // stream that sits behind at full pace, is not.
+    #[test]
+    fn a_stream_stalled_behind_the_freshest_round_is_flagged_after_the_grace() {
+        let t0 = Instant::now();
+        let s = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut w = StalledBehind::new(STALL_LAG_ROUNDS, STALL_LAG_GRACE, STALL_LAG_WIDEN);
+        // nothing of its own yet, or no freshest round: nothing to judge
+        assert_eq!(w.check(0, Some(TIP + 500), false, t0), None);
+        assert_eq!(w.check(TIP, None, false, t0), None);
+        // stopped at TIP while the others move ~15 rounds/s
+        assert_eq!(
+            w.check(TIP, Some(TIP + 45), false, s(0)),
+            None,
+            "the grace starts"
+        );
+        assert_eq!(w.check(TIP, Some(TIP + 88), false, s(2_900)), None);
+        assert_eq!(w.check(TIP, Some(TIP + 90), false, s(3_000)), Some(90));
+        // a dip it recovers from: back under the threshold clears the timer
+        let mut dip = StalledBehind::new(STALL_LAG_ROUNDS, STALL_LAG_GRACE, STALL_LAG_WIDEN);
+        assert_eq!(dip.check(TIP, Some(TIP + 50), false, s(0)), None);
+        assert_eq!(dip.check(TIP + 30, Some(TIP + 70), false, s(2_000)), None);
+        // 45 behind again from 3.0 s: a fresh grace
+        assert_eq!(dip.check(TIP + 30, Some(TIP + 75), false, s(3_000)), None);
+        assert_eq!(dip.check(TIP + 30, Some(TIP + 104), false, s(5_900)), None);
+        // the grace has run, but it hasn't fallen 30 further: still waits
+        assert_eq!(dip.check(TIP + 30, Some(TIP + 100), false, s(6_000)), None);
+        assert_eq!(
+            dip.check(TIP + 30, Some(TIP + 105), false, s(6_100)),
+            Some(75)
+        );
+        // sitting 60 behind at full pace never widens
+        let mut steady = StalledBehind::new(STALL_LAG_ROUNDS, STALL_LAG_GRACE, STALL_LAG_WIDEN);
+        for k in 0..100u32 {
+            let r = TIP + 15 * k;
+            assert_eq!(
+                steady.check(r, Some(r + 60), false, s(1_000 * u64::from(k))),
+                None
+            );
+        }
+        // a node that isn't draining its queue holds the stream back: the timer starts over
+        let mut held = StalledBehind::new(STALL_LAG_ROUNDS, STALL_LAG_GRACE, STALL_LAG_WIDEN);
+        assert_eq!(held.check(TIP, Some(TIP + 50), false, s(0)), None);
+        assert_eq!(held.check(TIP, Some(TIP + 100), true, s(3_000)), None);
+        assert_eq!(held.check(TIP, Some(TIP + 110), false, s(3_500)), None);
+        assert_eq!(held.check(TIP, Some(TIP + 150), false, s(6_400)), None);
+        assert_eq!(held.check(TIP, Some(TIP + 150), false, s(6_500)), Some(150));
+    }
+
+    // A session whose upstream goes silent while the gateway's other streams keep moving ends on
+    // the stalled-behind check well before the 10 s idle timeout, as an upstream fault.
+    #[tokio::test]
+    async fn push_session_ends_soon_when_its_upstream_goes_silent_while_others_advance() {
+        const R: u32 = 1_496_000_000;
+        let node_l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let node_addr = node_l.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut c = TcpStream::connect(node_addr).await.unwrap();
+            let mut buf = vec![0u8; 1 << 16];
+            while c.read(&mut buf).await.is_ok_and(|n| n > 0) {}
+        });
+        let (node_conn, _) = node_l.accept().await.unwrap();
+        // the upstream sends a few blocks at R, then nothing (connection kept open)
+        let peer_l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer_l.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = peer_l.accept().await.unwrap();
+            s.write_all(&[0, 0, 0, 1, 0, 7]).await.unwrap();
+            for r in R..R + 5 {
+                s.write_all(&make_live_block_frame(r)).await.unwrap();
+            }
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            drop(s);
+        });
+        let active_conn = TcpStream::connect(peer_addr).await.unwrap();
+        let freshest = Arc::new(FreshestRound::new(
+            PEER_LAG_ROUNDS,
+            PEER_LAG_GRACE,
+            FRESHEST_STALE,
+            Arc::new(AtomicU32::new(R)),
+        ));
+        // two other streams of the gateway move on from R at ~50 rounds/s
+        let feeder = {
+            let (a, b) = (freshest.feed("a"), freshest.feed("b"));
+            tokio::spawn(async move {
+                let mut r = R + 5;
+                loop {
+                    a.offer(r);
+                    b.offer(r);
+                    r += 1;
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+        };
+        let t0 = Instant::now();
+        let reason = timeout(
+            Duration::from_secs(8),
+            serve_push(
+                node_conn,
+                active_conn,
+                PushConfig {
+                    hosts: Arc::new(vec!["127.0.0.1".into()]),
+                    active_idx: 0,
+                    prefetched_greeting: None,
+                    prefetched_frames: Vec::new(),
+                    initial_last_forwarded: 0,
+                    live_floor: Arc::new(AtomicU32::new(0)),
+                    net_round_tip: Arc::new(AtomicU32::new(0)),
+                    superseded: None,
+                    end_when: None,
+                    freshest: Some(freshest),
+                },
+            ),
+        )
+        .await
+        .expect("the silent session ends before the idle timeout");
+        feeder.abort();
+        assert!(
+            reason.starts_with("active peer stalled behind the freshest stream"),
+            "{reason}"
+        );
+        assert!(t0.elapsed() < Duration::from_secs(6), "{:?}", t0.elapsed());
+        assert!(push_exit_is_upstream_fault(&reason));
     }
 
     // A session whose upstream keeps trailing the gateway's freshest stream (another session, the
