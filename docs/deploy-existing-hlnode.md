@@ -1,91 +1,64 @@
-# hypersync 部署到已有 HL node 服务器
+# hypersync 部署指南
 
-本文档用于把 `hypersync` 部署到一台已经在运行 Hyperliquid HL node 的服务器上。生产默认按这个方式部署：
-`gw/peerd` 和至少一个真实 HL node 在同一台 host 或同一个公网出口 IP 后面，让公网 peers 看到的
-`4001/4002` 始终是真实 HL node。
+本文档说明怎样把 hypersync 部署到运行 Hyperliquid hl-node 的服务器上，以及怎样接入其它机器上的节点。
+流程按 2026-10-28 ~ 11-03 的测试实际验证过的方式写（单节点同机约 41 h、Linode 远端节点 10 h、受控停顿
+测试），网关版本 `18f6864`。
 
-目标拓扑分成两层，下面用 Mermaid/MMD 表达：
+## 1. 拓扑
 
 ```mermaid
 flowchart LR
-  subgraph P["Public HL P2P network"]
-    PEERS["Public HL peers"]
+  subgraph NET["Hyperliquid P2P 网络"]
+    PRIO["优先级 peer<br/>（QuickNode sentry；上线前用公开 stand-in）"]
+    POOL["公开 peer 池"]
   end
 
-  subgraph H["Existing HL node host / same public egress IP"]
-    PUB["Host public 4001/4002<br/>owned by the real HL node"]
-    HL["Real HL node container"]
-    DATA[("HL node data volume<br/>tcp_lz4_stats")]
-
-    subgraph GNET["Docker network: hypersync_gwnet"]
-      GW["hypersync-gw<br/>172.28.0.10:4000-4010<br/>not published to public internet"]
+  subgraph H["网关主机（公网 IP）"]
+    RESP["hypersync-responder<br/>公网 4001/4002<br/>只应答探测，从不外连"]
+    subgraph GNET["Docker 网络 hypersync_gwnet"]
+      GW["hypersync-gw<br/>172.28.0.10:4000-4010<br/>不对公网开放"]
       PEERD["hypersync-peerd"]
-      PD[("/pd<br/>peers.json<br/>(+ bootstrap.cache only with --cache)")]
+      PD[("./data → /pd<br/>peers.json")]
+      NODE["hl-node<br/>不开放 4000-4010"]
     end
   end
 
-  subgraph R["Optional remote downstream nodes"]
-    RHL["HL node on another host"]
+  subgraph R["可选：远端节点主机"]
+    RNODE["hl-node<br/>不开放任何公网端口"]
   end
 
-  PEERS <-- "public gossip 4001/4002" --> PUB
-  PUB --- HL
-  HL -- "root_node_ips = 172.28.0.10<br/>container/private traffic 4000-4010" --> GW
-  GW -- "outbound upstream dials<br/>4001 / 4002" --> PEERS
-  PEERD -- "read-only harvest" --> DATA
-  PEERD -- "write live peer pool" --> PD
-  GW -- "read peer pool + cache" --> PD
-  RHL -. "optional private/VPN access only<br/>firewall allowlist 4000-4010" .-> GW
+  PRIO -- "探测本机公网 4001/4002" --> RESP
+  GW -- "外连 4001/4002" --> PRIO
+  GW -. "仅当所有优先级 peer 不可用" .-> POOL
+  PEERD -- "发现、探测" --> POOL
+  PEERD --> PD --> GW
+  NODE -- "root_node_ips = 172.28.0.10" --> GW
+  RNODE -. "WireGuard，网关只绑在隧道地址" .-> GW
 ```
 
-`hypersync-gw` 和 `hypersync-peerd` 独立作为一个 Docker Compose 项目运行。已有 HL node 不需要放进
-hypersync 的 compose 里，但需要加入 `hypersync_gwnet` 网络，并把
-`override_gossip_config.json` 指向 gateway。
+- **网关**为每个节点挑一个上游 peer，转发状态数据（冷启动）、实时区块（4001）和追块请求（4002），并在上游停顿、
+  落后或异常时几秒内换掉它。一个网关可以同时服务多个节点（按节点来源 IP 区分）。
+- **peerd** 发现并探测公开 peer，每 2 分钟写一次 `data/peers.json`。
+- **优先级 peer**（`HYPERSYNC_PRIORITY_PEERS`）优先使用；默认独占模式下，只有全部优先级 peer 都不可用时才用公开池。
+- **应答器**接管本机公网 4001/4002：上游 peer（包括 QuickNode sentry）会回头探测与它们连接的 IP，没人应答会被降级。
+  有了应答器，节点就不需要任何公网端口。它是 hypersync 唯一面向公网的监听。
+- 节点只连网关（`try_new_peers: false`），不再直接连公网 peer。
 
-注意这里的 `4001/4002` 有两套不同含义：
+## 2. 关键结论
 
-- 真实 HL node 的公网 `4001/4002`：给公网 HL peers 访问，用来证明这个公网 IP 有正常 HL node peer 行为。
-- gateway 的 `4001/4002`：给你自己的 HL node 从 Docker 内网或私网访问，只做透明转发/缓存/追块代理。
+- **网关绝不能对公网开放。** 任何能连上它的人都能触发一次约 5.8 GB 的状态数据转发。公网上只允许应答器。
+- **资源**：hypersync 三个组件合计 < 100 MB 内存（网关峰值实测 69 MB，稳态约 6 MB；peerd ~18 MB；应答器 ~4 MB），
+  CPU ~1%。内存压力全部来自 hl-node：同机测试里它从 ~15 GiB 涨到 30+ GiB，62 GB 主机上每 3~6 小时低内存重启一次，
+  偶尔先冻结 20 分钟。**hl-node 所在主机建议 ≥128 GB。** 网关可以放在小机器上（远端节点走 WireGuard，见第 9 节）。
+- 默认不开 `--cache`（见第 13 节），节点冷启动时网关透明转发一个正在提供状态的 peer。
+- 网关是单点：节点只连网关。网关靠 `restart: unless-stopped` 自动拉起，重启时节点会断开几秒后自动重连。
+- 优先级 peer 的 IP 在所有日志里只显示为 `prio-1..N`；`.env` 已在 `.gitignore` 里，不要提交或外传。
 
-两者可以在同一台机器同时存在，因为容器内部端口互相隔离；只有把两个容器都 publish 到同一个宿主机
-`0.0.0.0:4001/4002` 时才会冲突。
+## 3. 前置条件
 
-## 1. 关键结论
-
-- 先保持已有 HL node 正常运行，不要一开始就停掉或切到 gateway-only。
-- 先启动 `peerd + gw`，让 peerd 读取已有 HL node 的 `tcp_lz4_stats`，建立 live peer pool。
-- 等 `data/peers.json` 有稳定 `live_servers` 后，再切换 HL node。默认 compose 不开 `--cache`（`gateway /pd/peers.json --push`），不会生成 `data/bootstrap.cache`，也不需要等它；node 冷启动时 gateway 会透明转发一个正在提供 abci_state 的真实 peer 完成 bootstrap。只有确有内存余量时才按第 7 节开启 `--cache`。
-- 生产推荐把 gw/peerd 部署在至少一个真实 HL node 所在机器。备选方案也必须保证 gw 出公网的源 IP 和一个健康 HL node 的公网 peer 行为一致。公网 HL peers 可能根据源 IP 是否有正常 `4001/4002` 行为来降级连接；如果 gw 放在一台没有 HL node 公网端口行为的空机器上，peerd/gw 可能拿不到稳定 live peer。
-- gateway 默认只在 Docker 内网 `hypersync_gwnet` 暴露。同机部署时不要把 gateway 的 `4000-4010` publish 到宿主机；真实 HL node 继续占用宿主机公网 `4001/4002`。异机 node 访问 gw 时，也只应把 gateway 发布到私网/VPN IP，并用防火墙只允许 HL node 来源 IP。
-- HL node 自己的公网 `4001/4002` 可以保持原状；这些端口属于 HL node，不是 gateway。
-- 多个 HL node 可以共用一个 gateway，但 gateway 按 node 的来源 IP 区分 session。共用 gateway 的多个 node 必须在 gateway 看来拥有不同来源 IP，例如不同 Docker container IP。
-- 多 node 同机测试时，内存压力主要来自 HL node 自身，不是 gateway。默认不开 `--cache` 时 gateway 稳态常驻只有几 MB（2026-10-21 实测约 6MB），每个进行中的 bootstrap 会短暂多占约 64MB 预取缓冲，写出后即释放；开 `--cache` 后 gateway 会常驻一份完整 bootstrap（2026-10 约 5.8GB），refresh race 时可升到 ~19GB。单个 HL node 实测约 34-40GB，两节点机器要预留足够 RAM/swap。
-
-## 2. 前置条件
-
-服务器上已经满足：
-
-- Docker / Docker Compose 可用。
-- HL node 已经运行并且能正常同步。
-- 推荐部署形态是 gw/peerd 和 HL node 在同一台 Docker host。此时 HL node 的数据 volume 可被 hypersync 只读挂载，用于读取：
-
-```text
-tcp_lz4_stats/
-```
-
-- 不推荐把 gw/peerd 放在没有真实 HL node 的空机器上。如果必须异机部署，gw 机器的公网出口 IP 仍然必须有真实 HL node 的 `4001/4002` 行为，或通过网络/NAT 让公网 peers 看到的是已有 HL node 的同一个健康出口 IP。只复制 `tcp_lz4_stats` 能改善候选发现，但不能解决公网 peer 对 gw 源 IP 的互惠/降级判断。
-- 如果只是让其它机器上的 HL node 连接这台 gw，这不等于“异机 gw”：gw 仍然部署在已有 HL node 机器上，远端 HL node 通过私网/VPN 访问 gw。
-- `tcp_lz4_stats` 是一个目录，里面通常是一组按日期命名的文件，例如 `20260706`；不要只复制单个文件，至少要复制整个目录。它只给 `peerd` 用，`gw` 不读 HL node 文件。
-
-默认示例假设 HL node volume 名称是：
-
-```text
-hyperliquid_hl-data
-```
-
-如果你的实际 volume 名称不同，需要修改 `docker-compose.colocated.yml`。
-
-查询现有 HL node 容器和 volume：
+- Docker 和 Docker Compose。
+- 本机公网 IP：`curl -4 ifconfig.me`。
+- 已有节点时，确认它的容器名、compose 目录和数据卷：
 
 ```sh
 docker ps
@@ -93,502 +66,187 @@ docker volume ls | grep -i hyper
 docker inspect <HL_NODE_CONTAINER> --format '{{json .Mounts}}'
 ```
 
-查询服务器公网 IP：
+下文假设节点的 compose 项目在 `~/node`、项目名 `hyperliquid`、数据卷 `hyperliquid_hl-data`、服务名 `node`，按实际情况替换。
+
+## 4. 拉代码、构建镜像
 
 ```sh
-curl -4 ifconfig.me
+git clone git@github.com:bufrr/hypersync.git /opt/hypersync
+cd /opt/hypersync && git checkout main && mkdir -p data
+docker compose build              # 生成 hypersync:latest
 ```
 
-后面会把这个公网 IP 写入 `HL_SELF_IP`，防止 peerd 把自己的 HL node 当作上游 peer。
+已有仓库时：`git pull && docker compose build`。
 
-## 3. 拉代码并构建镜像
+## 5. 配置 `.env`
+
+在仓库根目录创建 `.env`：
 
 ```sh
-cd /opt
-git clone git@github.com:bufrr/hypersync.git
-cd hypersync
-git checkout main
-mkdir -p data
-docker compose build
+# 所有自有节点的公网 IP（逗号分隔）：永远不会被当作上游
+HL_SELF_IP=<本机公网 IP>[,<其它节点公网 IP>...]
+# 优先级 peer（QuickNode sentry；上线前用测量过的公开 stand-in）
+HYPERSYNC_PRIORITY_PEERS=<IP1>,<IP2>,<IP3>
+# 必须有几个优先级 peer：数量不足或有非法、私网、重复地址时，网关、peerd、应答器都拒绝启动
+HYPERSYNC_PRIORITY_PEERS_EXPECTED=3
+# 应答器只绑定公网 IP（网关也在本机其它地址上开放端口时必须设置，比如第 9 节的 WireGuard）
+HYPERSYNC_RESPONDER_BIND=<本机公网 IP>
 ```
 
-如果仓库已经存在：
+其它可调项见 README 的 Configuration 表。几点说明：
 
-```sh
-cd /opt/hypersync
-git pull
-docker compose build
-```
+- `HYPERSYNC_PRIORITY_EXCLUSIVE` 默认 `1`（独占）：公开池只在每个优先级 peer 都不可用时才服务节点。
+- 启动检查覆盖优先级 peer 和网关的各项参数（`HYPERSYNC_PRIORITY_*`、`HYPERSYNC_FAILOVER_*`）。值不合法时进程退出，
+  日志里是 `[main] invalid environment: ...`，不会悄悄退回默认值。`HL_SELF_IP` 不在检查范围内，写错时这些 IP
+  只是不会被排除，需要自己核对。
 
-## 4. 配置 `.env`
-
-在 hypersync repo 根目录创建 `.env`：
-
-```sh
-cat > .env <<'EOF'
-HL_SELF_IP=<YOUR_PUBLIC_NODE_IP>
-EOF
-```
-
-多个 HL node 公网 IP 用逗号分隔：
-
-```sh
-HL_SELF_IP=1.1.1.1,2.2.2.2
-```
-
-`HL_SELF_IP` 的作用是：这些 IP 不会进入 gateway 的上游 peer pool，避免 gateway 把自己的 node
-互相转发成上游。
-
-## 5. 确认 HL node 数据 volume
-
-先在 HL node 容器里找到 `tcp_lz4_stats` 的实际位置：
-
-```sh
-docker exec <HL_NODE_CONTAINER> sh -lc 'find /home/hluser/hl -maxdepth 5 -type d -name tcp_lz4_stats -print'
-docker exec <HL_NODE_CONTAINER> sh -lc 'ls -lah /home/hluser/hl/data/tcp_lz4_stats | tail'
-```
-
-如果实际路径不是 `/home/hluser/hl/data/tcp_lz4_stats`，后续命令里的路径按实际输出替换。
-
-再确认这个目录来自哪个 Docker volume 或 host bind mount：
-
-```sh
-docker inspect <HL_NODE_CONTAINER> --format '{{json .Mounts}}'
-```
-
-常见情况是容器内 `/home/hluser/hl/data` 对应一个 Docker volume，例如 `hyperliquid_hl-data`。
-那么 `tcp_lz4_stats` 在 volume 根目录下，对 peerd 挂载后会表现为：
-
-```text
-/hl/node1/tcp_lz4_stats
-```
-
-### 同机部署：直接挂载 HL node volume
-
-默认的 `docker-compose.colocated.yml` 内容假设：
-
-```yaml
-volumes:
-  node1-hl-data:
-    external: true
-    name: hyperliquid_hl-data
-```
-
-如果实际 volume 不是 `hyperliquid_hl-data`，修改为实际名称：
-
-```yaml
-volumes:
-  node1-hl-data:
-    external: true
-    name: <YOUR_HL_DATA_VOLUME>
-```
-
-这个 overlay 会把 HL node 的数据 volume 只读挂载到 peerd：
-
-```text
-/hl/node1/tcp_lz4_stats
-```
-
-peerd 会从这里读取 HL node 实际交换过数据的 peer，作为候选来源。这对首次部署很重要。
-
-此时 `HL_STATS_DIR` 由 `docker-compose.colocated.yml` 设置：
-
-```yaml
-services:
-  peerd:
-    environment:
-      HL_STATS_DIR: /hl/node1/tcp_lz4_stats
-```
-
-确认 peerd 真正看到了这个目录：
-
-```sh
-docker exec hypersync-peerd sh -lc 'echo HL_STATS_DIR=$HL_STATS_DIR; ls -lah /hl/node1/tcp_lz4_stats | tail'
-```
-
-### 非推荐异机 gw：复制或同步 tcp_lz4_stats
-
-生产默认不走这一节。只有在 gw/peerd 不在任何 HL node 所在机器、但已经通过网络/NAT 保证 gw 出公网源 IP
-具备真实 HL node 公网 `4001/4002` 行为时，才考虑复制 `tcp_lz4_stats`。
-
-这种情况下不能直接挂载 Docker volume，需要在 gw/peerd 机器上准备一个本地目录：
+## 6. 启动 peerd 和网关
 
 ```sh
 cd /opt/hypersync
-mkdir -p hl-stats/node1/tcp_lz4_stats
+docker compose up -d gw peerd
+# 本机已有节点数据卷时，可以加上 colocated overlay，让 peerd 读节点的 tcp_lz4_stats（发现 peer 最好的来源）：
+# docker compose -f docker-compose.yml -f docker-compose.colocated.yml up -d gw peerd
 ```
 
-从 HL node 机器同步整个目录到 gw/peerd 机器。示例：
+overlay 默认挂载卷 `hyperliquid_hl-data`，不同名时改 `docker-compose.colocated.yml`。之后升级、重启都要带上同样的 `-f` 参数。
+
+检查：
 
 ```sh
-rsync -az <HL_NODE_HOST>:/path/to/tcp_lz4_stats/ /opt/hypersync/hl-stats/node1/tcp_lz4_stats/
-```
-
-如果只能通过容器取文件，可以先在 HL node 机器上导出：
-
-```sh
-docker cp <HL_NODE_CONTAINER>:/home/hluser/hl/data/tcp_lz4_stats ./tcp_lz4_stats
-rsync -az ./tcp_lz4_stats/ <GW_HOST>:/opt/hypersync/hl-stats/node1/tcp_lz4_stats/
-```
-
-如果确实采用这种非推荐形态，建议用 cron 或 systemd timer 每几分钟同步一次。一次性复制也能帮助首次启动，但后续候选不会继续从 node 新日志更新。
-
-在 gw/peerd 机器上新增一个本地 overlay，例如 `docker-compose.stats.yml`：
-
-```yaml
-services:
-  peerd:
-    environment:
-      HL_STATS_DIR: /hl/node1/tcp_lz4_stats
-    volumes:
-      - ./hl-stats/node1/tcp_lz4_stats:/hl/node1/tcp_lz4_stats:ro
-```
-
-启动时带上这个 overlay：
-
-```sh
-docker compose -f docker-compose.yml -f docker-compose.stats.yml up -d --build
-```
-
-如果暂时没有 `tcp_lz4_stats`，也可以不设置 `HL_STATS_DIR`，peerd 会依赖 `gossipRootIps` API、
-已有 `data/peer_candidates.txt` / `data/peers.json` 和主动 probe。缺点是首次冷启动的 peer 发现会弱一些，
-更容易出现 live pool 建立慢或 `live=0`。
-
-## 6. 启动 peerd + gateway
-
-已有 HL node 还保持原配置继续运行，先启动 hypersync：
-
-```sh
-docker compose -f docker-compose.yml -f docker-compose.colocated.yml up -d --build
-```
-
-如果使用上一节的异机复制目录 overlay，则改为：
-
-```sh
-docker compose -f docker-compose.yml -f docker-compose.stats.yml up -d --build
-```
-
-如果完全不提供 `tcp_lz4_stats`，只启动基础 compose：
-
-```sh
-docker compose -f docker-compose.yml up -d --build
-```
-
-确认容器运行：
-
-```sh
-docker ps --filter name=hypersync
-```
-
-查看 peerd 日志：
-
-```sh
+docker logs hypersync-gw 2>&1 | grep -E "upstream tiers|invalid environment"
+#   期望：[gw] upstream tiers: priority peers=3 max_sessions=0 stage=1500ms bootstrap=prefer exclusive=true
 docker logs -f hypersync-peerd
+#   期望：[peerd] ... candidates=N ... live=N round_tip=Some(...) ...   （live 稳定在 4 以上再切节点）
+docker inspect hypersync-gw -f '{{json .HostConfig.PortBindings}}'
+#   必须是 {}：网关不占宿主机端口
 ```
 
-期望看到类似：
+## 7. 修改节点配置
 
-```text
-[peerd] candidates=59 live=19 round_tip=Some(...) kept_previous=false ...
-```
-
-核心判断：
-
-- `live` 不应长期为 `0`。
-- 生产切换前建议 `live >= 4`；开启 `--cache` 时若低于 4，gateway 会先暂缓 cache refresh，接近过期时仍会用可用 peer 强制尝试刷新，避免主动等到 cache 过期。
-- `round_tip` 应该是 `Some(...)`。
-- `data/peers.json` 里应该有 `live_servers`。
-
-确认 gateway 没有占用宿主机公网端口：
-
-```sh
-docker inspect hypersync-gw --format '{{json .NetworkSettings.Ports}}'
-docker compose ps
-```
-
-基础同机部署下，`hypersync-gw` 的 `Ports` 应该是 `{}`，`docker compose ps` 里 gateway 的 `PORTS`
-列为空。宿主机上的公网 `4001/4002` 应该来自真实 HL node，而不是 gateway：
-
-```sh
-docker ps --format 'table {{.Names}}\t{{.Ports}}'
-ss -ltnp 'sport = :4001 or sport = :4002'
-```
-
-如果看到 `hypersync-gw` publish 了 `0.0.0.0:4001->4001` 或 `0.0.0.0:4002->4002`，说明部署方式不对：
-gateway 被暴露成公网入口了。
-
-查看 peers 文件：
-
-```sh
-cat data/peers.json
-```
-
-## 7. bootstrap cache（可选，`--cache`）
-
-默认 compose 不开 `--cache`，不会生成 `data/bootstrap.cache`，可以直接跳过本节：node 冷启动时由 gateway
-透明转发一个正在提供 abci_state 的真实 peer。之所以默认关闭：内存 snapshot cache 加上它的 refresh race
-当时会占用 6-19GB（现在最多同时约 3 份 bootstrap，约 17GB），和约 34-40GB 的 hl-node 同机时，2026-10-12 把主机内存推过了 hl-visor 约 95% 的低内存
-重启阈值，导致 hl-node 子进程反复重启。
-
-只有主机有足够内存余量、并且希望 node 重启时不依赖外部 peer 提供 abci_state 时，才开启 `--cache`：在
-`docker-compose.yml` 的 `gw` 服务 `command` 里追加 `"--cache"`（或用 compose override 覆盖 `command`），
-例如 `["gateway", "/pd/peers.json", "--push", "--cache"]`，然后重新 `up -d`。
-
-gateway 使用 `--cache` 时会捕获完整 bootstrap，生成：
-
-```text
-data/bootstrap.cache
-```
-
-查看 gateway 日志：
-
-```sh
-docker logs -f hypersync-gw
-```
-
-期望看到类似：
-
-```text
-[gw] bootstrap captured ...
-[gw] bootstrap cache persisted to /pd/bootstrap.cache
-```
-
-如果日志中偶尔出现类似：
-
-```text
-[gw] bootstrap attempt via <peer> failed: state-server too slow ...
-```
-
-这通常只是 refresh race 淘汰慢 peer，不等同于 gateway 故障。只要后续能看到 cache persisted、
-`data/bootstrap.cache` 的 mtime 持续更新，并且 cache age 不超过 8 分钟（fresh 窗口），就可以继续观察。
-
-确认 cache 文件：
-
-```sh
-ls -lh data/bootstrap.cache
-stat data/bootstrap.cache
-```
-
-正常大小约 5.8GB（2026-10 主网）。切换 node 前，建议 cache mtime 不超过 8 分钟；超过 8 分钟的 cache 不会被回放。
-
-如果 cache 暂时没有生成，但 `peers.json` 已经有稳定 live peer，node 也可以通过透明 fallback
-从真实 peer bootstrap（这也正是默认不开 `--cache` 时的路径）；只是会更依赖公网 peer 状态。开启了 `--cache` 时，建议先等 cache 成功再切换。
-
-## 8. 让已有 HL node 加入 hypersync 网络
-
-hypersync compose 会创建 attachable 网络：
-
-```text
-hypersync_gwnet
-```
-
-如果 HL node 也是 Docker Compose 管理，推荐在 HL node 的 compose override 中加入外部网络。
-
-示例：
+**节点 `docker-compose.yml`**（`~/node`）：
 
 ```yaml
 networks:
-  hypersync_gwnet:
+  default:
+  gwnet:                       # 网关的网络，由 hypersync 项目创建
     external: true
+    name: hypersync_gwnet
 
 services:
-  <HL_NODE_SERVICE_NAME>:
-    networks:
-      - default
-      - hypersync_gwnet
+  node:
+    ports:
+      - "3001:3001"            # 只保留需要的 RPC 端口；去掉 4000-4010，公网 4001/4002 交给应答器
+    networks: [default, gwnet]
+    volumes:
+      - hl-data:/home/hluser/hl/data
+      # 绑定挂载：容器重建后网关地址不会丢
+      - ./override_gossip_config.json:/home/hluser/override_gossip_config.json
+    # mem_limit: 52g           # 内存紧张的主机建议加：内存满时容器被直接杀掉并重启（几分钟恢复），
+    #                          # 不会拖着整台主机卡 20 分钟。代价是重启更频繁
 ```
 
-应用 node compose 变更：
-
-```sh
-cd <HL_NODE_REPO>
-docker compose up -d
-```
-
-如果暂时不想改 HL node compose，也可以先把正在运行的 node 容器直接接入网络：
-
-```sh
-docker network connect hypersync_gwnet <HL_NODE_CONTAINER>
-```
-
-这个方式适合临时验证；长期部署仍建议写进 HL node compose，避免容器重建后丢失网络配置。
-
-确认 HL node 已加入 `hypersync_gwnet`：
-
-```sh
-docker inspect <HL_NODE_CONTAINER> --format '{{json .NetworkSettings.Networks}}'
-```
-
-同机部署时，HL node 连接 gateway 的地址固定为：
-
-```text
-172.28.0.10
-```
-
-## 9. 修改 HL node gossip 配置
-
-把 HL node 的 `override_gossip_config.json` 改成只连接 gateway：
+**`~/node/override_gossip_config.json`**（先备份旧的）：
 
 ```json
 {"root_node_ips":[{"Ip":"172.28.0.10"}],"try_new_peers":false,"chain":"Mainnet"}
 ```
 
-文件位置取决于你的 HL node 部署方式。常见位置是 HL node 容器内的 hluser home：
+`172.28.0.10` 是 hypersync `docker-compose.yml` 里 gw 的 `ipv4_address`，是固定地址。
+
+## 8. 切换顺序与验收
+
+### 8.1 已有节点（从直连切到网关）
+
+1. 节点保持原样运行，先完成第 6 步，等 peerd `live` 稳定在 4 以上。
+2. 改好第 7 步的两个文件。
+3. 重建节点，同时启动应答器。节点释放公网 4001/4002 后应答器才能绑定上去，所以先节点后应答器：
+
+```sh
+cd ~/node && docker compose up -d                                  # 节点不再开放 4000-4010
+cd /opt/hypersync && docker compose --profile public up -d responder
+```
+
+### 8.2 全新节点
+
+```sh
+cd /opt/hypersync && docker compose up -d gw peerd && docker compose --profile public up -d responder
+cd ~/node && docker compose up -d
+```
+
+全新数据卷的节点冷启动实测约 7 分钟追平：几秒内网关给它转发状态数据，2–3 分钟后接上实时区块。
+
+### 8.3 验收
+
+```sh
+docker logs -f hypersync-gw | grep -E "bootstrap|selected live|session ended|tier=pool"
+```
+
+期望依次看到：
 
 ```text
-/home/hluser/override_gossip_config.json
+[gw] [<node>] node bootstrap via prio-N tier=prio (abci_state ... bytes, prefetched 64 MB); active set
+[gw] [<node>] selected live peer prio-N tier=prio first_round=... greeting=...
 ```
 
-示例命令：
+端口与网络：
 
 ```sh
-docker exec <HL_NODE_CONTAINER> sh -lc 'cat > /home/hluser/override_gossip_config.json <<EOF
-{"root_node_ips":[{"Ip":"172.28.0.10"}],"try_new_peers":false,"chain":"Mainnet"}
-EOF'
+ss -ltn | grep -E ':(400[0-9]|4010) '      # 只应有 <公网IP>:4001 和 <公网IP>:4002（应答器）
+docker ps --format 'table {{.Names}}\t{{.Ports}}' | grep -E 'hypersync|hyperliquid'
+docker logs hypersync-responder 2>&1 | tail -1
+#   [responder] last 600s: 4001 probes=... | ... busy=0 | from priority peers=...
 ```
 
-建议修改前先备份旧配置：
+节点延迟。逐块记录 `begin_block_wall_time - block_time`，正常 0.7~1 s，整点前后会有 2 s 左右的停顿：
 
 ```sh
-docker exec <HL_NODE_CONTAINER> sh -lc 'cp /home/hluser/override_gossip_config.json /home/hluser/override_gossip_config.json.bak.$(date +%Y%m%d%H%M%S) 2>/dev/null || true'
+sudo tail -1 /var/lib/docker/volumes/hyperliquid_hl-data/_data/node_fast_block_times/$(date -u +%Y%m%d)
 ```
 
-## 10. 重启 HL node
+通过标准（至少观察 30 分钟）：
 
-只重启 HL node，不需要重启 gateway：
+- 延迟中位数 ≤1 s，没有持续超过 5 s 的分钟（低内存重启和优先级 peer 停顿除外，见第 11 节）。
+- 网关日志里没有 `tier=pool`，也没有 `round too large`。
+- peerd `live` 不长期为 0；应答器 `busy=0`。
+- `docker inspect hypersync-gw hypersync-peerd hypersync-responder --format '{{.Name}} restart={{.RestartCount}} oom={{.State.OOMKilled}}'`
+  全部是 `restart=0 oom=false`。
+
+## 9. 远端节点（节点在另一台机器）
+
+验证方式：2026-10-30 网关本机 + Linode 节点，跑了 10 h。
+
+1. 两台机器之间建 WireGuard 隧道。远端防火墙入站默认拒绝，只放行网关主机的 ssh、WireGuard（UDP 51820）和 ping。
+2. 远端节点的公网 IP 加进 `HL_SELF_IP`，并设置 `HYPERSYNC_RESPONDER_BIND`（第 5 节）。
+3. 网关只在 WireGuard 地址上开放端口。在 hypersync 目录新建 `docker-compose.wg.yml`：
+
+```yaml
+services:
+  gw:
+    ports:
+      - "<本机 WireGuard 地址>:4000-4010:4000-4010"
+```
 
 ```sh
-cd <HL_NODE_REPO>
-docker compose restart <HL_NODE_SERVICE_NAME>
+docker compose -f docker-compose.yml -f docker-compose.wg.yml up -d gw peerd
+ss -ltn | grep -E ':(400[0-9]|4010) '      # WG 地址上 4000-4010，公网 IP 上只有 4001/4002（应答器）
 ```
 
-或者：
+4. 远端节点：`override_gossip_config.json` 的 `root_node_ips` 写本机 WireGuard 地址；compose 不开放 4000-4010，
+   也不需要加入 `hypersync_gwnet`。
+5. 之后网关的升级和重启都要带上这个 overlay。
 
-```sh
-docker restart <HL_NODE_CONTAINER>
-```
+## 10. 多个节点共用一个网关
 
-观察 node 日志：
-
-```sh
-docker logs -f <HL_NODE_CONTAINER>
-```
-
-期望看到：
-
-```text
-connected to abci stream from 172.28.0.10:4001
-received abci greeting from 172.28.0.10:4001
-got 100 client blocks ...
-applied block ...
-```
-
-如果命中 cache，gateway 日志会出现类似：
-
-```text
-[gw] [<node-ip>] node cold-start FROM CACHE (... MB), no peer state fetch
-```
-
-## 11. 验收检查
-
-切换后至少观察 30 分钟。推荐每 5 分钟检查一次。
-
-gateway / peerd：
-
-```sh
-docker logs --since 5m hypersync-gw
-docker logs --since 5m hypersync-peerd
-docker stats --no-stream hypersync-gw hypersync-peerd
-```
-
-HL node：
-
-```sh
-docker logs --since 5m <HL_NODE_CONTAINER> 2>&1 | grep -E 'applied block|got [0-9]+ client blocks|new app hashes|ERROR|panic|LimitExceeded|Peer-only|Querying jailed validators|forward_client_blocks'
-docker stats --no-stream <HL_NODE_CONTAINER>
-```
-
-快速取最新 applied block：
-
-```sh
-docker logs --since 10m <HL_NODE_CONTAINER> 2>&1 | grep -Eo 'applied block [0-9]+' | tail -1
-```
-
-检查容器是否 OOM 或异常重启：
-
-```sh
-docker inspect hypersync-gw hypersync-peerd <HL_NODE_CONTAINER> \
-  --format '{{.Name}} restart={{.RestartCount}} oom={{.State.OOMKilled}} status={{.State.Status}}'
-```
-
-通过标准：
-
-- HL node 高度持续增长。
-- `hypersync-peerd` 的 `live` 不长期为 0；生产切换和 cache 预热阶段建议保持 `live >= 4`。
-- `hypersync-gw` 没有持续 `4002 client-block fetch failed`。
-- HL node 没有持续 `Peer-only request`、`LimitExceeded`、panic 或 OOM。
-- 仅开启 `--cache` 时：`data/bootstrap.cache` 持续刷新，mtime 不长期超过 8 分钟。
-- 冷启动 / catch-up 阶段可能短暂出现 `Querying jailed validators for high round` 或
-  `forward_client_blocks no more blocks from reader, reconnecting to a new peer`。如果随后
-  `applied block` 继续增长、gateway 重新选择 live peer、双 node 高度差重新收敛，可以视为可恢复事件；如果持续出现或高度停滞，应按故障处理。
-
-开启 `--cache` 时查看 cache 更新时间：
-
-```sh
-stat -c '%y %s' data/bootstrap.cache
-```
-
-## 12. 首次启动异常处理
-
-如果 peerd 长时间 `live=0`：
-
-1. 确认原 HL node 仍在 direct/public 模式运行，并且公网 `4001` 可达。
-2. 同机部署时，确认 `docker-compose.colocated.yml` 挂载的是正确的 HL node 数据 volume；异机部署时，确认 `docker-compose.stats.yml` 挂载的是已经复制/同步过来的 `tcp_lz4_stats` 目录。
-3. 确认 `HL_STATS_DIR` 指向真实存在的 `tcp_lz4_stats`：
-
-```sh
-docker exec hypersync-peerd sh -lc 'ls -lah /hl/node1/tcp_lz4_stats | tail'
-```
-
-4. 查看 peerd 候选：
-
-```sh
-wc -l data/peer_candidates.txt
-tail -50 data/peer_candidates.txt
-```
-
-5. 重启 peerd：
-
-```sh
-docker restart hypersync-peerd
-```
-
-如果仍然为 0，不要切换 HL node 到 gateway-only。先让 HL node 保持 direct 模式，等 peerd 候选恢复。
-
-本次测试中的经验是：部分 HL peer 会反连本机公网 `4001`。因此完全空机器首次启动时，如果没有已有
-HL node 维持这个公网行为，peerd 可能出现 `header_eof` 或 `live=0`。在“已有 HL node 的服务器”
-上部署时，正确流程就是先保持原 node 运行，等 peerd/gw 热起来，再切 node。
-
-## 13. 多个 HL node 共用一个 gateway
-
-多个 HL node 共用一个 gateway 时：
-
-- 每个 node 都要加入 `hypersync_gwnet`。
-- 每个 node 的 `override_gossip_config.json` 都指向 `172.28.0.10`。
-- 多个 node 在 gateway 看来必须有不同来源 IP。gateway 使用 TCP source IP 作为 node session key；
-  如果两个远端 node 经过同一个 NAT / SNAT 到 gateway，gateway 会把它们当成同一个 node，不能这样部署。
-- `HL_SELF_IP` 要包含所有本机/本组 HL node 的公网 IP。
-- 如果多个 node 有多个 hl-data volume，可以扩展 `docker-compose.colocated.yml`：
+- 网关按 TCP 来源 IP 区分节点：每个节点在网关看来必须是不同的来源 IP，比如不同的容器 IP 或不同的 WireGuard 地址。
+  经过同一个 NAT 的两个节点会被当成一个，不能这样部署。
+- 每个节点都指向网关；`HL_SELF_IP` 包含所有节点的公网 IP。
+- 同机多个节点时，可以在 `docker-compose.colocated.yml` 里给 peerd 多挂几个数据卷：
 
 ```yaml
 volumes:
-  node1-hl-data:
-    external: true
-    name: hyperliquid_hl-data
-  node2-hl-data:
-    external: true
-    name: hyperliquid2_hl-data
-
+  node1-hl-data: { external: true, name: hyperliquid_hl-data }
+  node2-hl-data: { external: true, name: hyperliquid2_hl-data }
 services:
   peerd:
     environment:
@@ -599,83 +257,79 @@ services:
       - node2-hl-data:/hl/node2:ro
 ```
 
-## 14. 回滚
+## 11. 日常监控：日志含义
 
-如果切换后 HL node 不正常：
+网关的 `session ended` 行以 `reason=` 说明原因。上游的问题会让该 peer 冷却 30 s，节点几秒内重连到另一个 peer。
 
-1. 恢复旧 gossip 配置：
+| `reason=` | 含义 | 处理 |
+|---|---|---|
+| `active peer stalled behind the freshest stream by N rounds` | 上游停了或断续发块，其它流还在前进；约 6 s 切走 | 正常。三个公开 stand-in 实测约每 3–4 个在线小时一次，节点最多落后 ~10 s |
+| `active stream error: active peer lags the freshest stream ...` | 上游持续落后 100 轮以上 5 s | 正常处理 |
+| `active stream error: idle timeout` / `early eof` | 上游 10 s 没数据，或主动断开 | 正常处理 |
+| `node write failed` / `node write timeout` / `node outbound ended` | 节点那一侧断了：重启，或卡住 30 s 不读数据 | 看节点：通常是 hl-visor 低内存重启 |
+| `node catch-up not converging` | 节点卡在 ~1,050–1,110 轮的小范围追块循环，网关结束会话让它一次追完 | 正常处理；每节点每 5 分钟最多一次 |
+| `returning to a priority peer` | 节点之前落到了公开池，现在回到优先级 peer | 正常 |
 
-```sh
-docker exec <HL_NODE_CONTAINER> sh -lc 'cp /home/hluser/override_gossip_config.json.bak.<TS> /home/hluser/override_gossip_config.json'
-```
+需要关注的情况：
 
-2. 重启 HL node：
+- 出现 `tier=pool`：所有优先级 peer 同时不可用。
+- 某个优先级 peer 按在线时间算故障率持续明显高于其它几个：考虑换掉它。注意：按次数统计会冤枉连接延迟最低、
+  因此最常被选中的那个 peer。
+- 节点 `child_low_memory: true`（hl-visor 日志）：主机内存不足，见第 2 节。
+- 节点冷启动后长时间没有 `selected live peer`：看 peerd 的 `live` 和网关的 `live attempt failed`。
 
-```sh
-docker restart <HL_NODE_CONTAINER>
-```
+## 12. 升级与回滚
 
-3. 停止 hypersync：
+**升级网关：**
 
 ```sh
 cd /opt/hypersync
-docker compose -f docker-compose.yml -f docker-compose.colocated.yml down
+mkdir -p data/gwlogs
+docker logs -t hypersync-gw > data/gwlogs/gw-$(date -u +%Y%m%dT%H%M%SZ)-pre-upgrade.log 2>&1
+docker tag hypersync:latest hypersync:prev                # 留一份旧镜像
+git pull && docker compose build
+docker compose up -d gw peerd                             # 带上部署时用的 -f overlay；节点断开几秒后自动重连
+docker compose --profile public up -d responder           # 应答器代码有改动时
 ```
 
-回滚后确认 HL node 重新连接公网 peer 并继续 applied block。
+**回滚网关：** `docker tag hypersync:prev hypersync:latest && docker compose up -d gw peerd`
 
-## 15. 常见问题
+**整体回滚到直连：**
 
-### gateway 要不要 host network？
+1. 恢复节点原来的 `override_gossip_config.json`，并在节点 compose 里重新开放 4000-4010。
+2. 停掉应答器以释放公网 4001/4002：`docker compose --profile public stop responder`
+3. 重建节点：`cd ~/node && docker compose up -d`，确认它重新连上公网 peer，并且 `applied block` 持续增长。
+4. 停掉 hypersync：`cd /opt/hypersync && docker compose --profile public stop gw peerd responder`
+   （容器、镜像和 `.env` 都保留，`start` 可恢复）。
 
-同机部署不需要。推荐使用 Docker bridge 网络 `hypersync_gwnet`，HL node 通过 `172.28.0.10`
-访问 gateway。
+## 13. 状态缓存 `--cache`（可选，默认关闭）
 
-如果 gateway 和 node 不在同一台机器，node 必须能通过私网/VPN 访问 gateway 的 `4000-4010`，
-可以把 gateway 端口绑定到私有网卡并用防火墙限制来源。不要把 gateway 的 `4000-4010` 裸露到公网：
-gateway 没有公网 allowlist，任何人访问都可能触发大流量 bootstrap replay。
+默认 `gateway /pd/peers.json --push` 不缓存状态数据：节点冷启动时网关透明转发一个正在提供状态的 peer
+（独占模式下优先用优先级 peer）。开启 `--cache` 后网关会常驻一份完整状态（~5.8 GB），最多同时 ~3 份（~17 GB）。
+和 hl-node 同机时，这曾把主机推过 hl-visor 的低内存重启阈值。只在内存充足、又希望冷启动不依赖外部 peer 时开启：
+在 `docker-compose.yml` 的 gw `command` 末尾加 `"--cache"` 后 `up -d`，日志里会出现 `bootstrap cache persisted`，
+生成 `data/bootstrap.cache`（超过 8 分钟的缓存不会回放）。缓存可能被恶意状态 peer 污染，只在信任状态来源时使用。
 
-这和公网 HL peers 看到的 `4001/4002` 是两件事。gateway 对下游 node 开放的端口不能替代真实 HL node
-的公网 peer 行为；如果 gw 机器本身没有健康 HL node 的公网 `4001/4002` 行为，上游 peers 可能把这个源 IP
-降级，表现为 peerd `header_eof`、`peer_full` 增多或 live pool 不稳定。因此生产上优先同机/同公网出口部署。
+## 14. 常见问题
 
-### 同机跑 HL node 和 gateway，4001/4002 会冲突吗？
+**网关要不要 host network？** 不要。同机用 `hypersync_gwnet` bridge 网络，节点连 `172.28.0.10`。
+远端节点通过 WireGuard 连接，网关只绑在隧道地址上。
 
-正常不会。冲突只发生在宿主机 publish 层，不发生在容器内部监听层：
+**应答器和网关都用 4001/4002，会冲突吗？** 不会。网关在 Docker 内网（或 WireGuard 地址）上监听，应答器绑在公网 IP 上。
+冲突只会发生在两者都发布到同一个宿主机地址的同一端口时，比如没设 `HYPERSYNC_RESPONDER_BIND`、网关又发布在本机
+另一个地址上。
 
-```text
-宿主机公网 4001/4002             -> real HL node container
-Docker 内网 172.28.0.10:4001/4002 -> hypersync-gw container
-```
+**节点还需要公网端口吗？** 不需要。上游 peer 的回访探测由应答器应答；节点的数据全部经网关。
 
-`hypersync-gw` 容器内部监听 `4000-4010`，但基础 compose 没有 `ports:`，所以不会占宿主机端口。
-真实 HL node 可以继续把公网 `4001/4002` 暴露给 HL peers。
+**要不要先停节点？** 已有节点时不要。先让它照常运行，等 peerd 热起来（第 8.1 节），再切换。
 
-会冲突的错误配置是：真实 HL node 已经 publish 了 `0.0.0.0:4001-4010`，同时又把 gateway 也 publish 到
-同一组宿主机端口。这样 Docker 会端口冲突，即使不冲突也会把 gateway 暴露成公网入口。
+**节点内存高是不是网关导致的？** 不是。网关稳态只有几 MB，峰值 69 MB；内存几乎全是 hl-node 用的，
+用 `docker stats` 分别看。
 
-如果确实有异机 HL node 需要访问同一台机器上的 gateway，优先使用 VPN/overlay 网络让远端 node 加入私网。
-如果必须用宿主机端口发布 gateway，必须绑定到私网/VPN IP，并确保真实 HL node 没有用 `0.0.0.0`
-占住同一组端口；真实 HL node 绑定公网 IP，gateway 绑定私网 IP，两者才可能在同一宿主机端口号上共存。
+**peerd `live=0` 能不能切？** 不建议。先查 `data/peers.json`、peerd 日志里的 `reasons={...}`、`HL_STATS_DIR` 挂载，
+必要时 `docker restart hypersync-peerd`。独占模式下节点主要用优先级 peer，但公开池是它们全部不可用时唯一的退路，
+测速参考流也来自公开池。
 
-### 是否需要先停 HL node？
-
-不需要。首次部署时反而应该先保持 HL node 正常运行，给 peerd 提供真实 peer 发现来源。
-等 peerd live pool 准备好（开启 `--cache` 时还要等 gateway cache 生成）后，再重启 node 切到 gateway。
-
-### cache 多久刷新？
-
-默认不开 `--cache`，没有 cache 需要刷新。开启 `--cache` 时 gateway 会定期刷新 bootstrap cache：fresh cache 窗口是 8 分钟，每 4 分钟刷新一次，失败的刷新最多 30 秒后重试；如果 live pool 临时低于 4，gateway 会先放缓刷新，接近过期时仍会尝试刷新。
-开启 `--cache` 时，切换前建议确认 `data/bootstrap.cache` 已存在并且 mtime 较新。
-
-### node 内存高是不是 gateway 导致？
-
-不是。HL node 和 gateway 是独立容器、独立进程。默认不开 `--cache` 时 gateway 稳态只占几 MB；开启 `--cache` 时它的主要内存来自 bootstrap cache 和刷新过程。
-node 自身同步、catch-up、状态加载也会占用大量内存，需要分别看 `docker stats`。实测双 node
-同机运行时，不开 `--cache` 的 gateway 常驻约 6MB（每个进行中的 bootstrap 短暂 +64MB），开 `--cache` 时约 5.8GB 常驻、refresh 短时可到 ~19GB，而单个 HL node 约 34-40GB；如果主机开始大量
-使用 swap，node 可能短暂执行落后并触发 `Querying jailed validators`，这不一定是 gateway 断流。
-
-### peerd live=0 能不能继续切？
-
-不建议。`live=0` 表示 gateway 没有稳定上游池。已有 cache 时短时间可能还能启动，但刷新和 fallback
-风险很高。应先恢复 peerd live pool。
+**优先级 peer 怎么换？** 改 `.env` 的 `HYPERSYNC_PRIORITY_PEERS` 后执行
+`docker compose up -d --force-recreate gw peerd`，并 `docker compose --profile public up -d --force-recreate responder`
+（应答器用这个列表统计优先级 peer 的探测次数）。
