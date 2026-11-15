@@ -47,6 +47,26 @@ pub(crate) async fn splice_with_idle(
     upc: TcpStream,
     upstream_idle: Option<Duration>,
 ) -> Relayed {
+    relay(down, upc, upstream_idle, None).await
+}
+
+// splice_with_idle for a bootstrap connection whose writes to the node began at `since`: they
+// may stall for BOOTSTRAP_NODE_WRITE_TIMEOUT during its first BOOTSTRAP_SLOW_WINDOW (see there).
+pub(crate) async fn splice_bootstrap(
+    down: TcpStream,
+    upc: TcpStream,
+    upstream_idle: Option<Duration>,
+    since: Instant,
+) -> Relayed {
+    relay(down, upc, upstream_idle, Some(since)).await
+}
+
+async fn relay(
+    down: TcpStream,
+    upc: TcpStream,
+    upstream_idle: Option<Duration>,
+    bootstrap_since: Option<Instant>,
+) -> Relayed {
     let up_ip = upc
         .peer_addr()
         .map(|a| a.ip().to_string())
@@ -74,7 +94,10 @@ pub(crate) async fn splice_with_idle(
                     Ok(0) | Err(_) => break true,
                     Ok(n) => n,
                 };
-                match timeout(NODE_WRITE_TIMEOUT, dw.write_all(&buf[..n])).await {
+                let write_timeout = bootstrap_since.map_or(NODE_WRITE_TIMEOUT, |since| {
+                    bootstrap_write_timeout(since, Instant::now())
+                });
+                match timeout(write_timeout, dw.write_all(&buf[..n])).await {
                     Ok(Ok(())) => {}
                     _ => break false,
                 }
@@ -141,6 +164,26 @@ const PUSH_MERGE_QUEUE_FRAMES: usize = 256;
 
 // Generous: the node normally drains 4001 continuously; only a stuck/half-open node hits this.
 pub(crate) const NODE_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
+// A node that has received the abci_state stops reading while it loads it, before it reads the
+// EVM KVs that follow (2026-11-09, a fresh node on a 16-core Linode: 57 s for a 1.37 GB state).
+// Its socket fills and the relay's writes stall all that time; cut at NODE_WRITE_TIMEOUT, the
+// node saw "Evm Kvs read error: early eof" and started its bootstrap over. So writes on a
+// bootstrap connection may stall BOOTSTRAP_NODE_WRITE_TIMEOUT during its first
+// BOOTSTRAP_SLOW_WINDOW (a whole bootstrap takes a few minutes); after that a hung node is
+// dropped at NODE_WRITE_TIMEOUT, as on every other connection. 300 s: a wipe-and-restart on the
+// same Linode measured 145 s in the EVM KVs phase, leaving 180 s only 35 s of headroom.
+pub(crate) const BOOTSTRAP_NODE_WRITE_TIMEOUT: Duration = Duration::from_secs(300);
+pub(crate) const BOOTSTRAP_SLOW_WINDOW: Duration = Duration::from_secs(15 * 60);
+
+// The bound on one node write of a bootstrap connection opened at `since`.
+pub(crate) fn bootstrap_write_timeout(since: Instant, now: Instant) -> Duration {
+    if now.saturating_duration_since(since) < BOOTSTRAP_SLOW_WINDOW {
+        BOOTSTRAP_NODE_WRITE_TIMEOUT
+    } else {
+        NODE_WRITE_TIMEOUT
+    }
+}
 
 // An upstream greeting reply is a few bytes sent right away; hl-node itself gives up ~5s after
 // greeting, so a longer wait only serves a dead connection.
@@ -1118,6 +1161,25 @@ mod tests {
         // steady traffic (every 100ms, under the 300ms limit) keeps the relay up past 1.5s
         let (_, (to_node, _)) = relay(Some(Duration::from_millis(100))).await;
         assert_eq!(to_node, u64::MAX, "still relaying when the test stopped it");
+    }
+
+    #[test]
+    fn a_bootstrap_connection_tolerates_a_loading_node_only_at_first() {
+        let t0 = Instant::now();
+        assert_eq!(
+            bootstrap_write_timeout(t0, t0),
+            BOOTSTRAP_NODE_WRITE_TIMEOUT
+        );
+        let late = t0 + BOOTSTRAP_SLOW_WINDOW - Duration::from_secs(1);
+        assert_eq!(
+            bootstrap_write_timeout(t0, late),
+            BOOTSTRAP_NODE_WRITE_TIMEOUT
+        );
+        let after = t0 + BOOTSTRAP_SLOW_WINDOW;
+        assert_eq!(bootstrap_write_timeout(t0, after), NODE_WRITE_TIMEOUT);
+        // longer than the 145 s EVM KVs phase measured on a fresh Linode after a wipe
+        assert!(BOOTSTRAP_NODE_WRITE_TIMEOUT > Duration::from_secs(145));
+        assert!(BOOTSTRAP_NODE_WRITE_TIMEOUT < BOOTSTRAP_SLOW_WINDOW);
     }
 
     #[tokio::test]

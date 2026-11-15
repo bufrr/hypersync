@@ -2,8 +2,8 @@ use crate::failover::{serve_failover, FailoverConfig, FailoverCtx};
 use crate::priority::{gwlog, PrioritySession, PriorityTier};
 use crate::protocol::{max_block_round_in_frames, unix_secs, MIN_COMPLETE_BOOTSTRAP_BYTES};
 use crate::push::{
-    push_exit_is_upstream_fault, serve_push, splice_with_idle, PushConfig, Relayed,
-    NODE_WRITE_TIMEOUT,
+    bootstrap_write_timeout, push_exit_is_upstream_fault, serve_push, splice_bootstrap,
+    splice_with_idle, PushConfig, Relayed, NODE_WRITE_TIMEOUT,
 };
 use crate::util::lock;
 use std::collections::HashMap;
@@ -282,8 +282,15 @@ async fn replay_cache_then_live(
     // write keeps every syscall small; a real node reads too slowly to trigger it, a
     // cache-draining fakenode reliably does.
     let mut replay_err = false;
+    let replay_start = Instant::now();
     for chunk in blob.chunks(8 * 1024 * 1024) {
-        if !node_write(&mut down, chunk).await {
+        if !node_write(
+            &mut down,
+            chunk,
+            bootstrap_write_timeout(replay_start, Instant::now()),
+        )
+        .await
+        {
             replay_err = true;
             break;
         }
@@ -473,13 +480,19 @@ async fn transparent_bootstrap(
                 node.ip
             );
         }
-        // bounded like every other node write: a node that stops reading must not park this
-        // task (and its pin, priority slot and upstream connection) until TCP gives up
+        // Bounded by the bootstrap window, which the relay below continues: the 64MB prefetch is
+        // one write, and a node on a link under ~17 Mbit/s needs more than NODE_WRITE_TIMEOUT for
+        // it. A node that stops reading still can't park this task (and its pin, priority slot
+        // and upstream connection) until TCP gives up.
+        let started = Instant::now();
         for chunk in [&hdr[..], &payload_prefix[..]] {
-            if !matches!(
-                timeout(NODE_WRITE_TIMEOUT, down.write_all(chunk)).await,
-                Ok(Ok(()))
-            ) {
+            if !node_write(
+                &mut down,
+                chunk,
+                bootstrap_write_timeout(started, Instant::now()),
+            )
+            .await
+            {
                 return;
             }
         }
@@ -488,7 +501,7 @@ async fn transparent_bootstrap(
         // connection (2026-10-21 2-node soak: 68MB resident for 25+ min).
         let prefetched = (hdr.len() + payload_prefix.len()) as u64;
         drop(payload_prefix);
-        let mut r = splice_with_idle(down, upc, Some(RELAY_UPSTREAM_IDLE)).await;
+        let mut r = splice_bootstrap(down, upc, Some(RELAY_UPSTREAM_IDLE), started).await;
         r.to_node += prefetched;
         r
     };

@@ -6,7 +6,8 @@ use crate::protocol::{
     GREET_TRUE, MIN_COMPLETE_BOOTSTRAP_BYTES,
 };
 use crate::push::{
-    copy_node_to_upstream, AbortOnDrop, Relayed, NODE_WRITE_TIMEOUT, RELAY_UPSTREAM_WRITE_TIMEOUT,
+    bootstrap_write_timeout, copy_node_to_upstream, AbortOnDrop, Relayed,
+    RELAY_UPSTREAM_WRITE_TIMEOUT,
 };
 use crate::util::lock;
 use std::collections::HashSet;
@@ -91,12 +92,14 @@ fn install_bootstrap_cache(blob: Vec<u8>, source: &str, sink: &CacheSink) {
     }
 }
 
-// One bounded write to a node (NODE_WRITE_TIMEOUT); false = the node is gone or not reading.
-pub(super) async fn node_write<W: AsyncWrite + Unpin>(w: &mut W, buf: &[u8]) -> bool {
-    matches!(
-        timeout(NODE_WRITE_TIMEOUT, w.write_all(buf)).await,
-        Ok(Ok(()))
-    )
+// One write to a node bounded by `limit` (a bootstrap's: bootstrap_write_timeout); false = the
+// node is gone or not reading.
+pub(super) async fn node_write<W: AsyncWrite + Unpin>(
+    w: &mut W,
+    buf: &[u8],
+    limit: Duration,
+) -> bool {
+    matches!(timeout(limit, w.write_all(buf)).await, Ok(Ok(())))
 }
 
 // Transparent bootstrap fallback, with a write-through cache tap. This keeps the node's real peer
@@ -116,6 +119,8 @@ pub(super) async fn splice_bootstrap_capture(
         .unwrap_or_default();
     let (mut dr, mut dw) = down.into_split();
     let (mut ur, mut uw) = upc.into_split();
+    let started = Instant::now();
+    let write_limit = move || bootstrap_write_timeout(started, Instant::now());
     // bytes relayed to the node, and whether the upstream side ended the relay (closed, failed,
     // went silent for `upstream_idle`, or sent a malformed frame) rather than the node
     let delivered = Arc::new(AtomicU64::new(0));
@@ -223,7 +228,7 @@ pub(super) async fn splice_bootstrap_capture(
                     blob = Vec::new();
                     capture = false;
                 }
-                if !node_write(&mut dw, &hdr).await {
+                if !node_write(&mut dw, &hdr, write_limit()).await {
                     break;
                 }
                 delivered.fetch_add(5, Ordering::Relaxed);
@@ -237,7 +242,7 @@ pub(super) async fn splice_bootstrap_capture(
                         upstream_gone();
                         break;
                     }
-                    if !node_write(&mut dw, &payload_prefix).await {
+                    if !node_write(&mut dw, &payload_prefix, write_limit()).await {
                         break;
                     }
                     delivered.fetch_add(payload_prefix.len() as u64, Ordering::Relaxed);
@@ -256,7 +261,7 @@ pub(super) async fn splice_bootstrap_capture(
                             return;
                         }
                     };
-                    if !node_write(&mut dw, &buf[..n]).await {
+                    if !node_write(&mut dw, &buf[..n], write_limit()).await {
                         return;
                     }
                     delivered.fetch_add(n as u64, Ordering::Relaxed);
