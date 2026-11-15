@@ -352,7 +352,7 @@ impl Drop for NodeConnGuard {
     }
 }
 
-// The gateway binds 0.0.0.0 with no allowlist; scanners must not grow the registry unbounded.
+// Only whitelisted downstreams reach this registry; cap their retained state regardless.
 const NODE_STATE_CAP: usize = 256;
 
 // Keep state across node restarts; prune entries idle this long.
@@ -392,6 +392,11 @@ pub(super) struct NodeRegistry {
 }
 
 impl NodeRegistry {
+    #[cfg(test)]
+    pub(super) fn len(&self) -> usize {
+        lock(&self.nodes).len()
+    }
+
     // Returns the node's state plus a guard that holds its open-connection count; keep the guard
     // alive for the life of the connection task.
     pub(super) fn get_or_insert(&self, ip: IpAddr, now: u64) -> (Arc<NodeState>, NodeConnGuard) {

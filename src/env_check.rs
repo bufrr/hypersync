@@ -66,6 +66,28 @@ pub(crate) fn problems(get: impl Fn(&str) -> Option<String>, gateway: bool) -> V
         return out;
     }
 
+    if let Some(raw) = get("HYPERSYNC_NODE_WHITELIST") {
+        for (i, item) in raw
+            .split(',')
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .enumerate()
+        {
+            match crate::whitelist::parse_entry(item) {
+                None => out.push(format!(
+                    "HYPERSYNC_NODE_WHITELIST entry #{} is not an IP address or CIDR",
+                    i + 1
+                )),
+                // the gateway also rejects entries containing its default gateway, at reload
+                Some(net) if crate::whitelist::too_broad(&net, &[]).is_some() => out.push(format!(
+                    "HYPERSYNC_NODE_WHITELIST entry #{} is a /0: it would serve every address",
+                    i + 1
+                )),
+                Some(_) => {}
+            }
+        }
+    }
+
     if let Some(v) = get("HYPERSYNC_PRIORITY_EXCLUSIVE") {
         if parse_bool(&v).is_none() {
             out.push(not_a(
@@ -273,6 +295,41 @@ mod tests {
             false
         )
         .is_empty());
+    }
+
+    #[test]
+    fn node_whitelist_entries_are_checked_only_for_the_gateway_without_echoing_values() {
+        assert!(problems(
+            env(&[(
+                "HYPERSYNC_NODE_WHITELIST",
+                "203.0.113.7, 192.168.1.5/24,,2001:db8::/64",
+            )]),
+            true,
+        )
+        .is_empty());
+        assert!(problems(env(&[("HYPERSYNC_NODE_WHITELIST", "not-a-node")]), false,).is_empty());
+        let p = problems(
+            env(&[(
+                "HYPERSYNC_NODE_WHITELIST",
+                "203.0.113.7:4001,not-a-node,,192.168.1.0/33",
+            )]),
+            true,
+        );
+        assert_eq!(p.len(), 3, "{p:?}");
+        for (i, line) in p.iter().enumerate() {
+            assert!(line.contains(&format!("#{}", i + 1)), "{line}");
+            assert!(!line.contains("203.0.113.7"), "{line}");
+            assert!(!line.contains("not-a-node"), "{line}");
+            assert!(!line.contains("192.168.1.0"), "{line}");
+        }
+        // a /0 would serve every address
+        let p = problems(
+            env(&[("HYPERSYNC_NODE_WHITELIST", "203.0.113.7,0.0.0.0/0,::/0")]),
+            true,
+        );
+        assert_eq!(p.len(), 2, "{p:?}");
+        assert!(p[0].contains("#2") && p[0].contains("/0"), "{}", p[0]);
+        assert!(p[1].contains("#3") && p[1].contains("/0"), "{}", p[1]);
     }
 
     #[test]

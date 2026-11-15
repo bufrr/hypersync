@@ -2,6 +2,7 @@ mod cache;
 mod client_blocks;
 mod node;
 mod pace;
+mod public;
 mod select;
 mod session;
 
@@ -145,6 +146,85 @@ fn fresh_peer_file_tip(path: &str) -> Option<u32> {
     extract_round_tip(&std::fs::read_to_string(path).ok()?)
 }
 
+// Accept on one gateway listener. The logical HL port is passed separately so tests can bind an
+// ephemeral local port. A stranger is dispatched before any node registry, pool or dial work.
+async fn serve_port(
+    l: TcpListener,
+    port: u16,
+    pool: Arc<Mutex<Vec<String>>>,
+    nodes: Arc<NodeRegistry>,
+    ctx: GatewayCtx,
+    public: Arc<public::Public>,
+) {
+    loop {
+        let (down, addr) = match l.accept().await {
+            Ok(x) => x,
+            Err(e) => {
+                // e.g. out of file descriptors: the listener is public, so a retry with no pause
+                // would spin a core for as long as the condition lasts
+                gwlog!("[gw] accept :{port}: {e}");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+        if !crate::whitelist::contains(addr.ip()) {
+            public.handle(down, addr.ip(), port);
+            continue;
+        }
+        let pool = pool.clone();
+        let nodes = nodes.clone();
+        let ctx = ctx.clone();
+        tokio::spawn(async move {
+            let mut down = down;
+            down.set_nodelay(true).ok();
+            let (node, _conn_guard) = nodes.get_or_insert(addr.ip(), unix_secs());
+            let peers = ctx.cooldown.usable(lock(&pool).clone(), Instant::now());
+            if peers.is_empty() && ctx.priority.is_empty() {
+                return;
+            }
+            if port == 4001 {
+                let mut greet = [0u8; 8];
+                if !matches!(
+                    timeout(Duration::from_secs(20), down.read_exact(&mut greet)).await,
+                    Ok(Ok(_))
+                ) {
+                    return;
+                }
+                gwlog!(
+                    "[gw] [{}] 4001 node greeting {}",
+                    node.ip,
+                    hex_bytes(&greet)
+                );
+                if greet[5] == 1 {
+                    handle_4001_bootstrap(down, node, peers, greet, ctx).await;
+                } else {
+                    handle_4001_live(down, node, peers, greet, ctx).await;
+                }
+            } else if should_fetch_forward_client_blocks(port) {
+                // 4002 client-block RPC is request/response. Always fetch-forward it through
+                // the current active peer so we can detect "Peer-only request" and wait for a
+                // fresh active instead of leaking the rejection to the node.
+                serve_client_blocks(
+                    down,
+                    node.clone(),
+                    ctx.priority.clone(),
+                    peers,
+                    ctx.rr.clone(),
+                    ctx.freshest.clone(),
+                )
+                .await;
+            } else {
+                // Other gossip channels stay transparently spliced to the node's active peer.
+                let Some(upc) = dial_active(&node, &ctx.priority, &peers, &ctx.rr, port).await
+                else {
+                    return;
+                };
+                splice(down, upc).await;
+            }
+        });
+    }
+}
+
 // Full P2P gateway. Every downstream node connects ONLY to the gateway; the gateway provides all of
 // HL's sync P2P backed by MULTIPLE upstream peers (the priority tier first, then the pool from the
 // node's own peer file, a startup path arg):
@@ -159,6 +239,13 @@ pub(crate) async fn run_gateway(node_peer_file: String, push: bool, cache_coldst
     let priority = Arc::new(PriorityTier::from_env());
     let blacklist_dir = peer_file_dir(&node_peer_file);
     crate::blacklist::reload("gw", &blacklist_dir);
+    if crate::whitelist::reload("gw", &blacklist_dir) == 0 {
+        gwlog!(
+            "[gw] no node is whitelisted (HYPERSYNC_NODE_WHITELIST or {}): every connection would get probe answers only; refusing to start",
+            blacklist_dir.join(crate::whitelist::FILE_NAME).display()
+        );
+        std::process::exit(2);
+    }
     let pool: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(read_pool(&priority, &node_peer_file)));
     // cached verbatim bootstrap (abci_state + EVM KVs) for cold-start without a peer state fetch
     let boot_blob: Arc<Mutex<Option<Arc<Vec<u8>>>>> = Arc::new(Mutex::new(None));
@@ -229,9 +316,21 @@ pub(crate) async fn run_gateway(node_peer_file: String, push: bool, cache_coldst
         let priority = priority.clone();
         tokio::spawn(async move {
             let mut last_fresh_tip = Instant::now();
+            let mut empty_whitelist_warned = false;
             loop {
                 tokio::time::sleep(Duration::from_secs(30)).await;
                 crate::blacklist::reload("gw", &blacklist_dir);
+                let whitelist_len = crate::whitelist::reload("gw", &blacklist_dir);
+                if whitelist_len == 0 {
+                    if !empty_whitelist_warned {
+                        gwlog!(
+                            "[gw] WARN node whitelist is empty: new connections get probe answers only; running node sessions are unchanged"
+                        );
+                        empty_whitelist_warned = true;
+                    }
+                } else {
+                    empty_whitelist_warned = false;
+                }
                 let p = read_pool(&priority, &path);
                 if p.is_empty() {
                     // missing/unreadable/empty file (peerd itself never writes an empty pool over
@@ -486,78 +585,28 @@ pub(crate) async fn run_gateway(node_peer_file: String, push: bool, cache_coldst
     // so the node streams the complete abci_state + EVM KVs + live blocks straight from a fresh peer.
     // Round-robin start means node/gateway restarts rotate to a different fresh state-server (no
     // per-peer abci_state rate-limit). The whole pool behind the gateway is the failover set.
-    let mut handles = Vec::new();
+    // Bind every listener before serving any: a port that can't be bound exits the process (so
+    // the container restarts) rather than leaving a gateway that looks up but never answers there
+    // — on 4001/4002 that includes the upstream peers' probes.
+    let mut listeners = Vec::new();
     for port in 4000u16..=4010 {
+        match TcpListener::bind(("0.0.0.0", port)).await {
+            Ok(l) => listeners.push((port, l)),
+            Err(e) => {
+                gwlog!("[gw] bind :{port}: {e}; exiting");
+                std::process::exit(1);
+            }
+        }
+    }
+    let public = Arc::new(public::Public::new());
+    public.spawn_stats_logger();
+    let mut handles = Vec::new();
+    for (port, l) in listeners {
         let pool = pool.clone();
         let nodes = nodes.clone();
         let ctx = ctx.clone();
-        handles.push(tokio::spawn(async move {
-            let l = match TcpListener::bind(("0.0.0.0", port)).await {
-                Ok(l) => l,
-                Err(e) => {
-                    gwlog!("[gw] bind :{port}: {e}");
-                    return;
-                }
-            };
-            loop {
-                let (down, addr) = match l.accept().await {
-                    Ok(x) => x,
-                    Err(_) => continue,
-                };
-                let pool = pool.clone();
-                let nodes = nodes.clone();
-                let ctx = ctx.clone();
-                tokio::spawn(async move {
-                    let mut down = down;
-                    down.set_nodelay(true).ok();
-                    let (node, _conn_guard) = nodes.get_or_insert(addr.ip(), unix_secs());
-                    let peers = ctx.cooldown.usable(lock(&pool).clone(), Instant::now());
-                    if peers.is_empty() && ctx.priority.is_empty() {
-                        return;
-                    }
-                    if port == 4001 {
-                        let mut greet = [0u8; 8];
-                        if !matches!(
-                            timeout(Duration::from_secs(20), down.read_exact(&mut greet)).await,
-                            Ok(Ok(_))
-                        ) {
-                            return;
-                        }
-                        gwlog!(
-                            "[gw] [{}] 4001 node greeting {}",
-                            node.ip,
-                            hex_bytes(&greet)
-                        );
-                        if greet[5] == 1 {
-                            handle_4001_bootstrap(down, node, peers, greet, ctx).await;
-                        } else {
-                            handle_4001_live(down, node, peers, greet, ctx).await;
-                        }
-                    } else if should_fetch_forward_client_blocks(port) {
-                        // 4002 client-block RPC is request/response. Always fetch-forward it through
-                        // the current active peer so we can detect "Peer-only request" and wait for a
-                        // fresh active instead of leaking the rejection to the node.
-                        serve_client_blocks(
-                            down,
-                            node.clone(),
-                            ctx.priority.clone(),
-                            peers,
-                            ctx.rr.clone(),
-                            ctx.freshest.clone(),
-                        )
-                        .await;
-                    } else {
-                        // Other gossip channels stay transparently spliced to the node's active peer.
-                        let Some(upc) =
-                            dial_active(&node, &ctx.priority, &peers, &ctx.rr, port).await
-                        else {
-                            return;
-                        };
-                        splice(down, upc).await;
-                    }
-                });
-            }
-        }));
+        let public = public.clone();
+        handles.push(tokio::spawn(serve_port(l, port, pool, nodes, ctx, public)));
     }
     for h in handles {
         let _ = h.await;
@@ -572,6 +621,120 @@ pub(crate) use self::client_blocks::{
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    fn routing_ctx() -> GatewayCtx {
+        let net_round_tip = Arc::new(AtomicU32::new(0));
+        GatewayCtx {
+            rr: Arc::new(AtomicUsize::new(0)),
+            boot_blob: Arc::new(Mutex::new(None)),
+            boot_blob_cached_at: Arc::new(AtomicU64::new(0)),
+            disk_cache_path: None,
+            capture_tap: Arc::new(tokio::sync::Semaphore::new(1)),
+            net_round_tip: net_round_tip.clone(),
+            state_servers: Arc::new(Mutex::new(Vec::new())),
+            priority: Arc::new(PriorityTier::new(
+                Vec::new(),
+                0,
+                Duration::from_millis(1500),
+                crate::priority::BootstrapPolicy::Fallback,
+            )),
+            pool: Arc::new(Mutex::new(vec!["203.0.113.1".into()])),
+            cooldown: Arc::new(PeerCooldown::default()),
+            freshest: Arc::new(FreshestRound::new(
+                PEER_LAG_ROUNDS,
+                PEER_LAG_GRACE,
+                FRESHEST_STALE,
+                net_round_tip,
+            )),
+            cache_coldstart: false,
+            push: false,
+        }
+    }
+
+    async fn routing_listener(port: u16) -> (std::net::SocketAddr, Arc<NodeRegistry>) {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let nodes = Arc::new(NodeRegistry::default());
+        let ctx = routing_ctx();
+        let pool = ctx.pool.clone();
+        tokio::spawn(serve_port(
+            l,
+            port,
+            pool,
+            nodes.clone(),
+            ctx,
+            Arc::new(public::Public::new()),
+        ));
+        (addr, nodes)
+    }
+
+    async fn ask(addr: std::net::SocketAddr, request: &[u8]) -> Vec<u8> {
+        let mut c = TcpStream::connect(addr).await.unwrap();
+        c.write_all(request).await.unwrap();
+        c.shutdown().await.unwrap();
+        let mut out = Vec::new();
+        timeout(Duration::from_secs(5), c.read_to_end(&mut out))
+            .await
+            .expect("public answer did not close")
+            .unwrap();
+        out
+    }
+
+    #[tokio::test]
+    async fn stranger_4001_gets_peer_full_without_node_state() {
+        let _g = crate::whitelist::TEST_LOCK.lock().await;
+        crate::whitelist::install(&[]);
+        let (addr, nodes) = routing_listener(4001).await;
+        assert_eq!(
+            ask(addr, &crate::protocol::GREET_FALSE).await,
+            public::PEER_FULL
+        );
+        assert_eq!(nodes.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn stranger_4002_gets_an_empty_peer_table_without_node_state() {
+        let _g = crate::whitelist::TEST_LOCK.lock().await;
+        crate::whitelist::install(&[]);
+        let (addr, nodes) = routing_listener(4002).await;
+        assert_eq!(
+            ask(addr, &[0, 0, 0, 1, 0, 1]).await,
+            public::EMPTY_PEER_TABLE
+        );
+        assert_eq!(nodes.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn stranger_on_another_port_is_closed_without_node_state() {
+        let _g = crate::whitelist::TEST_LOCK.lock().await;
+        crate::whitelist::install(&[]);
+        let (addr, nodes) = routing_listener(4005).await;
+        assert!(ask(addr, &[]).await.is_empty());
+        assert_eq!(nodes.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn whitelisted_loopback_reaches_node_service_not_public_answers() {
+        let _g = crate::whitelist::TEST_LOCK.lock().await;
+        crate::whitelist::install(&["127.0.0.1"]);
+        let (addr, nodes) = routing_listener(4005).await;
+        let mut c = TcpStream::connect(addr).await.unwrap();
+        for _ in 0..50 {
+            if nodes.len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(nodes.len(), 1, "whitelisted source got no node state");
+        // The public path would have closed this port at once. The node path is still waiting for
+        // its active-peer selection instead of sending a public answer.
+        let mut byte = [0u8; 1];
+        assert!(timeout(Duration::from_millis(100), c.read(&mut byte))
+            .await
+            .is_err());
+        crate::whitelist::install(&[]);
+    }
 
     #[test]
     fn net_tip_follows_fresh_readings_and_resets_when_they_stop() {

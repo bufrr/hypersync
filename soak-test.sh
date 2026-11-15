@@ -2,11 +2,12 @@
 # hypersync stability soak monitor: samples the node's applied-block rate, gateway-only sync
 # source, real error count, and container health at a fixed interval. Companion to peerd.sh.
 #
-# "Real" errors exclude internet-scanner noise by SIGNATURE, not by source IP: the node never
-# receives inbound peer connections (it only dials out), so any "tcp greeting ... gossip" /
-# "gossip rpc request ..." over-limit error is always scanner noise hitting the node's public
-# ports, regardless of which IP sent it. A real sync-path error has a different desc (e.g.
-# "abci_stream recv greeting", "process_client_block error").
+# "Real" errors exclude internet-scanner noise by SIGNATURE, not by source IP. With the current
+# whitelist-gated public gateway, non-node probes are answered by the gateway and never reach the
+# node. A legacy direct node may still log "tcp greeting ... gossip" / "gossip rpc request ..."
+# over-limit errors from its public ports; those are scanner noise regardless of which IP sent them.
+# A real sync-path error has a different desc (e.g. "abci_stream recv greeting",
+# "process_client_block error").
 # A cache replay can log "receiving evm kvs for checkpoint that already exists" when the node has
 # a leftover EVM checkpoint but no linked ABCI state during restart; the node recovers by relinking
 # state, so the monitor does not treat that specific line as fatal.

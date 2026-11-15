@@ -144,7 +144,7 @@ gateway, so all of it is other peers' doing):
 | Pool peers | 94 | 4001 greetings, 29 of them `send_abci:true`; node1 accepted the live ones (status `03`) and uploaded 6.5 GB in the hour |
 
 So a node's public ports mostly answer reachability checks, and otherwise serve strangers. The
-gateway's probe responder (README "Public probe responder") answers the checks in its place:
+gateway answers the checks in its place for every non-whitelisted source (README "Public probe answers"):
 connect-only probes are held until the peer closes, a greeting gets the peer-full status
 `00 00 00 01 00 04`, `query_peers` an empty table `00 00 00 02 00 01 00`, any other RPC the
 structured Peer-only (§8b). No block is served.

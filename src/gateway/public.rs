@@ -1,24 +1,25 @@
-// Public probe responder (`hypersync responder [<bind-ip>]`): answers what peers send to the
-// public 4001/4002 of an IP that peers with them, so a node behind the gateway needs no public
-// ports and the gateway host alone holds the address the upstreams know.
+// Public probe answers for gateway connections whose source IP is not node-whitelisted. The
+// gateway's listeners are public, but a stranger never reaches node state or an upstream dial.
 //
-// Captured on node1's public ports (docs/hl-p2p-protocol.md §8c): QuickNode and pool peers open
-// 4001 and close it without sending a byte (a reachability check) and ask 4002 for query_peers;
-// some pool peers also greet 4001 to pull a live stream or ask 4002 for heights.
+// Captured on public 4001/4002 (docs/hl-p2p-protocol.md §8c): QuickNode and pool peers open 4001
+// and close it without sending a byte (a reachability check) and ask 4002 for query_peers; some
+// pool peers also greet 4001 to pull a live stream or ask 4002 for heights.
 //
-// What it answers, and nothing more:
+// What a stranger gets, and nothing more:
 // - 4001: a connect-only probe is held until the peer closes; a greeting gets the "peer full"
 //   status a busy node sends, then the connection closes. No block is ever sent.
-// - 4002: query_peers gets an empty peer table; any other request gets the structured
-//   Peer-only error.
+// - 4002: query_peers gets an empty peer table; any other request gets the structured Peer-only
+//   error; a malformed or oversized request gets no answer.
+// - every other port: immediate close without a read.
 // It never dials out: nothing it receives reaches a node or an upstream.
 
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
 
@@ -26,22 +27,22 @@ use crate::priority::{gwlog, is_priority};
 
 // a probe that never closes is dropped after this; a real greeting or request arrives at once
 const IDLE: Duration = Duration::from_secs(10);
-// connections held at once across both ports; past it a new one is closed unanswered
+// connections held at once across all public ports; past it a new one is closed unanswered
 const MAX_CONNS: usize = 256;
 // the longest request accepted on 4002 (query_peers is 1 byte, a range query 11)
 const MAX_REQUEST: usize = 64;
 const STATS_EVERY: Duration = Duration::from_secs(600);
 
 // [L=1][type=0][4]: the refusal a full node sends to a 4001 greeting (protocol::response_is_peer_full)
-pub(crate) const PEER_FULL: [u8; 6] = [0, 0, 0, 1, 0, 4];
+pub(super) const PEER_FULL: [u8; 6] = [0, 0, 0, 1, 0, 4];
 // [L=2][type=0][0x01 query_peers][count 0]
-pub(crate) const EMPTY_PEER_TABLE: [u8; 7] = [0, 0, 0, 2, 0, 0x01, 0];
+pub(super) const EMPTY_PEER_TABLE: [u8; 7] = [0, 0, 0, 2, 0, 0x01, 0];
 // [L=3][type=0][00 01 00]: error, variant 0 = Peer-only request (gateway::response_is_peer_only)
-pub(crate) const PEER_ONLY: [u8; 8] = [0, 0, 0, 3, 0, 0x00, 0x01, 0x00];
+const PEER_ONLY: [u8; 8] = [0, 0, 0, 3, 0, 0x00, 0x01, 0x00];
 const QUERY_PEERS: [u8; 2] = [0, 0x01]; // type 0, variant 1
 
 #[derive(Default)]
-pub(crate) struct Stats {
+pub(super) struct Stats {
     probes: AtomicU64,
     greetings: AtomicU64,
     query_peers: AtomicU64,
@@ -49,10 +50,11 @@ pub(crate) struct Stats {
     bad: AtomicU64,
     busy: AtomicU64,
     from_priority: AtomicU64,
+    other_port: AtomicU64,
 }
 
 impl Stats {
-    fn take(&self) -> [u64; 7] {
+    fn take(&self) -> [u64; 8] {
         [
             &self.probes,
             &self.greetings,
@@ -61,60 +63,57 @@ impl Stats {
             &self.bad,
             &self.busy,
             &self.from_priority,
+            &self.other_port,
         ]
         .map(|c| c.swap(0, Ordering::Relaxed))
     }
 }
 
-pub(crate) async fn run_responder(bind_ip: &str) {
-    let stats = Arc::new(Stats::default());
-    let slots = Arc::new(Semaphore::new(MAX_CONNS));
-    let mut tasks = Vec::new();
-    for port in [4001u16, 4002] {
-        let l = match TcpListener::bind((bind_ip, port)).await {
-            Ok(l) => l,
-            Err(e) => {
-                gwlog!("[responder] bind :{port}: {e}");
-                std::process::exit(1);
-            }
-        };
-        tasks.push(tokio::spawn(serve(l, port, slots.clone(), stats.clone())));
-    }
-    gwlog!("[responder] answering probes on :4001 and :4002");
-    let st = stats.clone();
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(STATS_EVERY).await;
-            let [p, g, q, o, b, busy, prio] = st.take();
-            gwlog!(
-                "[responder] last {}s: 4001 probes={p} greetings={g} | 4002 query_peers={q} other={o} | malformed={b} busy={busy} | from priority peers={prio}",
-                STATS_EVERY.as_secs()
-            );
-        }
-    });
-    for t in tasks {
-        let _ = t.await;
-    }
+pub(super) struct Public {
+    stats: Arc<Stats>,
+    slots: Arc<Semaphore>,
 }
 
-pub(crate) async fn serve(l: TcpListener, port: u16, slots: Arc<Semaphore>, stats: Arc<Stats>) {
-    loop {
-        let (s, addr) = match l.accept().await {
-            Ok(x) => x,
-            Err(e) => {
-                gwlog!("[responder] accept :{port}: {e}");
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                continue;
-            }
-        };
-        let Ok(permit) = slots.clone().try_acquire_owned() else {
-            stats.busy.fetch_add(1, Ordering::Relaxed);
-            continue; // dropping `s` closes it
-        };
-        if is_priority(&addr.ip().to_string()) {
-            stats.from_priority.fetch_add(1, Ordering::Relaxed);
+impl Public {
+    pub(super) fn new() -> Self {
+        Self {
+            stats: Arc::new(Stats::default()),
+            slots: Arc::new(Semaphore::new(MAX_CONNS)),
         }
-        let stats = stats.clone();
+    }
+
+    pub(super) fn spawn_stats_logger(&self) {
+        let stats = self.stats.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(STATS_EVERY).await;
+                let [p, g, q, o, b, busy, prio, other] = stats.take();
+                gwlog!(
+                    "[gw] [public] last {}s: 4001 probes={p} greetings={g} | 4002 query_peers={q} other={o} | other ports={other} malformed={b} busy={busy} | from priority peers={prio}",
+                    STATS_EVERY.as_secs()
+                );
+            }
+        });
+    }
+
+    // Synchronous dispatch: the gateway accept loop never waits on a stranger. Addresses are used
+    // only for the priority counter, never logged per connection.
+    pub(super) fn handle(&self, s: TcpStream, ip: IpAddr, port: u16) {
+        let other_port = port != 4001 && port != 4002;
+        if other_port {
+            self.stats.other_port.fetch_add(1, Ordering::Relaxed);
+        }
+        let Ok(permit) = self.slots.clone().try_acquire_owned() else {
+            self.stats.busy.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        if is_priority(&ip.to_string()) {
+            self.stats.from_priority.fetch_add(1, Ordering::Relaxed);
+        }
+        if other_port {
+            return; // `s` closes without a read; the permit is released immediately
+        }
+        let stats = self.stats.clone();
         tokio::spawn(async move {
             let _permit = permit;
             s.set_nodelay(true).ok();
@@ -185,13 +184,24 @@ mod tests {
     use crate::protocol::response_is_peer_full;
 
     async fn responder() -> (std::net::SocketAddr, std::net::SocketAddr, Arc<Stats>) {
-        let stats = Arc::new(Stats::default());
-        let slots = Arc::new(Semaphore::new(MAX_CONNS));
+        use tokio::net::TcpListener;
+
+        let public = Arc::new(Public::new());
+        let stats = public.stats.clone();
         let l1 = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let l2 = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let (a1, a2) = (l1.local_addr().unwrap(), l2.local_addr().unwrap());
-        tokio::spawn(serve(l1, 4001, slots.clone(), stats.clone()));
-        tokio::spawn(serve(l2, 4002, slots, stats.clone()));
+        for (l, port) in [(l1, 4001), (l2, 4002)] {
+            let public = public.clone();
+            tokio::spawn(async move {
+                loop {
+                    let Ok((s, addr)) = l.accept().await else {
+                        continue;
+                    };
+                    public.handle(s, addr.ip(), port);
+                }
+            });
+        }
         (a1, a2, stats)
     }
 

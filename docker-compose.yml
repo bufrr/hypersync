@@ -2,22 +2,24 @@
 #
 # The gateway serves MULTIPLE downstream hl-nodes (sessions are keyed by the node's source IP —
 # one node per egress IP; two nodes NAT'd through one IP would be conflated). It reads no node
-# files: gw needs only /pd (peers.json + bootstrap.cache), peerd discovers upstream peers via the
-# gossipRootIps API + probing.
+# files: gw needs only /pd (peers.json + node_whitelist.txt + bootstrap.cache); peerd discovers
+# upstream peers via the gossipRootIps API + probing.
 #
 # Deployment modes:
 #   co-located (nodes on this machine):  node compose projects join the attachable gwnet below
 #     as an external network (name: hypersync_gwnet) and dial the gw's static IP 172.28.0.10.
-#     Leave gw `ports:` disabled. The host's public 4001/4002 are answered either by the node
-#     or, with `--profile public`, by the responder below (then the node publishes no ports).
-#     Container-internal 4001/4002 do not conflict with the node.
-#     Optionally add stats harvesting: docker compose -f docker-compose.yml \
-#       -f docker-compose.colocated.yml up -d
-#   remote (nodes on other machines):    expose gw only on a PRIVATE/VPN interface and firewall
-#     to node IPs. If a real HL node also runs on this host, it cannot already bind
-#     0.0.0.0:4000-4010; bind the node to the public IP and gw to the private/VPN IP. A
-#     gateway-only public IP without real HL node 4001/4002 behavior may be deprioritized by
-#     upstream peers: run the responder below (`--profile public`) on it.
+#     Whitelist each node's gwnet address: the dynamic range 172.28.0.128/25 covers the default
+#     pool, or assign static node IPs and list them individually.
+#   remote (nodes on other machines):    nodes dial the gateway host's public IP; whitelist each
+#     node's public source IP. No VPN is needed. Set HYPERSYNC_PUBLIC_BIND to publish only on one
+#     host address when needed.
+#
+# WARNING: never whitelist the gwnet bridge gateway 172.28.0.1 or a range containing it (for
+# example 172.28.0.0/24). Connections Docker's userland proxy forwards (IPv6, hairpin) arrive from
+# that address, so doing so would whitelist the whole internet.
+#
+# The gateway's 4000-4010 listeners are public. A whitelisted source gets the node service; every
+# other source gets probe answers on 4001/4002 and an immediate close on all other ports.
 #
 # Env (.env): HL_SELF_IP = comma-separated public IPs of ALL your nodes (keeps your own nodes out
 # of the upstream pool — otherwise the gateway can end up relaying your nodes to each other).
@@ -63,6 +65,9 @@ services:
       # IPs never dialed; also read from /pd/ip_blacklist.txt (= ./data/ip_blacklist.txt, re-read
       # every 30s)
       HYPERSYNC_IP_BLACKLIST: "${HYPERSYNC_IP_BLACKLIST:-}"
+      # IPs / CIDRs served as nodes (plus /pd/node_whitelist.txt, re-read every 30 s); every other
+      # source gets probe answers only. Required: the gateway refuses to start with none.
+      HYPERSYNC_NODE_WHITELIST: "${HYPERSYNC_NODE_WHITELIST:-}"
       # hot-standby failover (README "Hot-standby failover"); 0 standbys = off
       HYPERSYNC_FAILOVER_STANDBYS: "${HYPERSYNC_FAILOVER_STANDBYS:-0}"
       # pace reference stream for the lagging-peer guard (README "Dropping a peer"); 0 = off
@@ -77,31 +82,8 @@ services:
     # hl-node that pushed host memory past hl-visor's ~95% low-memory restart threshold
     # (2026-10-12 soak: 5 child restarts). Node cold-starts then bootstrap transparently via a peer.
     command: ["gateway", "/pd/peers.json", "--push"]
-    # remote mode ONLY — bind to a private/VPN interface and firewall to node IPs.
-    # Never publish gw on the same public 4001/4002 that belongs to the real HL node:
-    # ports:
-    #   - "${GW_BIND_IP:?set GW_BIND_IP to a private interface IP}:4000-4010:4000-4010"
-
-  # The only public listener (README "Public probe responder"): answers upstream peers' probes of
-  # this host's 4001/4002 so the nodes need no public ports. Opt-in, because it takes the host
-  # ports a node publishes: stop publishing them from the node, then
-  #   docker compose --profile public up -d responder
-  responder:
-    image: hypersync:latest
-    container_name: hypersync-responder
-    restart: unless-stopped
-    profiles: ["public"]
-    mem_limit: 256m
-    command: ["responder"]
-    environment:
-      # only to count probes from priority peers; never logged as addresses
-      HYPERSYNC_PRIORITY_PEERS: "${HYPERSYNC_PRIORITY_PEERS:-}"
-      HYPERSYNC_PRIORITY_PEERS_EXPECTED: "${HYPERSYNC_PRIORITY_PEERS_EXPECTED:-}"
-    # on every address (IPv4 and IPv6) by default; set HYPERSYNC_RESPONDER_BIND (.env) to the public IP when the
-    # gateway is also published on this host (e.g. on a VPN address for remote nodes)
     ports:
-      - "${HYPERSYNC_RESPONDER_BIND:+${HYPERSYNC_RESPONDER_BIND}:}4001:4001"
-      - "${HYPERSYNC_RESPONDER_BIND:+${HYPERSYNC_RESPONDER_BIND}:}4002:4002"
+      - "${HYPERSYNC_PUBLIC_BIND:+${HYPERSYNC_PUBLIC_BIND}:}4000-4010:4000-4010"
 
   peerd:
     image: hypersync:latest

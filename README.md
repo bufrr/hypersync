@@ -15,12 +15,13 @@ priority peers ──┼─▶ hypersync gateway ─▶ your hl-node(s)
 - **peerd** discovers peers (`gossipRootIps` API + a `query_peers` crawl), probes which ones serve live blocks, and writes `peers.json` for the gateway every cycle.
 - **Priority peers** (e.g. dedicated sentries) are tried first; the public pool is the backup.
 - A node only ingests blocks from peers it dials, so each node points `root_node_ips` at the gateway and dials nothing else.
-- **responder** (optional) answers the probes upstream peers send back to the gateway host's public 4001/4002, so the nodes need no public ports (below).
+- The gateway's public listeners answer upstream probe traffic from non-whitelisted sources on 4001/4002, so the nodes need no public ports (below).
 
 ## Quick start (docker compose)
 
 ```sh
 echo 'HL_SELF_IP=<public IPs of all your nodes, comma-separated>' > .env   # see Configuration
+echo 'HYPERSYNC_NODE_WHITELIST=172.28.0.128/25' >> .env  # co-located nodes on gwnet
 docker compose up -d    # gateway + peerd
 ```
 
@@ -30,11 +31,13 @@ Point each node at the gateway in `override_gossip_config.json` and restart it:
 {"root_node_ips": [{"Ip": "172.28.0.10"}], "try_new_peers": false, "chain": "Mainnet"}
 ```
 
-- **Same host:** the node's compose project joins the external `hypersync_gwnet` network and dials `172.28.0.10`.
-- **Other hosts:** publish the gateway's 4000-4010 only on a private/VPN address, firewalled to your nodes. If a real node on the same host owns the public 4000-4010, bind that node to the public IP and the gateway to the private one.
+- **Same host:** the node's compose project joins the external `hypersync_gwnet` network and dials `172.28.0.10`. Whitelist its gwnet address, or the default dynamic pool `172.28.0.128/25`.
+- **Other hosts:** add each remote node's public IPv4 source address or CIDR to `HYPERSYNC_NODE_WHITELIST`; the node dials the gateway host's public IPv4 address directly, with no VPN required. Use IPv4: under Compose an IPv6 connection reaches the gateway through Docker's proxy from `172.28.0.1`, so a node's IPv6 address can never be whitelisted. `HYPERSYNC_PUBLIC_BIND` optionally limits the host address on which the gateway publishes 4000-4010.
 - Smoke test: `docker run --rm --network hypersync_gwnet hypersync:latest fakenode 172.28.0.10 --rpc --label smoke`
 
-> **Never publish the gateway on the internet.** Anyone who reaches it can trigger a ~5.8 GB bootstrap relay. Upstream peers deprioritise IPs whose 4001/4002 don't answer, so the public 4001/4002 on your egress IP should be answered by a real hl-node or by the [probe responder](#public-probe-responder) — the only hypersync listener meant for the internet.
+> **Whitelist only your nodes.** A whitelisted source can trigger a ~5.8 GB bootstrap relay. The gateway refuses to start with an empty whitelist. The gwnet bridge gateway `172.28.0.1` must never be covered: Docker's userland proxy makes forwarded IPv6 and hairpin connections arrive from that address, so covering it would whitelist the whole internet. The gateway therefore rejects (logs and never installs) a `/0` or any entry containing its own default gateway, such as `172.28.0.0/24`. Non-whitelisted sources receive only the [public probe answers](#public-probe-answers).
+>
+> **Upgrading from the responder topology, or rolling back across it:** follow §12 of [docs/deploy-existing-hlnode.md](docs/deploy-existing-hlnode.md). Never run an image built before the whitelist with this compose file: it publishes 4000-4010 to the internet, and that image serves every source.
 
 ## Modes
 
@@ -44,7 +47,6 @@ Point each node at the gateway in `override_gossip_config.json` and restart it:
 | `peerd [interval-secs]` | Peer discovery and probing (default 300 s; compose uses 120). Run as its own container. |
 | `proxy <ip1,ip2,...> [--push]` | Failover proxy over a fixed upstream list instead of peerd's pool. |
 | `relay <ip>` | Plain relay of 4000-4010 to one upstream. |
-| `responder [<bind-ip>]` | Answers peers' probes on the public 4001/4002 (compose profile `public`). |
 | `fakenode <gw-ip> [--rpc] [--live-secs N] [--label X]` | Synthetic node for testing a gateway. |
 | `cache`, `mock`, `bench`, `<port> <peers>` | Testing only. |
 
@@ -53,24 +55,36 @@ Gateway flags:
 - **`--push`** (recommended): live blocks pass through the gateway's checks (below) instead of a raw splice, and a bad upstream ends the session so the node reconnects to a fresh one.
 - **`--cache`**: keep the full bootstrap (~5.8 GB) in memory and on disk and replay it to cold-starting nodes, avoiding the per-IP abci_state rate limit. Holds up to ~3 bootstraps at once (~17 GB: the cache plus a refresh capture and a fallback tap), which pushed a 64 GB host shared with an hl-node past hl-visor's low-memory restart threshold — so it is off by default. A capture is installed only if it ends in live blocks, but a hostile state peer could still append a few fake ones to an incomplete state; enable it only with state peers you trust. Without it, a node restart bootstraps from a peer that is serving state right now (the gateway remembers recent state servers).
 
-## Public probe responder
+## Public probe answers
 
 Upstream peers, QuickNode's sentries included, check the IP that peers with them: they open its
 4001 and close it without a byte, and ask its 4002 for `query_peers`. Some pool peers also greet
-4001 to pull a live stream or ask 4002 for heights. Without an answer there, a node had to own the
-host's public 4001/4002. The responder answers instead, and nothing else:
+4001 to pull a live stream or ask 4002 for heights. The gateway answers these probes whenever the
+connection's source IP is not in the node whitelist:
 
 - 4001: a probe is held until the peer closes it; a greeting gets the "peer full" status, then the
   connection closes. No block is ever sent.
 - 4002: `query_peers` gets an empty peer table; anything else gets the structured Peer-only error.
+- 4000 and 4003-4010: the connection closes immediately without a read.
 
-It never dials out, so nothing it receives reaches a node or an upstream. Every 10 minutes it logs
-how many probes it answered and how many came from priority peers.
+A non-whitelisted connection never creates node session state, dials an upstream or receives a
+block. Every 10 minutes the gateway logs public-answer counters, including other-port closes and
+probes from priority peers, under `[gw] [public]`. The gateway never logs a stranger's address per
+connection.
 
-To use it, stop publishing 4000-4010 from the node, then
-`docker compose --profile public up -d responder`. It binds every address by default; set
-`HYPERSYNC_RESPONDER_BIND` in `.env` to the public IP when the gateway is also published on this
-host (e.g. on a WireGuard address for remote nodes), so both can use 4001/4002.
+The whitelist is the union of `HYPERSYNC_NODE_WHITELIST` (comma-separated) and
+`node_whitelist.txt` next to the peers file (`data/node_whitelist.txt` in compose), one entry per
+line with `#` comments allowed. IPv4/IPv6 addresses and CIDRs are accepted; CIDR host bits are
+masked. Under Compose only IPv4 entries can ever match a remote node (see Quick start). Both
+sources are re-read every 30 seconds. Removals affect new connections only; existing node sessions
+are left alone. An entry that would serve the whole internet is rejected with a `REJECTED` log
+line: a `/0` (also refused at startup when it is in the environment variable) or one containing
+the gateway's default gateway (`172.28.0.1` in compose; a NAT router's address on a bare host). An
+empty initial whitelist, counting only the entries actually installed, stops startup; an empty set
+after a reload logs a warning.
+
+Because the probe answers now come from the gateway process, a gateway restart or crash loop also
+leaves upstream probes unanswered until it is back (the old separate responder kept answering).
 
 ## Configuration
 
@@ -79,6 +93,8 @@ Set in `.env`; compose passes them through.
 | Variable | Default | Meaning |
 |---|---|---|
 | `HL_SELF_IP` | – | Comma-separated public IPs of **all** your nodes; never used as upstreams. |
+| `HYPERSYNC_NODE_WHITELIST` | – | Comma-separated node source IPs/CIDRs; union with `node_whitelist.txt`. At least one entry is required. |
+| `HYPERSYNC_PUBLIC_BIND` | all host addresses | Optional host IP on which Compose publishes the gateway's 4000-4010. |
 | `HYPERSYNC_IP_BLACKLIST` | – | Comma-separated IPs never connected to (see [IP blacklist](#ip-blacklist)). |
 | `HYPERSYNC_PRIORITY_PEERS` | – | Comma-separated priority peer IPs. Logged as `prio-N`, never by IP. |
 | `HYPERSYNC_PRIORITY_PEERS_EXPECTED` | – | How many priority peers there must be (e.g. `3` for QuickNode). Set, a missing, short or partly invalid list stops startup instead of quietly leaving nodes on the pool. |
