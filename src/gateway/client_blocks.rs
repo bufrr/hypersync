@@ -444,6 +444,20 @@ fn note_client_block_result(
     None
 }
 
+// A short frame whose body is readable text (an upstream error message), else None: a small
+// batch of a few blocks is binary and logged by size only.
+fn frame_text(frame: &[u8]) -> Option<&str> {
+    if frame.len() >= 300 {
+        return None;
+    }
+    let text = std::str::from_utf8(&frame[5.min(frame.len())..]).ok()?;
+    (!text.is_empty()
+        && text
+            .chars()
+            .all(|c| !c.is_control() || c == '\n' || c == '\t'))
+    .then_some(text)
+}
+
 // One line per answered 4002 request: which upstream, which tier, how big, how long since the
 // node asked. A terminal error frame (e.g. "client block round too large: X > tip") is logged
 // with its text, which also reveals the upstream's own tip.
@@ -455,14 +469,9 @@ fn log_client_blocks(
     frame: &[u8],
     started: Instant,
 ) {
-    let detail = if frame.len() < 300 {
-        format!(
-            " text={:?}",
-            String::from_utf8_lossy(&frame[5.min(frame.len())..])
-        )
-    } else {
-        String::new()
-    };
+    let detail = frame_text(frame)
+        .map(|t| format!(" text={t:?}"))
+        .unwrap_or_default();
     gwlog!(
         "[gw] [{}] 4002 client blocks via {} tier={} stage={} bytes={} ms={}{}",
         node.ip,
@@ -725,6 +734,16 @@ async fn fetch_client_blocks_raced(
 const SIBLING_4002_WAIT: Duration = Duration::from_secs(3);
 const SIBLING_4002_COOL: Duration = Duration::from_secs(60);
 
+// The sibling's 4002 can't be connected to at all (nothing listens there, or no route): not a
+// passing failure, so it is skipped for SIBLING_UNREACHABLE rather than SIBLING_4002_COOL.
+fn sibling_unreachable(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind::*;
+    matches!(
+        e.kind(),
+        ConnectionRefused | HostUnreachable | NetworkUnreachable
+    )
+}
+
 pub(super) async fn fetch_client_blocks(
     siblings: Option<&Arc<LiveHub>>,
     node: &Arc<NodeState>,
@@ -765,6 +784,15 @@ pub(super) async fn fetch_client_blocks(
                 }
                 Ok((_, Ok(ClientBlockUpstreamResponse::TerminalError(_)))) => {
                     "no batch (round too large?)".to_string()
+                }
+                Ok((_, Err(e))) if sibling_unreachable(&e) => {
+                    hub.mark_unreachable(&ip);
+                    gwlog!(
+                        "[gw] [{}] 4002 sibling {ip}: {e}; asking upstream (sibling skipped {}s)",
+                        node.ip,
+                        SIBLING_UNREACHABLE.as_secs()
+                    );
+                    return fetch_client_blocks_raced(node, priority, peers, rr, req).await;
                 }
                 Ok((_, Err(e))) => e.to_string(),
                 Err(_) => format!("no answer in {}s", SIBLING_4002_WAIT.as_secs()),
@@ -1406,5 +1434,22 @@ mod tests {
         for t in t1.into_iter().chain(t2) {
             t.abort();
         }
+    }
+
+    #[test]
+    fn only_a_frame_that_reads_as_text_is_logged_as_text() {
+        let mut err = vec![0, 0, 0, 40, 0];
+        err.extend_from_slice(b"client block round too large: 12 > 10");
+        assert_eq!(
+            frame_text(&err),
+            Some("client block round too large: 12 > 10")
+        );
+        // a small batch of a few blocks (captured on Linode, 2026-11-16): binary, size only
+        let batch = [
+            0, 0, 0, 21, 1, 1, 2, 0, 0xe2, 0x50, 0x69, 1, 1, 0, 0x8a, 0x1a, 0x22, 1, 1,
+        ];
+        assert_eq!(frame_text(&batch), None);
+        assert_eq!(frame_text(&[0, 0, 0, 0, 0]), None, "empty body");
+        assert_eq!(frame_text(&[0u8; 400]), None, "too long to be an error");
     }
 }

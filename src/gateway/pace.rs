@@ -91,11 +91,14 @@ fn addr_4002(ip: &str) -> String {
 // a height answer: the round and when the peer read it
 pub(super) type HeightAnswer = Result<(u32, Instant), String>;
 
+// query_round's error prefix when the connection itself failed (refused, unreachable, blacklisted)
+pub(super) const HEIGHT_CONNECT_ERR: &str = "connect: ";
+
 pub(super) async fn query_round(ip: &str) -> HeightAnswer {
     tokio::time::timeout(HEIGHT_TIMEOUT, async {
         let mut s = crate::blacklist::connect(&addr_4002(ip))
             .await
-            .map_err(|e| format!("connect: {e}"))?;
+            .map_err(|e| format!("{HEIGHT_CONNECT_ERR}{e}"))?;
         let sent = Instant::now();
         s.write_all(&HEIGHT_REQUEST)
             .await

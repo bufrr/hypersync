@@ -33,6 +33,9 @@ use super::*;
 const SIBLING_MIN_ON_STREAM: Duration = Duration::from_secs(120);
 // ... and answer a height query no further than this behind (~20 s of rounds)
 const SIBLING_MAX_BEHIND: u32 = 300;
+// A sibling whose 4002 port can't be connected to (a node on another host publishes no ports) is
+// not asked for anything this long: bootstrap or range query.
+pub(super) const SIBLING_UNREACHABLE: Duration = Duration::from_secs(10 * 60);
 
 pub(super) struct LiveHub {
     // serializes creating a stream, so nodes reconnecting together share one selection
@@ -44,6 +47,8 @@ pub(super) struct LiveHub {
     probe_state: Arc<NodeState>,
     // siblings that just failed a 4002 range query, skipped until then
     range_cool: Mutex<HashMap<String, Instant>>,
+    // siblings whose 4002 refused a connection, skipped for everything until then
+    unreachable: Mutex<HashMap<String, Instant>>,
 }
 
 // a node on the stream: its state, its session count, when it joined
@@ -128,6 +133,7 @@ impl LiveHub {
             streams_in_use,
             probe_state: Arc::new(NodeState::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)),
             range_cool: Mutex::new(HashMap::new()),
+            unreachable: Mutex::new(HashMap::new()),
         }
     }
 
@@ -151,6 +157,7 @@ impl LiveHub {
         let now = Instant::now();
         let mut cool = lock(&self.range_cool);
         cool.retain(|_, until| *until > now);
+        let unreachable = self.unreachable_now(now);
         let nodes = lock(&hub.nodes);
         nodes
             .values()
@@ -160,12 +167,23 @@ impl LiveHub {
                     && n.client_blocks_run_since(now, CATCHUP_RUN_GAP).is_none()
             })
             .map(|(n, _, _)| n.ip.to_string())
-            .filter(|ip| !cool.contains_key(ip))
+            .filter(|ip| !cool.contains_key(ip) && !unreachable.contains(ip))
             .collect()
     }
 
     pub(super) fn cool_range_sibling(&self, ip: &str, ttl: Duration) {
         lock(&self.range_cool).insert(ip.to_string(), Instant::now() + ttl);
+    }
+
+    // Its 4002 port refused a connection: ask it for nothing for SIBLING_UNREACHABLE.
+    pub(super) fn mark_unreachable(&self, ip: &str) {
+        lock(&self.unreachable).insert(ip.to_string(), Instant::now() + SIBLING_UNREACHABLE);
+    }
+
+    fn unreachable_now(&self, now: Instant) -> std::collections::HashSet<String> {
+        let mut u = lock(&self.unreachable);
+        u.retain(|_, until| *until > now);
+        u.keys().cloned().collect()
     }
 
     // Nodes that can serve a sibling's bootstrap, by a POSITIVE sign that each is synced: its own
@@ -184,6 +202,7 @@ impl LiveHub {
             return Vec::new();
         };
         let now = Instant::now();
+        let unreachable = self.unreachable_now(now);
         let candidates: Vec<String> = lock(&hub.nodes)
             .values()
             .filter(|(n, _, joined)| {
@@ -193,6 +212,7 @@ impl LiveHub {
                     && !slow.contains(&n.ip.to_string(), now)
             })
             .map(|(n, _, _)| n.ip.to_string())
+            .filter(|ip| !unreachable.contains(ip))
             .collect();
         let reference = hub.fanout.round().max(freshest.unwrap_or(0));
         if candidates.is_empty() || reference == 0 {
@@ -216,6 +236,14 @@ impl LiveHub {
                     "[gw] sibling {ip} not a bootstrap source: at round {round}, {} behind",
                     reference.saturating_sub(round)
                 ),
+                // nothing listens (or no route): skip it for longer than a one-off failure
+                Err(e) if e.starts_with(HEIGHT_CONNECT_ERR) => {
+                    self.mark_unreachable(&ip);
+                    gwlog!(
+                        "[gw] sibling {ip} not a bootstrap source: height query {e} (skipped {}s)",
+                        SIBLING_UNREACHABLE.as_secs()
+                    )
+                }
                 Err(e) => gwlog!("[gw] sibling {ip} not a bootstrap source: height query {e}"),
             }
         }
@@ -891,6 +919,64 @@ mod tests {
         assert!(r.is_err(), "not forwarded to the node as a batch");
         assert_eq!(asked, 1);
         assert!(left.is_empty(), "the sibling cools down");
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_sibling_is_skipped_for_bootstrap_and_ranges() {
+        // nothing listens on this sibling's 4002 (an address no other test uses) (a node on another host publishes no ports)
+        let ctx = super::super::tests::routing_ctx();
+        let hubs = Arc::new(LiveHub::new(Arc::new(StreamClaims::default())));
+        let sib = Arc::new(NodeState::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 184)), 0));
+        hub_with_sibling(&hubs, &sib, Duration::from_secs(600));
+        let node = Arc::new(NodeState::new(
+            IpAddr::V4(Ipv4Addr::new(172, 28, 0, 201)),
+            0,
+        ));
+        let r = fetch_client_blocks(
+            Some(&hubs),
+            &node,
+            &ctx.priority,
+            &[],
+            &ctx.rr,
+            Arc::new(client_block_range_request(1_000, 1_099)),
+        )
+        .await;
+        assert!(
+            r.is_err(),
+            "no upstream in this test: the range went there and failed"
+        );
+        // a 60 s cool would also hide it from ranges; it must be the long skip, which bootstrap
+        // selection honours too
+        lock(&hubs.range_cool).clear();
+        assert!(
+            hubs.range_siblings(node.ip).is_empty(),
+            "skipped for ranges"
+        );
+        let until = lock(&hubs.unreachable)["127.0.0.184"];
+        assert!(until > Instant::now() + SIBLING_UNREACHABLE - Duration::from_secs(5));
+        let slow = SlowStateServers::default();
+        assert!(hubs
+            .bootstrap_siblings(node.ip, None, &slow)
+            .await
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_bootstrap_height_query_refused_marks_the_sibling_unreachable() {
+        let hubs = Arc::new(LiveHub::new(Arc::new(StreamClaims::default())));
+        let sib = Arc::new(NodeState::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 185)), 0));
+        hub_with_sibling(&hubs, &sib, Duration::from_secs(600));
+        let asking = IpAddr::V4(Ipv4Addr::new(172, 28, 0, 201));
+        let slow = SlowStateServers::default();
+        assert!(hubs
+            .bootstrap_siblings(asking, None, &slow)
+            .await
+            .is_empty());
+        assert!(lock(&hubs.unreachable).contains_key("127.0.0.185"));
+        assert!(
+            hubs.range_siblings(asking).is_empty(),
+            "nor asked for ranges"
+        );
     }
 
     #[tokio::test]
