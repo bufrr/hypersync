@@ -88,6 +88,8 @@ struct GatewayCtx {
     // rotated pool window on the next bootstrap: when most of the pool declines to serve state
     // (the common failure), a known server cuts recovery from minutes of rescanning to seconds.
     state_servers: Arc<Mutex<Vec<String>>>,
+    // state servers recently cut for trickling a bootstrap, skipped as bootstrap sources
+    slow_state_servers: Arc<SlowStateServers>,
     priority: Arc<PriorityTier>,
     // the live peer pool (peerd's file, refreshed every 30s) — failover standbys are drawn from it
     pool: Arc<Mutex<Vec<String>>>,
@@ -549,6 +551,7 @@ pub(crate) async fn run_gateway(node_peer_file: String, push: bool, cache_coldst
         capture_tap,
         net_round_tip: net_round_tip.clone(),
         state_servers: Arc::new(Mutex::new(Vec::new())),
+        slow_state_servers: Arc::new(SlowStateServers::default()),
         priority: priority.clone(),
         pool: pool.clone(),
         cooldown: Arc::new(PeerCooldown::default()),
@@ -633,6 +636,7 @@ mod tests {
             capture_tap: Arc::new(tokio::sync::Semaphore::new(1)),
             net_round_tip: net_round_tip.clone(),
             state_servers: Arc::new(Mutex::new(Vec::new())),
+            slow_state_servers: Arc::new(SlowStateServers::default()),
             priority: Arc::new(PriorityTier::new(
                 Vec::new(),
                 0,

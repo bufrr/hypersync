@@ -37,6 +37,80 @@ pub(crate) struct Relayed {
     // the upstream ended it (closed, failed, went silent, was blacklisted) — not the node leaving
     // or no longer reading
     pub(crate) upstream_ended: bool,
+    // a bootstrap relay cut because its state server sent below BOOTSTRAP_MIN_RATE
+    pub(crate) too_slow: bool,
+}
+
+// A state server can serve the abci_state fast and then trickle the EVM KVs: 2026-11-15, one
+// sent them at 0.26 MB/s for 10+ minutes (~2 h to finish) and never went silent, so the idle cut
+// never fired; the next peer served 24 MB/s. A bootstrap relay whose upstream delivers less than
+// BOOTSTRAP_MIN_RATE over BOOTSTRAP_RATE_WINDOW of time spent waiting on the upstream is cut, so
+// the node reconnects and the gateway picks another state server.
+//
+// Only time spent reading the upstream counts: a node that stops reading while it loads the
+// abci_state (57-145 s) blocks the relay in its write to the node, and the upstream's bytes are
+// waiting in the socket when it resumes, so a pausing node never makes its upstream look slow.
+// Past MIN_COMPLETE_BOOTSTRAP_BYTES the floor drops to BOOTSTRAP_TAIL_MIN_RATE: that size is only
+// ~90% of a bootstrap, so the rest of the EVM KVs may still be coming, or the bootstrap is done and
+// the connection carries the live stream (~1.3-1.9 MB/s on 2026-11-15). The lower floor still cuts
+// a server trickling the last of the EVM KVs (the one above sent 0.26 MB/s), and cutting a slow
+// live tail only sends the node to a vetted live session.
+pub(crate) const BOOTSTRAP_MIN_RATE: u64 = 1_000_000;
+pub(crate) const BOOTSTRAP_TAIL_MIN_RATE: u64 = 400_000;
+// Past this the connection is certainly the live stream (a whole bootstrap was ~5.8 GB on
+// 2026-11-15; raise it with MIN_COMPLETE_BOOTSTRAP_BYTES as the bootstrap grows): pacing stops, so
+// hours of live blocks are never held to a bootstrap floor.
+pub(crate) const BOOTSTRAP_PACE_UNTIL: u64 = 7_000_000_000;
+#[cfg(not(test))]
+pub(crate) const BOOTSTRAP_RATE_WINDOW: Duration = Duration::from_secs(120);
+#[cfg(test)]
+pub(crate) const BOOTSTRAP_RATE_WINDOW: Duration = Duration::from_millis(400);
+
+pub(crate) struct BootstrapPace {
+    total: u64,
+    waited: Duration,
+    bytes: u64,
+}
+
+impl BootstrapPace {
+    // `already`: bytes of the bootstrap delivered before this relay (the selection prefetch)
+    pub(crate) fn new(already: u64) -> Self {
+        Self {
+            total: already,
+            waited: Duration::ZERO,
+            bytes: 0,
+        }
+    }
+
+    // One upstream read of `n` bytes that took `waited`; false = the upstream is too slow, cut it.
+    pub(crate) fn on_read(&mut self, n: usize, waited: Duration) -> bool {
+        self.total += n as u64;
+        if self.total >= BOOTSTRAP_PACE_UNTIL {
+            return true;
+        }
+        self.waited += waited;
+        self.bytes += n as u64;
+        if self.waited < BOOTSTRAP_RATE_WINDOW {
+            return true;
+        }
+        let ok = self.bytes as f64 >= self.floor() as f64 * self.waited.as_secs_f64();
+        self.waited = Duration::ZERO;
+        self.bytes = 0;
+        ok
+    }
+
+    pub(crate) fn total(&self) -> u64 {
+        self.total
+    }
+
+    // bytes/s the upstream must deliver at this point of the bootstrap
+    pub(crate) fn floor(&self) -> u64 {
+        if self.total >= crate::protocol::MIN_COMPLETE_BOOTSTRAP_BYTES as u64 {
+            BOOTSTRAP_TAIL_MIN_RATE
+        } else {
+            BOOTSTRAP_MIN_RATE
+        }
+    }
 }
 
 // splice, also ending once the upstream has sent nothing for `upstream_idle` — for 4001 relays,
@@ -50,23 +124,31 @@ pub(crate) async fn splice_with_idle(
     relay(down, upc, upstream_idle, None).await
 }
 
-// splice_with_idle for a bootstrap connection whose writes to the node began at `since`: they
-// may stall for BOOTSTRAP_NODE_WRITE_TIMEOUT during its first BOOTSTRAP_SLOW_WINDOW (see there).
+// splice_with_idle for a bootstrap connection whose writes to the node began at `since`: its
+// writes may stall for BOOTSTRAP_NODE_WRITE_TIMEOUT during its first BOOTSTRAP_SLOW_WINDOW, and
+// with a `pace` an upstream below its floor is cut (see both). No pace = the last-resort relay
+// that keeps a slow server (only the idle cut applies).
 pub(crate) async fn splice_bootstrap(
     down: TcpStream,
     upc: TcpStream,
     upstream_idle: Option<Duration>,
     since: Instant,
+    pace: Option<BootstrapPace>,
 ) -> Relayed {
-    relay(down, upc, upstream_idle, Some(since)).await
+    relay(down, upc, upstream_idle, Some((since, pace))).await
 }
 
 async fn relay(
     down: TcpStream,
     upc: TcpStream,
     upstream_idle: Option<Duration>,
-    bootstrap_since: Option<Instant>,
+    bootstrap: Option<(Instant, Option<BootstrapPace>)>,
 ) -> Relayed {
+    let (bootstrap_since, mut pace) = match bootstrap {
+        Some((since, pace)) => (Some(since), pace),
+        None => (None, None),
+    };
+    let too_slow = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let up_ip = upc
         .peer_addr()
         .map(|a| a.ip().to_string())
@@ -78,10 +160,13 @@ async fn relay(
     // the upstream->node copy running and writing the old peer's bytes into the node
     let mut h = AbortOnDrop({
         let to_node = to_node.clone();
+        let too_slow = too_slow.clone();
+        let peer_ip = up_ip.clone();
         tokio::spawn(async move {
             let mut buf = vec![0u8; 256 * 1024];
             // true when the upstream side ended the copy, false when the node stopped taking it
             loop {
+                let read_started = Instant::now();
                 let read = ur.read(&mut buf);
                 let n = match upstream_idle {
                     Some(idle) => match timeout(idle, read).await {
@@ -94,6 +179,18 @@ async fn relay(
                     Ok(0) | Err(_) => break true,
                     Ok(n) => n,
                 };
+                if let Some(pace) = pace.as_mut() {
+                    if !pace.on_read(n, read_started.elapsed()) {
+                        gwlog!(
+                            "[gw] bootstrap via {} below {} KB/s after {} MB; cutting it",
+                            peer_ip,
+                            pace.floor() / 1_000,
+                            pace.total() / 1_000_000
+                        );
+                        too_slow.store(true, Ordering::Release);
+                        break true;
+                    }
+                }
                 let write_timeout = bootstrap_since.map_or(NODE_WRITE_TIMEOUT, |since| {
                     bootstrap_write_timeout(since, Instant::now())
                 });
@@ -115,6 +212,7 @@ async fn relay(
         to_node: to_node.load(Ordering::Relaxed),
         to_peer,
         upstream_ended,
+        too_slow: too_slow.load(Ordering::Acquire),
     }
 }
 
@@ -1180,6 +1278,91 @@ mod tests {
         // longer than the 145 s EVM KVs phase measured on a fresh Linode after a wipe
         assert!(BOOTSTRAP_NODE_WRITE_TIMEOUT > Duration::from_secs(145));
         assert!(BOOTSTRAP_NODE_WRITE_TIMEOUT < BOOTSTRAP_SLOW_WINDOW);
+    }
+
+    #[test]
+    fn bootstrap_pace_cuts_only_a_slow_upstream_before_the_live_stream() {
+        let w = BOOTSTRAP_RATE_WINDOW;
+        let floor = |d: Duration| (BOOTSTRAP_MIN_RATE as f64 * d.as_secs_f64()) as usize;
+        // at the floor over a whole window: kept
+        let mut p = BootstrapPace::new(0);
+        assert!(p.on_read(floor(w), w));
+        // below it: cut once a window of read waiting has passed, not before
+        let mut p = BootstrapPace::new(0);
+        assert!(p.on_read(floor(w) / 4, w / 2));
+        assert!(!p.on_read(floor(w) / 4, w / 2));
+        // the window restarts after a check
+        assert!(p.on_read(floor(w), w));
+        // past MIN_COMPLETE_BOOTSTRAP_BYTES the lower tail floor applies: a live-rate stream
+        // (above it, below the bootstrap floor) is kept, a trickle is still cut
+        let big = crate::protocol::MIN_COMPLETE_BOOTSTRAP_BYTES as u64;
+        let tail = |d: Duration| (BOOTSTRAP_TAIL_MIN_RATE as f64 * d.as_secs_f64()) as usize;
+        let mut p = BootstrapPace::new(big);
+        assert_eq!(p.floor(), BOOTSTRAP_TAIL_MIN_RATE);
+        assert!(p.on_read(tail(w) * 2, w));
+        assert!(!p.on_read(tail(w) / 2, w));
+        assert!(!BootstrapPace::new(big).on_read(1, w * 10));
+        // the prefetch counts toward that size
+        let mut p = BootstrapPace::new(big - 10);
+        assert_eq!(p.floor(), BOOTSTRAP_MIN_RATE);
+        assert!(p.on_read(10, Duration::ZERO));
+        assert_eq!((p.total(), p.floor()), (big, BOOTSTRAP_TAIL_MIN_RATE));
+        // past BOOTSTRAP_PACE_UNTIL nothing is cut any more
+        assert!(BootstrapPace::new(BOOTSTRAP_PACE_UNTIL).on_read(1, w * 10));
+    }
+
+    async fn tcp_pair() -> (TcpStream, TcpStream) {
+        let l = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let c = TcpStream::connect(l.local_addr().unwrap()).await.unwrap();
+        (c, l.accept().await.unwrap().0)
+    }
+
+    #[tokio::test]
+    async fn a_trickling_state_server_is_cut_as_too_slow() {
+        let (mut node, node_gw) = tcp_pair().await;
+        let (mut up_peer, up_gw) = tcp_pair().await;
+        // ~50 KB/s, far below the floor, but never silent long enough for the idle cut
+        tokio::spawn(async move {
+            while up_peer.write_all(&[7u8; 1024]).await.is_ok() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+        tokio::spawn(async move {
+            let mut buf = [0u8; 65536];
+            while matches!(node.read(&mut buf).await, Ok(n) if n > 0) {}
+        });
+        let r = timeout(
+            Duration::from_secs(5),
+            splice_bootstrap(
+                node_gw,
+                up_gw,
+                Some(Duration::from_secs(60)),
+                Instant::now(),
+                Some(BootstrapPace::new(0)),
+            ),
+        )
+        .await
+        .expect("a trickling upstream was not cut");
+        assert!(r.too_slow && r.upstream_ended);
+    }
+
+    #[tokio::test]
+    async fn a_node_pausing_to_load_state_does_not_make_its_upstream_slow() {
+        let (mut node, node_gw) = tcp_pair().await;
+        let (mut up_peer, up_gw) = tcp_pair().await;
+        tokio::spawn(async move { while up_peer.write_all(&[7u8; 65536]).await.is_ok() {} });
+        // the node stops reading for several rate windows (loading the abci_state), then drains
+        tokio::spawn(async move {
+            tokio::time::sleep(BOOTSTRAP_RATE_WINDOW * 4).await;
+            let mut buf = [0u8; 65536];
+            while matches!(node.read(&mut buf).await, Ok(n) if n > 0) {}
+        });
+        tokio::select! {
+            r = splice_bootstrap(node_gw, up_gw, Some(Duration::from_secs(60)), Instant::now(), Some(BootstrapPace::new(0))) => {
+                panic!("relay ended: too_slow={} upstream_ended={}", r.too_slow, r.upstream_ended)
+            }
+            _ = tokio::time::sleep(BOOTSTRAP_RATE_WINDOW * 8) => {}
+        }
     }
 
     #[tokio::test]

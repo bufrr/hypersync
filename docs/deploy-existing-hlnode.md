@@ -206,6 +206,20 @@ cd ~/node && docker compose up -d
 
 全新数据卷的节点冷启动实测约 7 分钟追平：几秒内网关给它转发状态数据，2–3 分钟后接上实时区块。
 
+冷启动过程（2026-11-15 在 16 核 Linode 上实测，状态服务器约 24 MB/s；详见 `docs/hl-p2p-protocol.md` §7a）：
+
+1. **abci_state（约 1.4 GB，约 1 分钟）**：节点日志每 4 MB 一行 `reading bytes for abci_stream recv greeting: X/Y`。
+2. **加载状态（约 1–2.5 分钟）**：出现 `received abci greeting` 和 `computed l1 hash`。这段时间节点**不读网络数据**，
+   网关对它的写入会卡住，属于正常现象（网关在冷启动连接的前 15 分钟允许单次写入卡 300 s）。
+3. **EVM KVs（约 4.4 GB，约 3 分钟）**：**节点在这一阶段不打任何进度日志**。要看进度只能看网关一侧的连接字节数：
+   `nsenter -t $(docker inspect -f {{.State.Pid}} hypersync-gw) -n ss -tni dst <节点IP>` 里的 `bytes_sent`。
+4. **完成**：数据卷里出现 `hyperliquid_data/visor_abci_state.json`，节点开始 `querying client blocks` /
+   `added client block batch during bootstrap`，经 4002 追块（每批 100 轮），约 10 分钟追到链头后转为 `applied block`。
+
+EVM KVs 阶段一旦断开，节点会打 `Evm Kvs read error: early eof`，并**从头**重新下载 abci_state，没有断点续传。
+有的状态服务器 abci_state 发得很快、EVM KVs 却只有每秒几百 KB（实测 0.26 MB/s，要约 2 小时），而且不会完全停住；
+网关对这种服务器按速率切断（见第 11 节），节点几秒后换一个服务器重来；所有候选都慢时，网关保留慢服务器让它下完，而不是无限重来。
+
 ### 8.3 验收
 
 ```sh
@@ -292,6 +306,16 @@ services:
 | `node write failed` / `node write timeout` / `node outbound ended` | 节点那一侧断了：重启，或卡住 30 s 不读数据 | 看节点：通常是 hl-visor 低内存重启 |
 | `node catch-up not converging` | 节点陷在小范围追块循环（hl-node 的已知问题，实测落在落后约 1,050–1,110 轮处）：整整 3 分钟里各批追块落后最新轮次的距离，最大值和最小值之差小于 150 轮，且没有缩小 50 轮以上，且请求范围的中位数小于 64 轮。网关结束会话，让节点重连后一次追完 | 正常处理；每节点每 5 分钟最多一次 |
 | `returning to a priority peer` | 节点之前落到了公开池，现在回到优先级 peer | 正常 |
+
+冷启动（bootstrap）相关的行，不带 `reason=`：
+
+| 日志 | 含义 | 处理 |
+|---|---|---|
+| `[gw] bootstrap via <peer> below 1000 KB/s after N MB; cutting it` | 状态服务器在等待它的 120 s 里平均不到 1 MB/s（超过 5.2 GB 后门槛降到 400 KB/s，超过 7 GB 不再检查）。网关切断，20 分钟内（优先级 peer 为 5 分钟）不再用它做冷启动（仍可提供实时区块），节点几秒内换服务器重新冷启动 | 正常。同一个节点反复出现说明可用的状态服务器都很慢：看 peerd 的 `live` 数 |
+| `[gw] [<node>] bootstrap via <peer> ended inside the abci_state (N of M MB); not used for bootstraps for 20 min` | 状态服务器在 abci_state 中途停住，节点自己约 20–30 s 后放弃（节点日志 `could not read abci state ... deadline has elapsed`）。20 分钟内（优先级 peer 为 5 分钟）不再用它做冷启动 | 正常；节点重启也会触发一次。优先级 peer 被标记时冷启动先换另一个优先级 peer，三个都被标记才用公开池 |
+| `every bootstrap candidate trickled recently; keeping a slow server this time (no rate cut)` | 候选的状态服务器 20 分钟内都被切过。为免无限重下，这次保留慢服务器，只按 60 s 无数据切断 | 冷启动会很慢但能完成；持续出现说明 peer 池太小或本机 IP 被普遍限速 |
+| `no peer serving abci_state right now` | 这一轮没找到愿意发状态的服务器 | 偶尔正常；持续出现时检查本机公网 4001/4002 是否有应答（`[gw] [public]` 统计） |
+| 节点日志 `Evm Kvs read error: early eof` | 冷启动在 EVM KVs 阶段断了，节点会从头再下 | 偶发且紧跟一条 `cutting it` 是预期的；没有 `cutting it` 却反复出现，说明连接在别处被断（节点重启、网关重启） |
 
 需要关注的情况：
 

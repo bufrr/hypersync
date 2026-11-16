@@ -3,7 +3,7 @@ use crate::priority::{gwlog, PrioritySession, PriorityTier};
 use crate::protocol::{max_block_round_in_frames, unix_secs, MIN_COMPLETE_BOOTSTRAP_BYTES};
 use crate::push::{
     bootstrap_write_timeout, push_exit_is_upstream_fault, serve_push, splice_bootstrap,
-    splice_with_idle, PushConfig, Relayed, NODE_WRITE_TIMEOUT,
+    splice_with_idle, BootstrapPace, PushConfig, Relayed, NODE_WRITE_TIMEOUT,
 };
 use crate::util::lock;
 use std::collections::HashMap;
@@ -423,6 +423,13 @@ async fn transparent_bootstrap(
         &peers,
         start,
     );
+    let (candidates, last_resort) = ctx.slow_state_servers.filter(candidates, Instant::now());
+    if last_resort {
+        gwlog!(
+            "[gw] [{}] every bootstrap candidate trickled recently; keeping a slow server this time (no rate cut)",
+            node.ip
+        );
+    }
     let Some(selected) = select_fast_bootstrap_peer(&ctx.priority, &candidates, 0, greet).await
     else {
         gwlog!("[gw] [{}] no peer serving abci_state right now", node.ip);
@@ -471,6 +478,7 @@ async fn transparent_bootstrap(
             },
             permit,
             RELAY_UPSTREAM_IDLE,
+            !last_resort,
         )
         .await
     } else {
@@ -501,7 +509,14 @@ async fn transparent_bootstrap(
         // connection (2026-10-21 2-node soak: 68MB resident for 25+ min).
         let prefetched = (hdr.len() + payload_prefix.len()) as u64;
         drop(payload_prefix);
-        let mut r = splice_bootstrap(down, upc, Some(RELAY_UPSTREAM_IDLE), started).await;
+        let mut r = splice_bootstrap(
+            down,
+            upc,
+            Some(RELAY_UPSTREAM_IDLE),
+            started,
+            (!last_resort).then(|| BootstrapPace::new(prefetched)),
+        )
+        .await;
         r.to_node += prefetched;
         r
     };
@@ -510,6 +525,30 @@ async fn transparent_bootstrap(
     // one (a node that left mid-transfer says nothing about the server)
     if relayed.upstream_ended && relayed.to_node < MIN_COMPLETE_BOOTSTRAP_BYTES as u64 {
         forget_state_server(&ctx.state_servers, &ip);
+    }
+    // the node reconnects within seconds: a server cut for trickling must not win that
+    // reconnect's selection race again (it serves the abci_state header as fast as any), nor a
+    // later one, wherever it would come from (remembered list or pool)
+    // The node gives up on a stalling abci_state itself (its read deadline, ~20-30 s without
+    // progress: "could not read abci state ... deadline has elapsed"), before the 60 s idle cut and
+    // long before a rate window. The node ending the relay hides that from upstream_ended, so a
+    // relay that ended inside the abci_state frame counts as the server's failure too.
+    let state_frame = 5 + abci_len as u64;
+    let ended_in_state = !relayed.too_slow && relayed.to_node < state_frame;
+    if relayed.too_slow || ended_in_state {
+        let ttl = ctx
+            .slow_state_servers
+            .mark(&ip, Instant::now(), ctx.priority.contains(&ip));
+        forget_state_server(&ctx.state_servers, &ip);
+        if ended_in_state {
+            gwlog!(
+                "[gw] [{}] bootstrap via {ip} ended inside the abci_state ({} of {} MB); not used for bootstraps for {} min",
+                node.ip,
+                relayed.to_node / 1_000_000,
+                state_frame / 1_000_000,
+                ttl.as_secs() / 60
+            );
+        }
     }
 }
 
@@ -646,6 +685,7 @@ pub(super) async fn handle_4001_live(
         to_node,
         to_peer,
         upstream_ended,
+        ..
     } = splice_with_idle(down, upc, Some(RELAY_UPSTREAM_IDLE)).await;
     if upstream_ended {
         cool_down(&ctx.priority, &ctx.cooldown, &ip);

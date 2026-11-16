@@ -6,7 +6,7 @@ use crate::protocol::{
     GREET_TRUE, MIN_COMPLETE_BOOTSTRAP_BYTES,
 };
 use crate::push::{
-    bootstrap_write_timeout, copy_node_to_upstream, AbortOnDrop, Relayed,
+    bootstrap_write_timeout, copy_node_to_upstream, AbortOnDrop, BootstrapPace, Relayed,
     RELAY_UPSTREAM_WRITE_TIMEOUT,
 };
 use crate::util::lock;
@@ -104,6 +104,7 @@ pub(super) async fn node_write<W: AsyncWrite + Unpin>(
 
 // Transparent bootstrap fallback, with a write-through cache tap. This keeps the node's real peer
 // relationship intact while opportunistically filling --cache from the same successful bootstrap.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn splice_bootstrap_capture(
     down: TcpStream,
     upc: TcpStream,
@@ -112,6 +113,8 @@ pub(super) async fn splice_bootstrap_capture(
     sink: CacheSink,
     capture_permit: tokio::sync::OwnedSemaphorePermit,
     upstream_idle: Duration,
+    // false: the last-resort relay that keeps a slow server (see splice_bootstrap)
+    paced: bool,
 ) -> Relayed {
     let up_ip = upc
         .peer_addr()
@@ -125,13 +128,19 @@ pub(super) async fn splice_bootstrap_capture(
     // went silent for `upstream_idle`, or sent a malformed frame) rather than the node
     let delivered = Arc::new(AtomicU64::new(0));
     let upstream_ended = Arc::new(AtomicBool::new(false));
+    let too_slow = Arc::new(AtomicBool::new(false));
+    let prefetched = (first_hdr.len() + first_payload_prefix.len()) as u64;
     // aborted on drop too: if this future is cancelled the copy task (and the capture permit it
     // holds) must not live on detached
     let mut h = AbortOnDrop({
         let delivered = delivered.clone();
         let upstream_ended = upstream_ended.clone();
         let upstream_gone = move || upstream_ended.store(true, Ordering::Release);
+        let too_slow = too_slow.clone();
+        let peer_ip = up_ip.clone();
         tokio::spawn(async move {
+            // the selection prefetch counts toward the bootstrap (see BootstrapPace)
+            let mut pace = BootstrapPace::new(prefetched);
             // Single-flight permit: released as soon as capturing stops (installed, overflowed, or
             // task end/abort) — NOT held for the rest of the relay, which may stream live blocks for
             // hours and would otherwise block every future cache tap.
@@ -168,6 +177,18 @@ pub(super) async fn splice_bootstrap_capture(
                 };
             }
 
+            macro_rules! slow_cut {
+                () => {
+                    gwlog!(
+                        "[gw] bootstrap via {peer_ip} below {} KB/s after {} MB; cutting it",
+                        pace.floor() / 1_000,
+                        pace.total() / 1_000_000
+                    );
+                    too_slow.store(true, Ordering::Release);
+                    upstream_gone();
+                };
+            }
+
             loop {
                 drop_slow_capture!();
                 if !capture {
@@ -175,6 +196,10 @@ pub(super) async fn splice_bootstrap_capture(
                 }
                 let mut hdr = [0u8; 5];
                 let mut payload_prefix = Vec::new();
+                // header waits count toward the pace too: a peer sending one small frame just
+                // inside the idle limit spends all its time here, not in payload reads
+                let hdr_started = Instant::now();
+                let prefetched_frame = first.is_some();
                 if let Some((h, prefix)) = first.take() {
                     hdr = h;
                     payload_prefix = prefix;
@@ -215,6 +240,10 @@ pub(super) async fn splice_bootstrap_capture(
                     break;
                 }
 
+                if paced && !prefetched_frame && !pace.on_read(hdr.len(), hdr_started.elapsed()) {
+                    slow_cut!();
+                    break;
+                }
                 let len = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as usize;
                 if len > MAX_ABCI_STATE_FRAME {
                     upstream_gone();
@@ -254,6 +283,7 @@ pub(super) async fn splice_bootstrap_capture(
                 while remaining > 0 {
                     let take = remaining.min(buf.len());
                     drop_slow_capture!();
+                    let read_started = Instant::now();
                     let n = match timeout(upstream_idle, ur.read(&mut buf[..take])).await {
                         Ok(Ok(n)) if n > 0 => n,
                         _ => {
@@ -261,6 +291,10 @@ pub(super) async fn splice_bootstrap_capture(
                             return;
                         }
                     };
+                    if paced && !pace.on_read(n, read_started.elapsed()) {
+                        slow_cut!();
+                        return;
+                    }
                     if !node_write(&mut dw, &buf[..n], write_limit()).await {
                         return;
                     }
@@ -325,6 +359,7 @@ pub(super) async fn splice_bootstrap_capture(
         to_node: delivered.load(Ordering::Relaxed),
         to_peer,
         upstream_ended: upstream_ended.load(Ordering::Acquire),
+        too_slow: too_slow.load(Ordering::Acquire),
     }
 }
 
@@ -1128,6 +1163,7 @@ mod tests {
                 },
                 permit,
                 Duration::from_millis(200),
+                true,
             ),
         )
         .await
@@ -1172,6 +1208,7 @@ mod tests {
                 },
                 permit,
                 Duration::from_millis(200),
+                true,
             ),
         )
         .await
@@ -1182,24 +1219,25 @@ mod tests {
         assert_eq!(tap.available_permits(), 1, "capture permit released");
     }
 
-    // A state peer that trickles just enough to dodge the idle limit loses the cache tap (its
-    // permit is released) once the capture deadline passes, while the node keeps getting bytes.
+    // A slow state peer (above BOOTSTRAP_MIN_RATE, so the relay keeps it, but too slow to finish
+    // the capture in time) loses the cache tap (its permit is released) once the capture deadline
+    // passes, while the node keeps getting bytes.
     #[tokio::test]
-    async fn a_trickling_upstream_loses_the_tap_but_keeps_relaying() {
+    async fn a_slow_upstream_loses_the_tap_but_keeps_relaying() {
         let up_l = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let up_addr = up_l.local_addr().unwrap();
         tokio::spawn(async move {
             let (mut s, _) = up_l.accept().await.unwrap();
-            // one byte every 50ms: never idle for the 200ms limit
-            while s.write_all(&[1]).await.is_ok() {
-                tokio::time::sleep(Duration::from_millis(50)).await;
+            // ~3 MB/s: never idle for the 200ms limit, above the rate floor
+            while s.write_all(&[1u8; 65536]).await.is_ok() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
         });
         let node_l = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let node_addr = node_l.local_addr().unwrap();
         let node = tokio::spawn(async move {
             let mut c = TcpStream::connect(node_addr).await.unwrap();
-            let mut buf = [0u8; 64];
+            let mut buf = vec![0u8; 65536];
             let mut got = 0usize;
             let until = Instant::now() + Duration::from_millis(800);
             while Instant::now() < until {
@@ -1226,6 +1264,7 @@ mod tests {
             },
             permit,
             Duration::from_millis(200),
+            true,
         ));
         tokio::time::sleep(MAX_TAP_CAPTURE + Duration::from_millis(250)).await;
         assert_eq!(tap.available_permits(), 1, "tap dropped after its deadline");
@@ -1240,6 +1279,99 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(!r.upstream_ended, "the node left first");
+    }
+
+    // A peer sending one small complete frame just inside the idle limit spends its time waiting
+    // for headers, not payload: it is cut on the tap path all the same.
+    #[tokio::test]
+    async fn complete_frames_just_inside_the_idle_limit_are_cut_as_too_slow() {
+        let up_l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = up_l.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = up_l.accept().await.unwrap();
+            // a 10-byte frame every 150 ms against a 200 ms idle limit
+            while s.write_all(&[0, 0, 0, 5, 1, 9, 9, 9, 9, 9]).await.is_ok() {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+        });
+        let node_l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let node_addr = node_l.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut c = TcpStream::connect(node_addr).await.unwrap();
+            let mut buf = vec![0u8; 65536];
+            while matches!(c.read(&mut buf).await, Ok(n) if n > 0) {}
+        });
+        let (down, _) = node_l.accept().await.unwrap();
+        let upc = TcpStream::connect(up_addr).await.unwrap();
+        let tap = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = tap.clone().try_acquire_owned().unwrap();
+        let r = timeout(
+            Duration::from_secs(5),
+            splice_bootstrap_capture(
+                down,
+                upc,
+                // a complete small first frame, so every later read starts at a header
+                [0, 0, 0, 1, 1],
+                vec![7],
+                CacheSink {
+                    boot_blob: Arc::new(Mutex::new(None)),
+                    boot_blob_cached_at: Arc::new(AtomicU64::new(0)),
+                    disk_cache_path: None,
+                },
+                permit,
+                Duration::from_millis(200),
+                true,
+            ),
+        )
+        .await
+        .expect("a peer pacing whole frames was not cut");
+        assert!(r.too_slow && r.upstream_ended);
+    }
+
+    // A state peer that trickles below BOOTSTRAP_MIN_RATE is cut on the tap path too.
+    #[tokio::test]
+    async fn a_trickling_upstream_is_cut_as_too_slow_with_the_tap() {
+        let up_l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = up_l.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = up_l.accept().await.unwrap();
+            // ~20 KB/s: never idle for the 200ms limit
+            while s.write_all(&[1u8; 1024]).await.is_ok() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        });
+        let node_l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let node_addr = node_l.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut c = TcpStream::connect(node_addr).await.unwrap();
+            let mut buf = vec![0u8; 65536];
+            while matches!(c.read(&mut buf).await, Ok(n) if n > 0) {}
+        });
+        let (down, _) = node_l.accept().await.unwrap();
+        let upc = TcpStream::connect(up_addr).await.unwrap();
+        let tap = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = tap.clone().try_acquire_owned().unwrap();
+        let r = timeout(
+            Duration::from_secs(5),
+            splice_bootstrap_capture(
+                down,
+                upc,
+                [0, 0, 100, 0, 1],
+                Vec::new(),
+                CacheSink {
+                    boot_blob: Arc::new(Mutex::new(None)),
+                    boot_blob_cached_at: Arc::new(AtomicU64::new(0)),
+                    disk_cache_path: None,
+                },
+                permit,
+                Duration::from_millis(200),
+                true,
+            ),
+        )
+        .await
+        .expect("a trickling upstream was not cut");
+        assert!(r.too_slow && r.upstream_ended);
+        assert_eq!(tap.available_permits(), 1);
     }
 
     #[test]

@@ -7,6 +7,7 @@ use crate::push::{
     FreshestRound, MAX_ACTIVE_ROUND_JUMP, NODE_CATCHUP_STUCK, RETURNING_TO_PRIORITY,
 };
 use crate::util::lock;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -695,6 +696,56 @@ pub(super) async fn race_fallback_upstream(
 }
 
 const STATE_SERVER_MEMORY: usize = 8;
+
+// State servers cut for trickling a bootstrap (push::BootstrapPace), skipped as bootstrap sources
+// for SLOW_STATE_SERVER_TTL, whether remembered or in the pool. One retry takes minutes and a
+// per-(IP, peer) state limit recovers over tens of minutes, so the session cooldown's 30 s would
+// let the third attempt land on the first trickler again. Bootstraps only: a server that trickles
+// state can still be a fine live peer.
+pub(super) const SLOW_STATE_SERVER_TTL: Duration = Duration::from_secs(20 * 60);
+// Priority (QuickNode) peers are trusted, few (3 in prod) and not rate-limited for us: a mark only
+// has to send the node's immediate retry to another of them. Long enough for that, short enough
+// that one bad transfer, or a node restarting mid-abci_state (which marks its server too), doesn't
+// hand the next bootstraps to unvetted pool peers for long.
+pub(super) const PRIORITY_SLOW_STATE_SERVER_TTL: Duration = Duration::from_secs(5 * 60);
+
+#[derive(Default)]
+pub(super) struct SlowStateServers(Mutex<HashMap<String, Instant>>);
+
+impl SlowStateServers {
+    pub(super) fn mark(&self, ip: &str, now: Instant, priority: bool) -> Duration {
+        let ttl = if priority {
+            PRIORITY_SLOW_STATE_SERVER_TTL
+        } else {
+            SLOW_STATE_SERVER_TTL
+        };
+        let mut m = lock(&self.0);
+        m.retain(|_, until| *until > now);
+        m.insert(ip.to_string(), now + ttl);
+        ttl
+    }
+
+    // `candidates` minus the slow ones, order kept, and whether every candidate was slow. Then
+    // all of them come back and the caller relays without a rate floor: cutting would only
+    // restart the bootstrap on another trickler, forever, re-fetching the abci_state each lap.
+    pub(super) fn filter(&self, candidates: Vec<String>, now: Instant) -> (Vec<String>, bool) {
+        let mut m = lock(&self.0);
+        m.retain(|_, until| *until > now);
+        if m.is_empty() || candidates.is_empty() {
+            return (candidates, false);
+        }
+        let fresh: Vec<String> = candidates
+            .iter()
+            .filter(|ip| !m.contains_key(*ip))
+            .cloned()
+            .collect();
+        if fresh.is_empty() {
+            (candidates, true)
+        } else {
+            (fresh, false)
+        }
+    }
+}
 
 pub(super) fn forget_state_server(list: &Mutex<Vec<String>>, ip: &str) {
     lock(list).retain(|x| x != ip);
@@ -1423,6 +1474,31 @@ mod tests {
         // no memory -> plain rotation
         let out = ordered_candidates(Vec::new(), &pool, 2);
         assert_eq!(out, ["3.3.3.3", "4.4.4.4", "1.1.1.1", "2.2.2.2"]);
+    }
+
+    #[test]
+    fn slow_state_servers_are_skipped_until_every_candidate_is_slow() {
+        let slow = SlowStateServers::default();
+        let t0 = Instant::now();
+        let c = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(slow.filter(c(&["a", "b"]), t0), (c(&["a", "b"]), false));
+        slow.mark("a", t0, false);
+        assert_eq!(slow.filter(c(&["a", "b"]), t0), (c(&["b"]), false));
+        // every candidate slow: keep them all, as the last resort
+        slow.mark("b", t0, false);
+        assert_eq!(slow.filter(c(&["a", "b"]), t0), (c(&["a", "b"]), true));
+        // and they expire
+        let later = t0 + SLOW_STATE_SERVER_TTL;
+        assert_eq!(slow.filter(c(&["a", "b"]), later), (c(&["a", "b"]), false));
+        // a priority peer's mark is shorter: back as a bootstrap source while a pool peer's lasts
+        let slow = SlowStateServers::default();
+        assert_eq!(slow.mark("prio", t0, true), PRIORITY_SLOW_STATE_SERVER_TTL);
+        slow.mark("pool", t0, false);
+        let c3 = c(&["prio", "pool", "other"]);
+        assert_eq!(slow.filter(c3.clone(), t0), (c(&["other"]), false));
+        let t5 = t0 + PRIORITY_SLOW_STATE_SERVER_TTL;
+        assert_eq!(slow.filter(c3, t5), (c(&["prio", "other"]), false));
+        assert!(PRIORITY_SLOW_STATE_SERVER_TTL < SLOW_STATE_SERVER_TTL);
     }
 
     #[test]
