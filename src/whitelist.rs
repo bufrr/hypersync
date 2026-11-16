@@ -177,10 +177,24 @@ pub(crate) fn default_gateways(route_table: &str) -> Vec<IpAddr> {
     out
 }
 
+// The last non-empty proxy-source set. A failed or empty read of the route table must not drop
+// the guard: an over-broad entry rejected at startup would then be installed on the next reload.
+static LAST_PROXY_SOURCES: Mutex<Vec<IpAddr>> = Mutex::new(Vec::new());
+
 fn proxy_sources() -> Vec<IpAddr> {
-    std::fs::read_to_string("/proc/net/route")
+    let read = std::fs::read_to_string("/proc/net/route")
         .map(|table| default_gateways(&table))
-        .unwrap_or_default()
+        .unwrap_or_default();
+    remember_proxy_sources(&LAST_PROXY_SOURCES, read)
+}
+
+fn remember_proxy_sources(last: &Mutex<Vec<IpAddr>>, read: Vec<IpAddr>) -> Vec<IpAddr> {
+    let mut last = last.lock().unwrap_or_else(PoisonError::into_inner);
+    if read.is_empty() {
+        return last.clone();
+    }
+    *last = read.clone();
+    read
 }
 
 fn current() -> Arc<Vec<Net>> {
@@ -428,6 +442,17 @@ mod tests {
         assert_eq!(default_gateways(table), vec![ip("172.28.0.1")]);
         assert!(default_gateways("").is_empty());
         assert!(default_gateways("Iface\tDestination\tGateway\n").is_empty());
+    }
+
+    #[test]
+    fn a_failed_route_read_keeps_the_last_proxy_sources() {
+        let last = Mutex::new(Vec::new());
+        assert!(remember_proxy_sources(&last, Vec::new()).is_empty());
+        let gw = vec![ip("172.28.0.1")];
+        assert_eq!(remember_proxy_sources(&last, gw.clone()), gw);
+        assert_eq!(remember_proxy_sources(&last, Vec::new()), gw);
+        let other = vec![ip("10.0.0.1")];
+        assert_eq!(remember_proxy_sources(&last, other.clone()), other);
     }
 
     #[test]
