@@ -152,6 +152,13 @@ pub(super) async fn probe_live(ip: &str) -> LiveProbe {
                     blocks += 1;
                     max_round = Some(max_round.map_or(round, |prev: u32| prev.max(round)));
                     status = ProbeStatus::Live;
+                    // Enough to call the peer live, and its round is its tip: stop here. Reading
+                    // on to the deadline downloaded ~6 s of the full block stream from every live
+                    // peer each cycle (2026-11-16: peerd 2.4-4.1 MB/s, more than the gateway's
+                    // shared live stream itself).
+                    if blocks >= MIN_LIVE_BLOCKS {
+                        break;
+                    }
                 } else {
                     status = ProbeStatus::LowRound;
                 }
@@ -183,6 +190,52 @@ pub(super) const MIN_LIVE_BLOCKS: usize = 2;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio::net::TcpListener;
+
+    // A live peer answers the greeting, then streams a block plus ~300 KB every 70 ms (~4 MB/s, a busy
+    // mainnet stream). The probe stops after MIN_LIVE_BLOCKS instead of reading to its 6 s deadline.
+    #[tokio::test]
+    async fn a_probe_stops_once_it_has_enough_live_blocks() {
+        // probe_live dials <ip>:4001: a loopback address of its own
+        let ip = "127.0.0.90";
+        let l = TcpListener::bind((ip, 4001)).await.unwrap();
+        let sent = Arc::new(AtomicUsize::new(0));
+        let counted = sent.clone();
+        tokio::spawn(async move {
+            let (mut s, _) = l.accept().await.unwrap();
+            let mut greet = [0u8; 8];
+            s.read_exact(&mut greet).await.unwrap();
+            s.write_all(&[0, 0, 0, 1, 0, 3]).await.unwrap();
+            let mut round = 1_528_000_000u32;
+            loop {
+                // a block, then ~300 KB of other stream data (a test block parses only small)
+                let payload = crate::protocol::test_block_payload(round, 2);
+                let mut frame = (payload.len() as u32).to_be_bytes().to_vec();
+                frame.push(1);
+                frame.extend_from_slice(&payload);
+                frame.extend_from_slice(&300_000u32.to_be_bytes());
+                frame.push(0);
+                frame.resize(frame.len() + 300_000, 0x5a);
+                if s.write_all(&frame).await.is_err() {
+                    return;
+                }
+                counted.fetch_add(frame.len(), Ordering::Relaxed);
+                round += 1;
+                tokio::time::sleep(Duration::from_millis(70)).await;
+            }
+        });
+        let t0 = Instant::now();
+        let p = probe_live(ip).await;
+        assert_eq!(p.status, ProbeStatus::Live);
+        assert_eq!(p.blocks, MIN_LIVE_BLOCKS);
+        assert_eq!(p.max_round, Some(1_528_000_001));
+        assert!(t0.elapsed() < Duration::from_secs(1), "{:?}", t0.elapsed());
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let mb = sent.load(Ordering::Relaxed) as f64 / 1e6;
+        assert!(mb < 3.0, "{mb} MB sent; a 6 s read would be ~25 MB");
+    }
 
     #[test]
     fn peerd_probe_status_peer_full_wins_over_block_count() {
