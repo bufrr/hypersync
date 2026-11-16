@@ -70,8 +70,15 @@ services:
       HYPERSYNC_NODE_WHITELIST: "${HYPERSYNC_NODE_WHITELIST:-}"
       # hot-standby failover (README "Hot-standby failover"); 0 standbys = off
       HYPERSYNC_FAILOVER_STANDBYS: "${HYPERSYNC_FAILOVER_STANDBYS:-0}"
-      # pace reference stream for the lagging-peer guard (README "Dropping a peer"); 0 = off
-      HYPERSYNC_REFERENCE_STREAM: "${HYPERSYNC_REFERENCE_STREAM:-1}"
+      # pace references for the lagging-peer guard (README "Dropping a peer"): 4002 height polls of
+      # a few pool peers; 0 = off
+      HYPERSYNC_PACE_REFERENCES: "${HYPERSYNC_PACE_REFERENCES:-1}"
+      # one upstream 4001 live stream shared by every node (README "Shared live stream"); 0 = one
+      # per node
+      HYPERSYNC_SHARED_LIVE: "${HYPERSYNC_SHARED_LIVE:-1}"
+      # bootstrap state and 4002 catch-up from a synced node behind the gateway first, upstream
+      # whenever it can't (README "Sibling sync"); 0 = always upstream
+      HYPERSYNC_SIBLING_SYNC: "${HYPERSYNC_SIBLING_SYNC:-1}"
       HYPERSYNC_FAILOVER_STALL_MS: "${HYPERSYNC_FAILOVER_STALL_MS:-400}"
       HYPERSYNC_FAILOVER_LAG_MS: "${HYPERSYNC_FAILOVER_LAG_MS:-150}"
       HYPERSYNC_FAILOVER_STATUS_DIR: "${HYPERSYNC_FAILOVER_STATUS_DIR:-}"

@@ -14,8 +14,9 @@ use super::*;
 //   request  = [u32 BE L=1][type=0][0x01]                      (0x01 = query_peers variant tag)
 //   response = [u32 BE L][type=0][0x01][count varint][entry..] (control frame, NOT lz4 data)
 //   entry    = [0x00 IPv4 discriminant][a][b][c][d][0x01][0x01] (7 bytes; only the 4 octets matter)
-// Crucially, query_peers is NOT peer-gated (unlike query_height / client_blocks, which return
-// "Peer-only request"), so peerd can crawl the peer graph standalone.
+// Crucially, query_peers is NOT peer-gated (unlike client_blocks, which returns "Peer-only
+// request"), so peerd can crawl the peer graph standalone. (query_height isn't gated either any
+// more: 2026-11-16, pool peers answered it from an IP that never streamed from them.)
 const QUERY_PEERS_REQUEST: [u8; 6] = [0, 0, 0, 1, 0, 1];
 
 const MAX_QUERY_PEERS_RESP: usize = 65_536;

@@ -258,7 +258,7 @@ impl<T> Drop for AbortOnDrop<T> {
 // node's outbound and the active peer's control / abci_state / RPC frames. Only the active peer
 // feeds the node: merging blocks from other peers by round alone cannot prove proposer/fork
 // correctness, and a wrong block can poison the node even when the active peer is healthy.
-const PUSH_MERGE_QUEUE_FRAMES: usize = 256;
+pub(super) const PUSH_MERGE_QUEUE_FRAMES: usize = 256;
 
 // Generous: the node normally drains 4001 continuously; only a stuck/half-open node hits this.
 pub(crate) const NODE_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -359,19 +359,70 @@ impl NodeQueue {
     }
 }
 
+// A stream's own highest round over the last FRESHEST_STALE, so a reference round can be compared
+// with what this stream had at the moment that reference was taken. A polled reference (4002
+// height, every 2 s) steps forward in ~30-round jumps while a stream advances smoothly: compared
+// with the stream's round NOW, a stream at a constant lag would look 0-30 rounds less behind just
+// before a poll and the full lag just after, and that sawtooth both fakes a "widening" lag (the
+// stalled-behind cut) and resets the 100-round guard's timer between polls.
+#[derive(Default)]
+pub(crate) struct OwnRounds(std::collections::VecDeque<(Instant, u32)>);
+
+impl OwnRounds {
+    pub(crate) fn record(&mut self, now: Instant, round: u32) {
+        if self.0.back().is_none_or(|(_, r)| round > *r) {
+            self.0.push_back((now, round));
+        }
+        // keep one sample older than the window: the round as of any counted reference
+        while self.0.len() > 1
+            && self
+                .0
+                .get(1)
+                .is_some_and(|(t, _)| now.saturating_duration_since(*t) > FRESHEST_STALE)
+        {
+            self.0.pop_front();
+        }
+    }
+
+    // The highest round recorded at or before `t`; before every sample, the oldest one (which can
+    // only understate a lag, never invent one). 0 with no sample.
+    pub(crate) fn at(&self, t: Instant) -> u32 {
+        self.0
+            .iter()
+            .rev()
+            .find(|(at, _)| *at <= t)
+            .or(self.0.front())
+            .map_or(0, |(_, r)| *r)
+    }
+
+    // How far this stream trailed `freshest` at the moment its reference round was taken.
+    pub(crate) fn behind(&self, freshest: Option<(u32, Instant)>) -> Option<(u32, u32)> {
+        freshest.map(|(f, at)| {
+            let own = self.at(at);
+            (own, f.saturating_sub(own))
+        })
+    }
+}
+
 pub(crate) struct BlockProgress {
     pub(crate) last_round: u32,
     at: Instant,
     // since when this stream has trailed the gateway's freshest round (see lagging)
     lag_since: Option<Instant>,
+    own: OwnRounds,
 }
 
 impl BlockProgress {
     pub(crate) fn new(last_round: u32, now: Instant) -> Self {
+        let mut own = OwnRounds::default();
+        if last_round != 0 {
+            own.record(now, last_round);
+        }
         BlockProgress {
             last_round,
             at: now,
             lag_since: None,
+            own,
         }
     }
 
@@ -386,6 +437,7 @@ impl BlockProgress {
         if rnd > self.last_round {
             self.last_round = rnd;
             self.at = now;
+            self.own.record(now, rnd);
         }
         Ok(())
     }
@@ -394,21 +446,27 @@ impl BlockProgress {
     // behind for its whole grace period; a stream that catches up (or a reference that went
     // stale) clears the timer. While the node isn't draining its queue (`node_backed_up`), the
     // node is what holds the stream back, so that time doesn't count against the upstream either.
+    //
+    // Judged against this stream's round as of the reference (see OwnRounds), and the grace runs
+    // in reference time: only newer reference rounds can confirm the lag, so a reference that
+    // stopped rising (its peers silent, or a network pause) never cuts a stream that has since
+    // caught up with it.
     pub(crate) fn lagging(
         &mut self,
         freshest: &FreshestRound,
+        own_peer: &str,
         node_backed_up: bool,
-        now: Instant,
     ) -> Option<u32> {
-        let behind = freshest
-            .get()
-            .map_or(0, |f| f.saturating_sub(self.last_round));
-        if self.last_round == 0 || node_backed_up || behind <= freshest.lag_rounds {
+        let reference = freshest.get_at(own_peer);
+        let behind = self.own.behind(reference).map_or(0, |(_, b)| b);
+        let Some((_, at)) = reference
+            .filter(|_| self.last_round != 0 && !node_backed_up && behind > freshest.lag_rounds)
+        else {
             self.lag_since = None;
             return None;
-        }
-        let since = *self.lag_since.get_or_insert(now);
-        (now.saturating_duration_since(since) >= freshest.grace).then_some(behind)
+        };
+        let since = *self.lag_since.get_or_insert(at);
+        (at.saturating_duration_since(since) >= freshest.grace).then_some(behind)
     }
 
     // The node isn't draining its queue, so the stream can't be read: that time doesn't count
@@ -424,10 +482,35 @@ impl BlockProgress {
     }
 }
 
+// One stalled-behind check of a stream whose own round is `own_now`: judged against the stream's
+// round as of the freshest reference (OwnRounds), with the grace in reference time (see
+// BlockProgress::lagging), so neither a polled reference's steps nor a frozen reference can cut it.
+pub(super) fn check_stalled_behind(
+    stalled: &mut StalledBehind,
+    own_rounds: &mut OwnRounds,
+    own_now: u32,
+    freshest: &FreshestRound,
+    own_peer: &str,
+    node_backed_up: bool,
+    now: Instant,
+) -> Option<u32> {
+    own_rounds.record(now, own_now);
+    let reference = freshest.get_at(own_peer);
+    match (own_rounds.behind(reference), reference) {
+        (Some((own_then, behind)), Some((_, at))) => stalled.check(
+            own_then,
+            Some(own_then.saturating_add(behind)),
+            node_backed_up,
+            at,
+        ),
+        _ => stalled.check(own_now, None, node_backed_up, now),
+    }
+}
+
 // The active stream stopped, or nearly, while the gateway's other streams advance (see
 // STALL_LAG_ROUNDS). Judged on a timer from the stream's own highest round, since a silent stream
 // gives BlockProgress no block to judge it on.
-struct StalledBehind {
+pub(super) struct StalledBehind {
     rounds: u32,
     grace: Duration,
     widen: u32,
@@ -436,7 +519,7 @@ struct StalledBehind {
 }
 
 impl StalledBehind {
-    fn new(rounds: u32, grace: Duration, widen: u32) -> Self {
+    pub(super) fn new(rounds: u32, grace: Duration, widen: u32) -> Self {
         StalledBehind {
             rounds,
             grace,
@@ -448,7 +531,7 @@ impl StalledBehind {
     // Rounds the stream trails `freshest` by, once it has stayed `rounds` behind for the grace and
     // fallen another `widen` behind meanwhile. No round of its own yet, no freshest round, or a
     // node not draining its queue (the node then holds the stream back) clears the timer.
-    fn check(
+    pub(super) fn check(
         &mut self,
         own_round: u32,
         freshest: Option<u32>,
@@ -468,7 +551,7 @@ impl StalledBehind {
 }
 
 // The freshest block round this gateway's upstream streams have reached: a reference far fresher
-// than peerd's probe tip (minutes old). Every live push session and the pace reference streams
+// than peerd's probe tip (minutes old). Every live push session, the shared live stream and the pace references
 // feed it, each with rounds that passed its own plausibility and jump gates. It is the highest
 // round streams from at least TWO different peers have reached, so no single peer — faulty or
 // hostile, sending rounds far ahead, even over several streams — can move it: the worst one bad
@@ -501,11 +584,11 @@ pub(crate) const FRESHEST_STALE: Duration = Duration::from_secs(30);
 // this takes ~6 s. On recorded streams of 8 healthy peers (5.2 peer-hours) it fired only on two
 // real stalls (304 and 548 rounds behind); no healthy stream ever trailed by more than 26 rounds.
 // A stream that sits behind at full pace isn't widening, so it stays the 100-round guard's.
-const STALL_LAG_ROUNDS: u32 = 45;
-const STALL_LAG_GRACE: Duration = Duration::from_secs(3);
-const STALL_LAG_WIDEN: u32 = 30;
+pub(super) const STALL_LAG_ROUNDS: u32 = 45;
+pub(super) const STALL_LAG_GRACE: Duration = Duration::from_secs(3);
+pub(super) const STALL_LAG_WIDEN: u32 = 30;
 // how often serve_push checks for it: the stream's own reads can't, a silent one has none
-const STALL_CHECK_EVERY: Duration = Duration::from_millis(250);
+pub(super) const STALL_CHECK_EVERY: Duration = Duration::from_millis(250);
 // Frames queued for a node that is not draining them (~2s of blocks): the node, not its upstream,
 // is then what holds the stream back, so the lag guard doesn't blame the peer.
 const NODE_BACKLOG_EXEMPT_FRAMES: usize = 32;
@@ -558,6 +641,14 @@ impl FreshestRound {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn peers_for_test(&self) -> Vec<String> {
+        let mut v: Vec<String> = lock(&self.streams).values().map(|e| e.0.clone()).collect();
+        v.sort();
+        v.dedup();
+        v
+    }
+
     // The lowest first round a newly selected peer may start at: the freshest round less the lag
     // the guard allows (0 = none known). A fresh 4001 stream starts at its peer's own tip, so one
     // starting below this would be cut by the guard a few seconds into the session, costing the
@@ -575,23 +666,42 @@ impl FreshestRound {
         self.get_within(self.stale)
     }
 
+    // The reference a stream from `own_peer` is judged against: the highest round two OTHER
+    // peers have reached, with when it was taken (when its entry rose to it), so the stream is
+    // judged against its own round as of then (OwnRounds). Its own entries never count: with one
+    // other peer left, its own feed would be the second "peer" and a stream lagging at a steady
+    // pace would be its own reference and never be cut. With fewer than two other peers: None
+    // (the guards pause; the pace references log a WARN when they can't keep two).
+    pub(crate) fn get_at(&self, own_peer: &str) -> Option<(u32, Instant)> {
+        self.get_within_at(self.stale, Some(own_peer))
+    }
+
     // get(), counting only entries whose round rose within `max_age`
     fn get_within(&self, max_age: Duration) -> Option<u32> {
+        self.get_within_at(max_age, None).map(|(r, _)| r)
+    }
+
+    fn get_within_at(&self, max_age: Duration, exclude: Option<&str>) -> Option<(u32, Instant)> {
         let tip = self.net_tip.load(Ordering::Acquire);
         if tip == 0 {
             return None;
         }
         let ceiling = tip.saturating_add(FRESHEST_TIP_SLACK);
         let now = Instant::now();
-        let mut per_peer: HashMap<&str, u32> = HashMap::new();
+        let mut per_peer: HashMap<&str, (u32, Instant)> = HashMap::new();
         let streams = lock(&self.streams);
         for (peer, round, at) in streams.values() {
+            if exclude == Some(peer.as_str()) {
+                continue;
+            }
             if now.saturating_duration_since(*at) <= max_age && *round <= ceiling {
-                let best = per_peer.entry(peer.as_str()).or_insert(0);
-                *best = (*best).max(*round);
+                let best = per_peer.entry(peer.as_str()).or_insert((*round, *at));
+                if (*round, *at) > *best {
+                    *best = (*round, *at);
+                }
             }
         }
-        let mut rounds: Vec<u32> = per_peer.into_values().collect();
+        let mut rounds: Vec<(u32, Instant)> = per_peer.into_values().collect();
         rounds.sort_unstable_by(|a, b| b.cmp(a));
         rounds.get(1).copied()
     }
@@ -609,14 +719,22 @@ pub(crate) struct FreshestFeed {
 impl FreshestFeed {
     // A round that passed the stream's own gates.
     pub(crate) fn offer(&self, round: u32) {
+        self.offer_at(round, Instant::now());
+    }
+
+    // a round the peer had at `at` (a polled height: halfway through the query's round trip)
+    pub(crate) fn offer_at(&self, round: u32, at: Instant) {
         self.own.fetch_max(round, Ordering::AcqRel);
-        self.freshest
-            .offer(self.id, &self.peer, round, Instant::now());
+        self.freshest.offer(self.id, &self.peer, round, at);
     }
 
     // The stream's own highest round, readable after the feed moved into its reader.
-    fn own_round(&self) -> Arc<AtomicU32> {
+    pub(super) fn own_round(&self) -> Arc<AtomicU32> {
         self.own.clone()
+    }
+
+    pub(crate) fn peer(&self) -> &str {
+        &self.peer
     }
 
     pub(crate) fn freshest(&self) -> &FreshestRound {
@@ -682,6 +800,9 @@ pub(crate) fn push_exit_is_upstream_fault(reason: &str) -> bool {
         || reason.starts_with("node greeting write")
         || reason.starts_with("active superseded")
         || reason.starts_with(RETURNING_TO_PRIORITY)
+        // the shared live stream: idle with no node left, or a node's session it ended
+        || reason.starts_with(super::hub::HUB_IDLE_REASON)
+        || reason.starts_with(super::hub::HUB_ENDED)
         || reason.starts_with(NODE_CATCHUP_STUCK))
 }
 
@@ -772,7 +893,7 @@ enum FrameKindSeen {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn spawn_active_pump(
+pub(super) fn spawn_active_pump(
     act_r: OwnedReadHalf,
     tx: NodeQueue,
     forward_gate: Arc<tokio::sync::Mutex<RoundForwardGate>>,
@@ -950,6 +1071,7 @@ pub(crate) async fn serve_push(node: TcpStream, active_conn: TcpStream, cfg: Pus
     let mut stall_check = tokio::time::interval(STALL_CHECK_EVERY);
     stall_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut stalled_behind = StalledBehind::new(STALL_LAG_ROUNDS, STALL_LAG_GRACE, STALL_LAG_WIDEN);
+    let mut own_rounds = OwnRounds::default();
     let exit_reason = loop {
         tokio::select! {
             _ = &mut superseded => break "active superseded by failover".to_string(),
@@ -957,9 +1079,12 @@ pub(crate) async fn serve_push(node: TcpStream, active_conn: TcpStream, cfg: Pus
             reason = &mut end_when => break reason,
             _ = stall_check.tick(), if own_round.is_some() => {
                 let (Some(own), Some(freshest)) = (&own_round, &cfg.freshest) else { continue };
-                if let Some(behind) = stalled_behind.check(
+                if let Some(behind) = check_stalled_behind(
+                    &mut stalled_behind,
+                    &mut own_rounds,
                     own.load(Ordering::Acquire),
-                    freshest.get(),
+                    freshest,
+                    &active_host,
                     tx.backed_up(),
                     Instant::now(),
                 ) {
@@ -1064,8 +1189,7 @@ async fn pump_merge(
             active_round.fetch_max(rnd, Ordering::AcqRel);
             if let Some(feed) = &freshest {
                 feed.offer(rnd);
-                if let Some(behind) =
-                    progress.lagging(feed.freshest(), tx.backed_up(), Instant::now())
+                if let Some(behind) = progress.lagging(feed.freshest(), feed.peer(), tx.backed_up())
                 {
                     return Err(std::io::Error::other(format!(
                         "active peer lags the freshest stream by {behind} rounds"
@@ -1103,7 +1227,7 @@ async fn pump_merge(
 // One frame the active peer sent during selection (prefetched), through the same gates as
 // pump_merge's live stream.
 #[allow(clippy::too_many_arguments)]
-async fn process_live_frame(
+pub(super) async fn process_live_frame(
     frame: Vec<u8>,
     tx: &NodeQueue,
     forward_gate: &Arc<tokio::sync::Mutex<RoundForwardGate>>,
@@ -1555,61 +1679,185 @@ mod tests {
         assert_eq!(f.get(), Some(1_496_000_101));
     }
 
+    // The grace runs in reference time: each check below follows a new reference round.
     #[test]
     fn a_stream_lagging_the_freshest_round_is_flagged_only_after_the_grace() {
         let f = freshest(Duration::from_secs(30));
         let (r1, r2) = (f.feed("r1"), f.feed("r2"));
+        let refs = |round: u32, t: Instant| {
+            r1.offer_at(round, t);
+            r2.offer_at(round, t);
+        };
         let t0 = Instant::now();
         let mut p = BlockProgress::new(0, t0);
         let s = Duration::from_secs(1);
-        r1.offer(1_496_001_000);
-        r2.offer(1_496_001_000);
+        refs(1_496_001_000, t0);
         // no round of its own yet: nothing to judge
-        assert_eq!(p.lagging(&f, false, t0), None);
+        assert_eq!(p.lagging(&f, "self", false), None);
         p.on_round(1_496_000_900, t0).unwrap();
         // 100 behind: within the allowance
-        assert_eq!(p.lagging(&f, false, t0), None);
+        assert_eq!(p.lagging(&f, "self", false), None);
         p.on_round(1_496_000_800, t0).unwrap(); // lower rounds don't move it back
-        r1.offer(1_496_001_200);
-        r2.offer(1_496_001_200); // now 300 behind
-        assert_eq!(p.lagging(&f, false, t0), None, "the grace starts now");
-        assert_eq!(p.lagging(&f, false, t0 + 14 * s), None);
-        assert_eq!(p.lagging(&f, false, t0 + 15 * s), Some(300));
+        refs(1_496_001_200, t0); // now 300 behind
+        assert_eq!(p.lagging(&f, "self", false), None, "the grace starts now");
+        refs(1_496_001_201, t0 + 14 * s);
+        assert_eq!(p.lagging(&f, "self", false), None);
+        refs(1_496_001_202, t0 + 15 * s);
+        assert_eq!(p.lagging(&f, "self", false), Some(302));
         // catching up clears the timer: a later relapse gets the full grace again
         p.on_round(1_496_001_150, t0 + 16 * s).unwrap();
-        assert_eq!(p.lagging(&f, false, t0 + 16 * s), None);
-        r1.offer(1_496_001_400);
-        r2.offer(1_496_001_400);
-        assert_eq!(p.lagging(&f, false, t0 + 17 * s), None);
-        assert_eq!(p.lagging(&f, false, t0 + 31 * s), None);
-        assert_eq!(p.lagging(&f, false, t0 + 32 * s), Some(250));
+        refs(1_496_001_203, t0 + 16 * s);
+        assert_eq!(p.lagging(&f, "self", false), None);
+        refs(1_496_001_400, t0 + 17 * s);
+        assert_eq!(p.lagging(&f, "self", false), None);
+        refs(1_496_001_401, t0 + 31 * s);
+        assert_eq!(p.lagging(&f, "self", false), None);
+        refs(1_496_001_402, t0 + 32 * s);
+        assert_eq!(p.lagging(&f, "self", false), Some(252));
         // a node that isn't draining its queue is what holds the stream back: no blame, and the
         // grace starts over once it drains
-        assert_eq!(p.lagging(&f, true, t0 + 40 * s), None);
-        assert_eq!(p.lagging(&f, false, t0 + 41 * s), None);
-        assert_eq!(p.lagging(&f, false, t0 + 56 * s), Some(250));
+        assert_eq!(p.lagging(&f, "self", true), None);
+        refs(1_496_001_403, t0 + 41 * s);
+        assert_eq!(p.lagging(&f, "self", false), None);
+        refs(1_496_001_404, t0 + 56 * s);
+        assert_eq!(p.lagging(&f, "self", false), Some(254));
         // a stream at the freshest round never lags
         let mut alone = BlockProgress::new(0, t0);
-        alone.on_round(1_496_001_400, t0).unwrap();
-        assert_eq!(alone.lagging(&f, false, t0 + 100 * s), None);
+        alone.on_round(1_496_001_404, t0 + 56 * s).unwrap();
+        assert_eq!(alone.lagging(&f, "self", false), None);
+    }
+
+    // A reference that stops rising (its peers silent, or a network pause) can't confirm a lag:
+    // a stream 200 behind it that then catches up is never cut on the old reading.
+    #[test]
+    fn a_frozen_reference_never_cuts_a_stream_that_caught_up() {
+        let f = freshest(Duration::from_secs(30));
+        let (r1, r2) = (f.feed("r1"), f.feed("r2"));
+        let t0 = Instant::now();
+        let r = 1_496_001_000;
+        r1.offer_at(r, t0);
+        r2.offer_at(r, t0);
+        let mut p = BlockProgress::new(0, t0);
+        p.on_round(r - 200, t0).unwrap();
+        assert_eq!(
+            p.lagging(&f, "self", false),
+            None,
+            "200 behind: the grace starts"
+        );
+        p.on_round(r, t0 + Duration::from_secs(3)).unwrap();
+        // the same reference round again is no new reading
+        r1.offer_at(r, t0 + Duration::from_secs(20));
+        for _ in 0..10 {
+            assert_eq!(p.lagging(&f, "self", false), None);
+        }
+    }
+
+    // A stream's own feed never serves as its reference: with one other peer left, a stream
+    // lagging at a steady pace isn't judged against itself (the guard pauses rather than vouch
+    // for it); once two other peers report, it is cut.
+    #[test]
+    fn a_stream_is_never_its_own_reference() {
+        let f = freshest(Duration::from_secs(30));
+        let (own, ext1) = (f.feed("self"), f.feed("ext1"));
+        let t0 = Instant::now();
+        let mut p = BlockProgress::new(0, t0);
+        let step = |i: u32| (t0 + Duration::from_secs(i.into()), TIP + 15 * i);
+        for i in 0..40 {
+            let (t, r) = step(i);
+            own.offer_at(r, t);
+            p.on_round(r, t).unwrap();
+            ext1.offer_at(r + 200, t);
+            assert!(f.get_at("self").is_none(), "one other peer is no reference");
+            assert_eq!(p.lagging(&f, "self", false), None);
+        }
+        // the old judgement, own feed counted, would have seen no lag at all
+        assert_eq!(f.get(), Some(TIP + 15 * 39));
+        let ext2 = f.feed("ext2");
+        let mut cut = None;
+        for i in 40..60 {
+            let (t, r) = step(i);
+            own.offer_at(r, t);
+            p.on_round(r, t).unwrap();
+            ext1.offer_at(r + 200, t);
+            ext2.offer_at(r + 200, t);
+            cut = cut.or(p.lagging(&f, "self", false));
+        }
+        assert_eq!(cut, Some(200), "200 behind two other peers for the grace");
     }
 
     #[test]
     fn one_hostile_peer_cannot_make_honest_sessions_look_lagging() {
         let f = freshest(Duration::from_secs(30));
         let (honest, other_honest) = (f.feed("honest"), f.feed("other-honest"));
-        // one peer feeding two streams (say a node session and a pace reference) is still one peer
+        // one peer feeding two entries (say a live stream and a polled reference) is still one peer
         let (hostile, hostile_again) = (f.feed("hostile"), f.feed("hostile"));
         let t0 = Instant::now();
-        honest.offer(1_496_000_000);
-        other_honest.offer(1_496_000_000);
-        hostile.offer(1_496_015_000); // a plausible round far ahead
-        hostile_again.offer(1_496_015_000);
         let mut p = BlockProgress::new(0, t0);
         p.on_round(1_496_000_000, t0).unwrap();
         for secs in [0, 20, 60] {
-            assert_eq!(p.lagging(&f, false, t0 + Duration::from_secs(secs)), None);
+            let t = t0 + Duration::from_secs(secs);
+            honest.offer_at(1_496_000_000 + secs as u32, t);
+            other_honest.offer_at(1_496_000_000 + secs as u32, t);
+            hostile.offer_at(1_496_015_000 + secs as u32, t); // a plausible round far ahead
+            hostile_again.offer_at(1_496_015_000 + secs as u32, t);
+            assert_eq!(p.lagging(&f, "self", false), None);
         }
+    }
+
+    // A reference polled every 2 s (4002 heights) steps ~30 rounds at a time while the stream
+    // advances one round per block. Judged against the stream's round as of each reference, a
+    // stream at a constant lag stays at that lag: no false "widening" stall cut at 80 behind, no
+    // guard timer reset between polls at 130 behind; a stream that stops is still caught.
+    // Simulated time: one step per round, ~15 rounds/s.
+    fn run_against_polled_reference(lag: u32, stops_after_secs: Option<u32>) -> (bool, bool) {
+        let f = Arc::new(FreshestRound::new(
+            PEER_LAG_ROUNDS,
+            PEER_LAG_GRACE,
+            FRESHEST_STALE,
+            Arc::new(AtomicU32::new(TIP)),
+        ));
+        let (a, b) = (f.feed("ref-a"), f.feed("ref-b"));
+        let t0 = Instant::now();
+        let step = Duration::from_secs(1) / 15;
+        let mut p = BlockProgress::new(0, t0);
+        let mut own_rounds = OwnRounds::default();
+        let mut stalled = StalledBehind::new(STALL_LAG_ROUNDS, STALL_LAG_GRACE, STALL_LAG_WIDEN);
+        let (mut lag_cut, mut stall_cut) = (false, false);
+        let mut own = 0u32;
+        for i in 0..(15 * 40u32) {
+            let t = t0 + step * i;
+            let network = TIP + 500 + i;
+            // two references polled 2 s apart, offset by 1 s
+            if i % 30 == 0 {
+                a.offer_at(network, t);
+            }
+            if i % 30 == 15 {
+                b.offer_at(network, t);
+            }
+            if stops_after_secs.is_none_or(|secs| i < secs * 15) {
+                own = network - lag;
+                p.on_round(own, t).unwrap();
+            }
+            lag_cut |= p.lagging(&f, "self", false).is_some();
+            stall_cut |=
+                check_stalled_behind(&mut stalled, &mut own_rounds, own, &f, "self", false, t)
+                    .is_some();
+        }
+        (lag_cut, stall_cut)
+    }
+
+    #[test]
+    fn a_stream_at_a_constant_lag_holds_against_a_polled_reference() {
+        assert_eq!(run_against_polled_reference(0, None), (false, false));
+        assert_eq!(
+            run_against_polled_reference(80, None),
+            (false, false),
+            "80 behind, full pace"
+        );
+        let (lag_cut, _) = run_against_polled_reference(130, None);
+        assert!(lag_cut, "130 behind for 40 s is cut by the 100-round guard");
+        let (_, stall_cut) = run_against_polled_reference(0, Some(10));
+        assert!(stall_cut, "a stream that stops is cut");
     }
 
     // The production tuning: a dip like the worst a healthy priority peer showed in soak (87
@@ -1626,18 +1874,25 @@ mod tests {
         let t0 = Instant::now();
         let mut p = BlockProgress::new(0, t0);
         p.on_round(TIP, t0).unwrap();
-        a.offer(TIP + 87);
-        b.offer(TIP + 87);
-        assert_eq!(p.lagging(&f, false, t0), None);
-        assert_eq!(p.lagging(&f, false, t0 + Duration::from_secs(60)), None);
+        let refs = |round: u32, t: Instant| {
+            a.offer_at(round, t);
+            b.offer_at(round, t);
+        };
+        refs(TIP + 87, t0);
+        assert_eq!(p.lagging(&f, "self", false), None);
+        refs(TIP + 88, t0 + Duration::from_secs(60));
+        assert_eq!(p.lagging(&f, "self", false), None);
         let behind = PEER_LAG_ROUNDS + 1;
-        a.offer(TIP + behind);
-        b.offer(TIP + behind);
-        let t1 = t0 + Duration::from_secs(60);
-        assert_eq!(p.lagging(&f, false, t1), None, "the grace starts now");
-        let almost = t1 + PEER_LAG_GRACE - Duration::from_millis(1);
-        assert_eq!(p.lagging(&f, false, almost), None);
-        assert_eq!(p.lagging(&f, false, t1 + PEER_LAG_GRACE), Some(behind));
+        let t1 = t0 + Duration::from_secs(61);
+        refs(TIP + behind, t1);
+        assert_eq!(p.lagging(&f, "self", false), None, "the grace starts now");
+        refs(
+            TIP + behind + 1,
+            t1 + PEER_LAG_GRACE - Duration::from_millis(1),
+        );
+        assert_eq!(p.lagging(&f, "self", false), None);
+        refs(TIP + behind + 2, t1 + PEER_LAG_GRACE);
+        assert_eq!(p.lagging(&f, "self", false), Some(behind + 2));
     }
 
     // Rounds far past peerd's network tip — or any while that tip is unknown — don't count, so
@@ -1810,7 +2065,7 @@ mod tests {
     }
 
     // A session whose upstream keeps trailing the gateway's freshest stream (another session, the
-    // pace reference) ends as an upstream fault, so the node reconnects to a peer that keeps up.
+    // pace references) ends as an upstream fault, so the node reconnects to a peer that keeps up.
     #[tokio::test]
     async fn push_session_ends_when_its_upstream_lags_the_freshest_stream() {
         const R: u32 = 1_496_000_000;

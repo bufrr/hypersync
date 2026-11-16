@@ -79,7 +79,7 @@ fn client_block_peer_candidates(
 // A 4002 response frame together with its share of CLIENT_BLOCK_RESPONSE_BYTES: the budget is
 // held for as long as the frame exists (kept as a fallback answer, being written to the node),
 // not just while it is read.
-struct BudgetedFrame {
+pub(super) struct BudgetedFrame {
     bytes: Vec<u8>,
     _budget: tokio::sync::SemaphorePermit<'static>,
 }
@@ -200,7 +200,7 @@ fn client_block_range(req: &[u8]) -> Option<(u32, u32)> {
     })
 }
 
-fn client_block_range_request(start: u32, end: u32) -> Vec<u8> {
+pub(super) fn client_block_range_request(start: u32, end: u32) -> Vec<u8> {
     let mut req = vec![0, 0, 0, 11, 0, 0, 0xfc];
     req.extend_from_slice(&start.to_le_bytes());
     req.push(0xfc);
@@ -303,6 +303,7 @@ fn start_prefetch(
     peers: &[String],
     rr: &Arc<AtomicUsize>,
     (start, end): (u32, u32),
+    siblings: Option<Arc<LiveHub>>,
 ) {
     let Ok(slot) = PREFETCH_SLOTS.try_acquire() else {
         return;
@@ -315,7 +316,7 @@ fn start_prefetch(
         let req = Arc::new(client_block_range_request(start, end));
         timeout(
             CLIENT_BLOCK_FETCH_DEADLINE,
-            fetch_client_blocks_raced(&n, &prio, &peers, &rr, req),
+            fetch_client_blocks(siblings.as_ref(), &n, &prio, &peers, &rr, req),
         )
         .await
         .unwrap_or_else(|_| Err("prefetch deadline".to_string()))
@@ -712,6 +713,73 @@ async fn fetch_client_blocks_raced(
     Err(failures.join("; "))
 }
 
+// A range query (catch-up) goes to a synced sibling node behind this gateway first: it answers
+// over the LAN, with no upstream traffic (2026-11-16: a live node answered a 100-round range with
+// an 8 MB batch to a direct dialer with no 4001 session). A sibling is on the same shared live
+// stream as the node, so its batches don't cross a state view the way another upstream's could
+// (see serve_client_blocks). Anything but a batch from it — refused, round too large or too
+// small, any other answer than a type-1 batch, an error, no answer within SIBLING_4002_WAIT —
+// cools that sibling for SIBLING_4002_COOL and the request goes to the upstream peers exactly as
+// without siblings. One sibling per request, so a hung one costs at most SIBLING_4002_WAIT of the
+// request's CLIENT_BLOCK_FETCH_DEADLINE. Height queries and query_peers always go upstream.
+const SIBLING_4002_WAIT: Duration = Duration::from_secs(3);
+const SIBLING_4002_COOL: Duration = Duration::from_secs(60);
+
+pub(super) async fn fetch_client_blocks(
+    siblings: Option<&Arc<LiveHub>>,
+    node: &Arc<NodeState>,
+    priority: &Arc<PriorityTier>,
+    peers: &[String],
+    rr: &Arc<AtomicUsize>,
+    req: Arc<Vec<u8>>,
+) -> Result<BudgetedFrame, String> {
+    if let Some(hub) = siblings.filter(|_| client_block_range(&req).is_some()) {
+        // the cooling rotates later requests through the others
+        if let Some(ip) = hub.range_siblings(node.ip).into_iter().next() {
+            let started = Instant::now();
+            let why = match timeout(
+                SIBLING_4002_WAIT,
+                fetch_client_blocks_from_peer(ip.clone(), req.clone(), false),
+            )
+            .await
+            {
+                Ok((_, Ok(ClientBlockUpstreamResponse::Frames(frame))))
+                    if frame.get(4) == Some(&1) =>
+                {
+                    gwlog!(
+                        "[gw] [{}] 4002 client blocks via {ip} tier=sibling bytes={} ms={}",
+                        node.ip,
+                        frame.len(),
+                        started.elapsed().as_millis()
+                    );
+                    return Ok(frame);
+                }
+                Ok((_, Ok(ClientBlockUpstreamResponse::Frames(frame)))) => format!(
+                    "not a batch (type {} len {})",
+                    frame.get(4).copied().unwrap_or(0),
+                    frame.len().saturating_sub(5)
+                ),
+                Ok((_, Ok(ClientBlockUpstreamResponse::PeerOnly))) => "peer-only".to_string(),
+                Ok((_, Ok(ClientBlockUpstreamResponse::RangeTooSmall(_)))) => {
+                    "round too small".to_string()
+                }
+                Ok((_, Ok(ClientBlockUpstreamResponse::TerminalError(_)))) => {
+                    "no batch (round too large?)".to_string()
+                }
+                Ok((_, Err(e))) => e.to_string(),
+                Err(_) => format!("no answer in {}s", SIBLING_4002_WAIT.as_secs()),
+            };
+            hub.cool_range_sibling(&ip, SIBLING_4002_COOL);
+            gwlog!(
+                "[gw] [{}] 4002 sibling {ip}: {why}; asking upstream (sibling skipped {}s)",
+                node.ip,
+                SIBLING_4002_COOL.as_secs()
+            );
+        }
+    }
+    fetch_client_blocks_raced(node, priority, peers, rr, req).await
+}
+
 // Serve the node's client-block RPC (port 4002), staged: the real 4001 active peer answers ALONE
 // within a grace budget (mixing client-block responses from another peer into a live session may
 // cross hardfork/state-view boundaries, and the common case must cost one upstream connection);
@@ -725,6 +793,8 @@ pub(super) async fn serve_client_blocks(
     peers: Vec<String>,
     rr: Arc<AtomicUsize>,
     freshest: Arc<crate::push::FreshestRound>,
+    // the shared stream, whose synced nodes answer range queries first (None: upstream only)
+    siblings: Option<Arc<LiveHub>>,
 ) {
     let mut down = down;
     let mut hdr = [0u8; 5];
@@ -767,7 +837,14 @@ pub(super) async fn serve_client_blocks(
             };
             timeout(
                 CLIENT_BLOCK_FETCH_DEADLINE,
-                fetch_client_blocks_raced(&node, &priority, &peers, &rr, Arc::new(req)),
+                fetch_client_blocks(
+                    siblings.as_ref(),
+                    &node,
+                    &priority,
+                    &peers,
+                    &rr,
+                    Arc::new(req),
+                ),
             )
             .await
             .unwrap_or_else(|_| {
@@ -791,7 +868,7 @@ pub(super) async fn serve_client_blocks(
                 );
                 // the node's next request, fetched while it processes this batch
                 if let Some(next) = tip.and_then(|t| next_prefetch_range(start, end, t)) {
-                    start_prefetch(&node, &priority, &peers, &rr, next);
+                    start_prefetch(&node, &priority, &peers, &rr, next, siblings.clone());
                 }
             }
             let _ = timeout(NODE_WRITE_TIMEOUT, down.write_all(&frame)).await;
@@ -1034,7 +1111,7 @@ mod tests {
         let tier = exclusive_tier("127.0.0.1");
         let rr = Arc::new(AtomicUsize::new(0));
         let before = node.pin_generation();
-        start_prefetch(&node, &tier, &[], &rr, (100, 199));
+        start_prefetch(&node, &tier, &[], &rr, (100, 199), None);
         assert!(lock(&node.prefetch)
             .as_ref()
             .is_some_and(|p| p.generation == before));
@@ -1156,7 +1233,7 @@ mod tests {
                 let addr = gw.local_addr().unwrap();
                 let serve = tokio::spawn(async move {
                     let (down, _) = gw.accept().await.unwrap();
-                    serve_client_blocks(down, node, tier, Vec::new(), rr, freshest).await;
+                    serve_client_blocks(down, node, tier, Vec::new(), rr, freshest, None).await;
                 });
                 let mut c = TcpStream::connect(addr).await.unwrap();
                 c.write_all(&client_block_range_request(start, start + 99))

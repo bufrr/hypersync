@@ -12,7 +12,7 @@ priority peers ──┼─▶ hypersync gateway ─▶ your hl-node(s)
 ```
 
 - **gateway** relays each node's bootstrap, live blocks (4001) and client-block RPC (4002) through one vetted upstream peer per node, and serves several nodes at once (one session per node source IP).
-- **peerd** discovers peers (`gossipRootIps` API + a `query_peers` crawl), probes which ones serve live blocks, and writes `peers.json` for the gateway every cycle.
+- **peerd** discovers peers (`gossipRootIps` API + a `query_peers` crawl), probes which ones serve live blocks (a live greeting, ended as soon as 2 blocks arrive, so a live peer costs a few hundred KB, not seconds of its stream), and writes `peers.json` for the gateway every cycle.
 - **Priority peers** (e.g. dedicated sentries) are tried first; the public pool is the backup.
 - A node only ingests blocks from peers it dials, so each node points `root_node_ips` at the gateway and dials nothing else.
 - The gateway's public listeners answer upstream probe traffic from non-whitelisted sources on 4001/4002, so the nodes need no public ports (below).
@@ -36,8 +36,6 @@ Point each node at the gateway in `override_gossip_config.json` and restart it:
 - Smoke test: `docker run --rm --network hypersync_gwnet hypersync:latest fakenode 172.28.0.10 --rpc --label smoke`
 
 > **Whitelist only your nodes.** A whitelisted source can trigger a ~5.8 GB bootstrap relay. The gateway refuses to start with an empty whitelist. The gwnet bridge gateway `172.28.0.1` must never be covered: Docker's userland proxy makes forwarded IPv6 and hairpin connections arrive from that address, so covering it would whitelist the whole internet. The gateway therefore rejects (logs and never installs) a `/0` or any entry containing its own default gateway, such as `172.28.0.0/24`. Non-whitelisted sources receive only the [public probe answers](#public-probe-answers).
->
-> **Upgrading from the responder topology, or rolling back across it:** follow §12 of [docs/deploy-existing-hlnode.md](docs/deploy-existing-hlnode.md). Never run an image built before the whitelist with this compose file: it publishes 4000-4010 to the internet, and that image serves every source.
 
 ## Modes
 
@@ -83,8 +81,8 @@ the gateway's default gateway (`172.28.0.1` in compose; a NAT router's address o
 empty initial whitelist, counting only the entries actually installed, stops startup; an empty set
 after a reload logs a warning.
 
-Because the probe answers now come from the gateway process, a gateway restart or crash loop also
-leaves upstream probes unanswered until it is back (the old separate responder kept answering).
+Because the probe answers come from the gateway process, a gateway restart or crash loop also
+leaves upstream probes unanswered until it is back.
 
 ## Configuration
 
@@ -103,7 +101,9 @@ Set in `.env`; compose passes them through.
 | `HYPERSYNC_PRIORITY_STAGE_MS` | `1500` | Staged tier only: how long priority peers race alone before the pool joins. |
 | `HYPERSYNC_PRIORITY_BOOTSTRAP` | `prefer` if exclusive, else `fallback` | Bootstrap from priority peers: `prefer` (first), `fallback` (after the pool, even on an exclusive tier), or `never`. |
 | `HYPERSYNC_FAILOVER_STANDBYS` | `0` | Hot standbys per node session (see below). |
-| `HYPERSYNC_REFERENCE_STREAM` | `1` | `0` turns off the two pace reference streams: extra live streams from pool peers (~1-2 MB/s each, nothing forwarded) that let even a single node session notice its peer falling behind. |
+| `HYPERSYNC_PACE_REFERENCES` | `1` | Pace references, which let even a single live stream notice its peer falling behind: 3 pool peers' rounds, polled with a 4002 height query every 2 s (~15 bytes/s each). With fewer than 2 working the lag guards pause (`WARN only N pace reference(s) available`). `0` turns them off. |
+| `HYPERSYNC_SHARED_LIVE` | `1` | `0` gives every node its own upstream 4001 live stream instead of sharing one (below). |
+| `HYPERSYNC_SIBLING_SYNC` | `1` | `0` always takes a node's bootstrap state and 4002 catch-up from upstream peers instead of first from a synced node behind the gateway (below). |
 | `HYPERSYNC_BOOT_CACHE` | next to peers.json | Disk path for `--cache`. |
 | `HYPERSYNC_DATA` | `./data` | peerd's data dir (`peers.json`, candidates). |
 | `HL_STATS_DIR` | – | Optional, comma-separated `tcp_lz4_stats` dirs of co-located nodes (extra discovery source). |
@@ -125,8 +125,8 @@ Set in `.env`; compose passes them through.
 - sends nothing for 10 s, or no higher block for 30 s;
 - sends a block more than 20,000 rounds above its previous one;
 - falls more than 1,500 rounds behind the network tip, or sends an implausible round;
-- stops, or nearly, while the gateway's other streams advance: 45 rounds (~3 s) behind the freshest round the gateway's live streams agree on, and another 30 rounds behind 3 s later (cut ~6 s after it stops, instead of the 10 s idle timeout or the guard below). A healthy stream that dips and recovers, or keeps pace a fixed distance behind, isn't cut (recorded streams of healthy peers never trailed by more than 26 rounds);
-- stays more than 100 rounds (~7 s) behind that freshest round for 5 s (cut ~12 s after it starts falling behind) — a peer that still sends, just slowly. "Agree" means streams from at least two different peers (other node sessions, two pace reference streams) have reached it, so one bad peer can't make honest sessions look lagging, and rounds more than ~20 min past peerd's network tip never count (nor any while that tip is unknown). Time when the node itself isn't taking blocks counts against the peer neither here nor for the 30 s stall;
+- stops, or nearly, while the gateway's other streams advance: 45 rounds (~3 s) behind the freshest round at least two OTHER upstream peers agree on (the pace references' polled rounds, other live streams; a stream never counts as its own reference), and another 30 rounds behind 3 s later (cut ~6 s after it stops, instead of the 10 s idle timeout or the guard below). A healthy stream that dips and recovers, or keeps pace a fixed distance behind, isn't cut (recorded streams of healthy peers never trailed by more than 26 rounds);
+- stays more than 100 rounds (~7 s) behind that freshest round for 5 s (cut ~12 s after it starts falling behind) — a peer that still sends, just slowly. "Agree" means at least two different peers (other streams, the pace references' polled rounds) have reached it, so one bad peer can't make honest sessions look lagging, and rounds more than ~20 min past peerd's network tip never count (nor any while that tip is unknown). Time when the node itself isn't taking blocks counts against the peer neither here nor for the 30 s stall;
 - stops reading the node's outbound traffic for 5 s.
 
 The peer is then skipped for 30 s (priority peers via their own cooldown), so the reconnect lands on a different one unless every peer is cooling down.
@@ -138,6 +138,15 @@ The peer is then skipped for 30 s (priority peers via their own cooldown), so th
 Live frames over 8 MB end the session (blocks average ~200 KB), at most 64 MB of frames are queued per node, and writes to a node are bounded to 30 s, so neither a hostile peer nor a stuck node can make a session hold more. The one exception is a bootstrap connection: during its first 15 minutes a write may stall up to 300 s, because a node stops reading while it loads the received abci_state before it reads the EVM KVs (57-145 s measured on a 16-core node), and the 64 MB state prefetch is a single write that a slow link needs well over 30 s for. After those 15 minutes the 30 s bound applies again.
 
 **Network round tip.** peerd publishes the median round of the largest cluster of probed peers, so a minority of peers (even a few colluding ones) can't move it; a majority of the probed peers lying still could. The gateway replaces its tip with each fresh reading and resets it to unknown (with a `WARN`) if none arrives for 15 minutes, rather than freezing on a stale value.
+
+**Shared live stream** (`--push`, default; `HYPERSYNC_SHARED_LIVE=0` turns it off). Every node behind the gateway is fed from ONE upstream 4001 live stream, so an upstream peer sees the gateway as a single node however many sit behind it. This works because after its 8-byte greeting a node sends nothing on 4001, and every node is sent the same thing: the peer's accept frame, then the same blocks. The first node to start a live session selects the peer; later nodes join the running stream, get blocks from that point on, and fetch the gap over 4002 as on any new session. All of them pin their 4002 to the stream's peer, which knows them by the gateway's source IP. The stream is judged once by the checks above (a failure ends every node's session and they reconnect onto one new stream; the peer is cooled down once) and takes one priority slot. It returns to a priority peer only while every node on it is caught up. Each node has its own 64 MB queue: one that stops reading is dropped on its own (`node write backlog`) without holding the others back. A stream with no node left lingers 30 s for reconnects. The pace references poll other peers' rounds over 4002 instead of streaming blocks, so the blocks come from upstream exactly once: upstream 4001 traffic is this one stream (~2.2 MB/s on 2026-11-16) however many nodes are behind the gateway. No peer gets two long-lived streams from the gateway. Served per node as before: a node greeting with other bytes than the stream's, hot-standby sessions, the live session after a `--cache` replay, and a node whose selection found no peer. Log lines: `live hub start`/`live hub ended`, and each node's `4001 push session start ... mode=shared nodes=N`.
+
+**Sibling sync** (with the shared live stream; `HYPERSYNC_SIBLING_SYNC=0` turns it off). Nodes behind the gateway serve each other over the LAN first, with no upstream traffic and no upstream rate limit; any failure falls back to upstream peers exactly as without siblings.
+
+- **Bootstrap state.** A cold-starting node's abci_state + EVM KVs come from a sibling that has been on the shared stream for 2 minutes, isn't catching up, and answers a 4002 height query within 300 rounds (~20 s) of the stream's round. A remote node publishes no ports, so its height query fails and it is never asked. hl-node prepares the state on each request, so a sibling may take 30 s to send its first byte (13.5-15 s measured, once over 20 s while busy; then 309 MB/s); the whole sibling attempt is bounded to 35 s. When it fails within 8 s, upstream peers are asked in the same attempt; when it fails later, too little of the node's ~60 s deadline is left for an upstream server, so the gateway closes the connection: hl-node retries within ~2 s and that retry goes straight upstream. A sibling that declines, is too slow, or ends the relay short of a whole bootstrap isn't asked again for 10 minutes; nor is one whose bootstrap ended at full size when the node asks for another bootstrap within 5 minutes (bytes alone can't prove a bootstrap took: a sibling may close the connection after it). Log line: `bootstrapping again Ns after sibling <node>'s bootstrap`. A sibling's state is never written to the `--cache`. Log lines: `node bootstrap via <node> tier=sibling`, `no sibling node served abci_state`, `bootstrap via sibling <node> ended at N MB`, `sibling <node> not a bootstrap source: ...`.
+- **4002 catch-up.** A range query goes to one such sibling first (3 s to answer); anything but a type-1 batch (refused, round too large or too small, any other status, an error, a timeout) skips that sibling for 60 s and sends the request upstream in the same request. Height queries and `query_peers` always go upstream. Log lines: `4002 client blocks via <node> tier=sibling`, `4002 sibling <node>: <why>; asking upstream`.
+
+The node's 4002 stays pinned to the shared stream's peer, never to a sibling.
 
 **Pool.** Re-read every 30 s; a missing or empty `peers.json` keeps the previous pool.
 

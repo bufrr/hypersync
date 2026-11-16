@@ -165,10 +165,14 @@ pub(super) async fn decline_detail(s: &mut TcpStream, typ: u8, len: usize) -> St
     }
 }
 
+// How long an upstream state server may take to send its abci_state header.
+pub(super) const STATE_HEADER_WAIT: Duration = Duration::from_secs(12);
+
 async fn try_fast_bootstrap_peer(
     ip: String,
     greet: [u8; 8],
     node_greeted: Instant,
+    header_wait: Duration,
 ) -> Result<BootstrapPeerSelection, String> {
     let mut upc = stage(
         timeout(
@@ -186,7 +190,7 @@ async fn try_fast_bootstrap_peer(
 
     let mut hdr = [0u8; 5];
     stage(
-        timeout(Duration::from_secs(12), upc.read_exact(&mut hdr)).await,
+        timeout(header_wait, upc.read_exact(&mut hdr)).await,
         "greeting header",
     )?;
     let len = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as usize;
@@ -243,6 +247,8 @@ pub(super) async fn select_fast_bootstrap_peer(
     start: usize,
     greet: [u8; 8],
     node_greeted: Instant,
+    // how long a candidate may take to start its abci_state (STATE_HEADER_WAIT for upstream)
+    header_wait: Duration,
 ) -> Option<BootstrapPeerSelection> {
     let n = peers.len();
     if n == 0 {
@@ -250,7 +256,10 @@ pub(super) async fn select_fast_bootstrap_peer(
     }
     let limit = n.min(BOOTSTRAP_SELECT_MAX_PEERS);
     let started = Instant::now();
-    let deadline = started + Duration::from_secs(BOOTSTRAP_SELECT_DEADLINE_SECS);
+    // room for a candidate's connect (5 s), header wait and prefetch (BOOTSTRAP_PREFETCH_SECS)
+    let deadline = started
+        + Duration::from_secs(BOOTSTRAP_SELECT_DEADLINE_SECS)
+            .max(header_wait + Duration::from_secs(5 + BOOTSTRAP_PREFETCH_SECS));
     let mut launched = 0usize;
     let mut in_flight = 0usize;
     let mut prio_in_flight = 0usize;
@@ -287,7 +296,7 @@ pub(super) async fn select_fast_bootstrap_peer(
                 None
             };
             set.spawn(async move {
-                let r = try_fast_bootstrap_peer(ip, greet, node_greeted)
+                let r = try_fast_bootstrap_peer(ip, greet, node_greeted, header_wait)
                     .await
                     .map(|mut s| {
                         s.prio_session = slot;
@@ -778,10 +787,18 @@ impl SlowStateServers {
         } else {
             SLOW_STATE_SERVER_TTL
         };
+        self.mark_for(ip, now, ttl)
+    }
+
+    pub(super) fn mark_for(&self, ip: &str, now: Instant, ttl: Duration) -> Duration {
         let mut m = lock(&self.0);
         m.retain(|_, until| *until > now);
         m.insert(ip.to_string(), now + ttl);
         ttl
+    }
+
+    pub(super) fn contains(&self, ip: &str, now: Instant) -> bool {
+        lock(&self.0).get(ip).is_some_and(|until| *until > now)
     }
 
     // `candidates` minus the slow ones, order kept, and whether every candidate was slow. Then
@@ -909,16 +926,44 @@ pub(super) async fn wait_priority_return(
     // the push session's lag guard: a candidate behind it would be cut right after the return
     freshest: Option<Arc<FreshestRound>>,
 ) -> String {
+    let watched = node.clone();
+    wait_priority_return_for(
+        node,
+        Box::new(move || vec![watched.clone()]),
+        priority,
+        net_tip,
+        timing,
+        freshest,
+    )
+    .await
+}
+
+// The nodes a session's return to a priority peer must not disturb mid-catch-up.
+pub(super) type WatchedNodes = Box<dyn Fn() -> Vec<Arc<NodeState>> + Send + Sync>;
+
+// wait_priority_return for a session serving several nodes (the shared live stream): it returns
+// only while every node in `watched` is caught up; `claimer` holds the probe rate limit and labels
+// the log lines.
+pub(super) async fn wait_priority_return_for(
+    claimer: Arc<NodeState>,
+    watched: WatchedNodes,
+    priority: Arc<PriorityTier>,
+    net_tip: Arc<AtomicU32>,
+    timing: RepinTiming,
+    freshest: Option<Arc<FreshestRound>>,
+) -> String {
+    let node = claimer;
     tokio::time::sleep(timing.min_session).await;
     let watch_start = Instant::now();
     loop {
         let now = Instant::now();
-        // the node's current catch-up run, counted from this session's watch at the earliest
-        let caught_up = node
-            .client_blocks_run_since(now, timing.catchup_quiet)
-            .is_none_or(|since| {
-                now.saturating_duration_since(since.max(watch_start)) >= timing.catchup_max
-            });
+        // each node's current catch-up run, counted from this session's watch at the earliest
+        let caught_up = watched().iter().all(|n| {
+            n.client_blocks_run_since(now, timing.catchup_quiet)
+                .is_none_or(|since| {
+                    now.saturating_duration_since(since.max(watch_start)) >= timing.catchup_max
+                })
+        });
         let candidates = if caught_up {
             priority.candidates()
         } else {
@@ -1323,6 +1368,7 @@ mod tests {
             0,
             crate::protocol::GREET_TRUE,
             Instant::now(),
+            STATE_HEADER_WAIT,
         )
         .await
         .expect("the pool serves the state");

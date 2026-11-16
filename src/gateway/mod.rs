@@ -1,5 +1,6 @@
 mod cache;
 mod client_blocks;
+mod hub;
 mod node;
 mod pace;
 mod public;
@@ -21,7 +22,7 @@ use tokio::time::timeout;
 
 // every submodule `use super::*`s: its siblings' pub(super) items resolve through these globs
 #[allow(unused_imports)]
-use self::{cache::*, client_blocks::*, node::*, pace::*, select::*, session::*};
+use self::{cache::*, client_blocks::*, hub::*, node::*, pace::*, select::*, session::*};
 
 // ---- full P2P gateway ----
 
@@ -96,8 +97,10 @@ struct GatewayCtx {
     // pool peers whose last node session ended on an upstream fault, skipped for a while
     cooldown: Arc<PeerCooldown>,
     // the freshest round any upstream stream of this gateway delivered (push sessions and the
-    // pace reference stream feed it; a session lagging it ends — see push::FreshestRound)
+    // pace references feed it; a session lagging it ends — see push::FreshestRound)
     freshest: Arc<FreshestRound>,
+    // the shared live stream (None: every live session has its own upstream stream)
+    live_hub: Option<Arc<LiveHub>>,
     cache_coldstart: bool,
     push: bool,
 }
@@ -213,6 +216,7 @@ async fn serve_port(
                     peers,
                     ctx.rr.clone(),
                     ctx.freshest.clone(),
+                    ctx.live_hub.clone().filter(|_| sibling_sync_enabled()),
                 )
                 .await;
             } else {
@@ -543,6 +547,19 @@ pub(crate) async fn run_gateway(node_peer_file: String, push: bool, cache_coldst
         }
     }
 
+    // peers with a long-lived stream from this gateway (the shared live stream's): the pace
+    // references never poll them
+    let streams_in_use = Arc::new(StreamClaims::default());
+    let live_hub =
+        (push && shared_live_enabled()).then(|| Arc::new(LiveHub::new(streams_in_use.clone())));
+    gwlog!(
+        "[gw] live sessions: {}",
+        if live_hub.is_some() {
+            "shared (one upstream 4001 stream for every node)"
+        } else {
+            "per node"
+        }
+    );
     let ctx = GatewayCtx {
         rr,
         boot_blob,
@@ -561,24 +578,19 @@ pub(crate) async fn run_gateway(node_peer_file: String, push: bool, cache_coldst
             FRESHEST_STALE,
             net_round_tip.clone(),
         )),
+        live_hub,
         cache_coldstart,
         push,
     };
-    // pace reference streams, so a lagging upstream is caught even with a single node session
-    // (HYPERSYNC_REFERENCE_STREAM=0 turns them off)
-    if push && std::env::var("HYPERSYNC_REFERENCE_STREAM").map_or(true, |v| v.trim() != "0") {
-        let in_use = Arc::new(Mutex::new(std::collections::HashSet::new()));
-        let cooled = Arc::new(Mutex::new(std::collections::HashMap::new()));
-        for start in 0..PACE_REFERENCES {
-            tokio::spawn(run_pace_reference(
-                ctx.pool.clone(),
-                ctx.freshest.clone(),
-                ctx.net_round_tip.clone(),
-                in_use.clone(),
-                cooled.clone(),
-                start,
-            ));
-        }
+    // pace references, so a lagging upstream is caught even with a single live stream: a few pool
+    // peers' rounds polled over 4002 (HYPERSYNC_PACE_REFERENCES=0 turns them off)
+    if push && std::env::var("HYPERSYNC_PACE_REFERENCES").map_or(true, |v| v.trim() != "0") {
+        tokio::spawn(run_height_references(
+            ctx.pool.clone(),
+            ctx.freshest.clone(),
+            ctx.net_round_tip.clone(),
+            streams_in_use.clone(),
+        ));
     }
 
     // listeners on 4000-4010. The node connects ONLY here; the gateway transparently relays each
@@ -626,7 +638,7 @@ mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
 
-    fn routing_ctx() -> GatewayCtx {
+    pub(super) fn routing_ctx() -> GatewayCtx {
         let net_round_tip = Arc::new(AtomicU32::new(0));
         GatewayCtx {
             rr: Arc::new(AtomicUsize::new(0)),
@@ -651,6 +663,7 @@ mod tests {
                 FRESHEST_STALE,
                 net_round_tip,
             )),
+            live_hub: None,
             cache_coldstart: false,
             push: false,
         }

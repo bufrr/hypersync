@@ -19,7 +19,7 @@ use super::*;
 
 // The lag guard a newly selected live peer is held to (FreshestRound::select_floor), or the guard
 // would cut it seconds in. Hot-standby sessions don't use the guard, so none.
-fn select_guard(ctx: &GatewayCtx) -> Option<Arc<FreshestRound>> {
+pub(super) fn select_guard(ctx: &GatewayCtx) -> Option<Arc<FreshestRound>> {
     (FailoverConfig::get().standbys == 0).then(|| ctx.freshest.clone())
 }
 
@@ -177,7 +177,12 @@ impl PeerCooldown {
     }
 }
 
-fn cool_down_on_fault(priority: &PriorityTier, cooldown: &PeerCooldown, ip: &str, reason: &str) {
+pub(super) fn cool_down_on_fault(
+    priority: &PriorityTier,
+    cooldown: &PeerCooldown,
+    ip: &str,
+    reason: &str,
+) {
     if push_exit_is_upstream_fault(reason) {
         cool_down(priority, cooldown, ip);
     }
@@ -399,6 +404,38 @@ async fn replay_cache_then_live(
     .await;
 }
 
+// A sibling hl-node prepares the state on each request before its first byte (2026-11-16: 13.5-
+// 14.8 s for a 1.40 GB state, then 309 MB/s over the LAN; once over 20 s while it was busy with a
+// slow hash computation), so it gets a longer header wait than an upstream server. The rest of a
+// 1.4 GB state at LAN speed takes ~5 s, so a sibling that starts within 30 s still beats the
+// node's ~60 s abci_state deadline; one that doesn't sends the node's retry upstream
+// (SIBLING_LATE).
+#[cfg(not(test))]
+const SIBLING_HEADER_WAIT: Duration = Duration::from_secs(30);
+#[cfg(not(test))]
+const SIBLING_SELECT_WAIT: Duration = Duration::from_secs(35);
+#[cfg(test)]
+const SIBLING_HEADER_WAIT: Duration = Duration::from_millis(400);
+#[cfg(test)]
+const SIBLING_SELECT_WAIT: Duration = Duration::from_millis(500);
+// A sibling that failed as a source (declined, too slow, ended early) isn't asked again for this
+// long: the next attempts go straight upstream.
+const SIBLING_SLOW_TTL: Duration = Duration::from_secs(10 * 60);
+// A node asking for a bootstrap again within this long after a sibling's bootstrap relay ended
+// didn't get a usable state from it (cut short, or the state didn't load): that sibling is
+// skipped. Bytes delivered can't tell: a complete bootstrap is ~5.8 GB, and a sibling may close
+// the connection after it (2026-11-16: one ended at 6.57 GB, the node went live).
+const SIBLING_RETRY_SIGN: Duration = Duration::from_secs(5 * 60);
+// A failed sibling attempt that took longer than this leaves upstream servers too little of the
+// node's ~60 s abci_state deadline (a 1.4 GB state in the ~30 s left needs ~50 MB/s; upstream
+// servers measured 24-34 MB/s). The gateway then closes the node's connection instead: hl-node
+// retries within ~2 s with a fresh deadline, and with the failed siblings skipped
+// (SIBLING_SLOW_TTL), that retry goes straight to upstream peers.
+#[cfg(not(test))]
+const SIBLING_LATE: Duration = Duration::from_secs(8);
+#[cfg(test)]
+const SIBLING_LATE: Duration = Duration::from_millis(300);
+
 // Transparent bootstrap relay: pick a peer actually serving the abci_state right now and splice,
 // tapping the stream into the cache when --cache holds the single-flight tap permit.
 async fn transparent_bootstrap(
@@ -417,26 +454,92 @@ async fn transparent_bootstrap(
     let start = ctx
         .rr
         .fetch_add(BOOTSTRAP_SELECT_MAX_PEERS, Ordering::Relaxed);
-    let remembered = lock(&ctx.state_servers).clone();
-    let candidates = bootstrap_source_list(
-        ctx.priority.bootstrap,
-        ctx.priority.candidates(),
-        remembered,
-        &peers,
-        start,
-    );
-    let (candidates, last_resort) = ctx.slow_state_servers.filter(candidates, Instant::now());
-    if last_resort {
-        gwlog!(
-            "[gw] [{}] every bootstrap candidate trickled recently; keeping a slow server this time (no rate cut)",
-            node.ip
+    // A synced node behind this gateway serves the state first, over the LAN: no upstream
+    // traffic and no upstream rate limit. Upstream peers only when none of them can.
+    let sibling = match &ctx.live_hub {
+        Some(hubs) if sibling_sync_enabled() => {
+            let siblings = hubs
+                .bootstrap_siblings(node.ip, ctx.freshest.get(), &ctx.slow_state_servers)
+                .await;
+            if siblings.is_empty() {
+                None
+            } else {
+                let picked = timeout(
+                    SIBLING_SELECT_WAIT,
+                    select_fast_bootstrap_peer(
+                        &ctx.priority,
+                        &siblings,
+                        0,
+                        greet,
+                        node_greeted,
+                        SIBLING_HEADER_WAIT,
+                    ),
+                )
+                .await
+                .ok()
+                .flatten();
+                if picked.is_none() {
+                    let now = Instant::now();
+                    for s in &siblings {
+                        ctx.slow_state_servers.mark_for(s, now, SIBLING_SLOW_TTL);
+                    }
+                    let late = node_greeted.elapsed() > SIBLING_LATE;
+                    gwlog!(
+                        "[gw] [{}] no sibling node served abci_state (tried {} in {:.0}s; not asked again for {} min); {}",
+                        node.ip,
+                        siblings.join(","),
+                        node_greeted.elapsed().as_secs_f64(),
+                        SIBLING_SLOW_TTL.as_secs() / 60,
+                        if late {
+                            "closing so the node retries upstream with a full deadline"
+                        } else {
+                            "asking upstream peers"
+                        }
+                    );
+                    if late {
+                        return;
+                    }
+                }
+                picked
+            }
+        }
+        _ => None,
+    };
+    let from_sibling = sibling.is_some();
+    let mut last_resort = false;
+    let selected = if let Some(s) = sibling {
+        s
+    } else {
+        let remembered = lock(&ctx.state_servers).clone();
+        let candidates = bootstrap_source_list(
+            ctx.priority.bootstrap,
+            ctx.priority.candidates(),
+            remembered,
+            &peers,
+            start,
         );
-    }
-    let Some(selected) =
-        select_fast_bootstrap_peer(&ctx.priority, &candidates, 0, greet, node_greeted).await
-    else {
-        gwlog!("[gw] [{}] no peer serving abci_state right now", node.ip);
-        return;
+        let (candidates, all_slow) = ctx.slow_state_servers.filter(candidates, Instant::now());
+        last_resort = all_slow;
+        if last_resort {
+            gwlog!(
+                "[gw] [{}] every bootstrap candidate trickled recently; keeping a slow server this time (no rate cut)",
+                node.ip
+            );
+        }
+        let Some(selected) = select_fast_bootstrap_peer(
+            &ctx.priority,
+            &candidates,
+            0,
+            greet,
+            node_greeted,
+            STATE_HEADER_WAIT,
+        )
+        .await
+        else {
+            gwlog!("[gw] [{}] no peer serving abci_state right now", node.ip);
+            return;
+        };
+        selected
     };
     let BootstrapPeerSelection {
         upc,
@@ -449,21 +552,32 @@ async fn transparent_bootstrap(
     gwlog!(
         "[gw] [{}] node bootstrap via {ip} tier={} (abci_state {} bytes, prefetched {} MB); active set",
         node.ip,
-        ctx.priority.tier_of(&ip),
+        if from_sibling {
+            "sibling"
+        } else {
+            ctx.priority.tier_of(&ip)
+        },
         abci_len,
         payload_prefix.len() / 1_000_000
     );
-    // never remember a priority peer: it would head every later candidate list and turn the
-    // fallback policy into prefer
-    if !ctx.priority.contains(&ip) {
+    // never remember a priority peer (it would head every later candidate list and turn the
+    // fallback policy into prefer), nor a sibling node (it isn't an upstream)
+    if !from_sibling && !ctx.priority.contains(&ip) {
         remember_state_server(&ctx.state_servers, &ip);
     }
-    let active_peer = node.pin_active(&ip);
-    let _active_guard = ActivePinGuard {
-        node: node.clone(),
-        peer: active_peer,
+    // the node's 4002 goes upstream: a sibling's state still pins it to the shared stream's peer
+    // (the node joins that stream next), or to nothing until its live session pins one
+    let pin = if from_sibling {
+        ctx.live_hub.as_ref().and_then(|h| h.peer())
+    } else {
+        Some(ip.clone())
     };
-    let tap_permit = if ctx.cache_coldstart {
+    let _active_guard = pin.map(|p| ActivePinGuard {
+        node: node.clone(),
+        peer: node.pin_active(&p),
+    });
+    // never cache a sibling's state: --cache replays only what an upstream state server served
+    let tap_permit = if ctx.cache_coldstart && !from_sibling {
         ctx.capture_tap.clone().try_acquire_owned().ok()
     } else {
         None
@@ -538,7 +652,28 @@ async fn transparent_bootstrap(
     // relay that ended inside the abci_state frame counts as the server's failure too.
     let state_frame = 5 + abci_len as u64;
     let ended_in_state = !relayed.too_slow && relayed.to_node < state_frame;
-    if relayed.too_slow || ended_in_state {
+    // A sibling relay that ended short of a whole bootstrap failed for sure: skip that sibling now.
+    // One that ended past it may or may not have completed (bytes can't tell): remembered, and
+    // judged by whether the node asks for a bootstrap again (SIBLING_RETRY_SIGN).
+    if from_sibling {
+        if relayed.to_node < MIN_COMPLETE_BOOTSTRAP_BYTES as u64 {
+            ctx.slow_state_servers
+                .mark_for(&ip, Instant::now(), SIBLING_SLOW_TTL);
+            gwlog!(
+                "[gw] [{}] bootstrap via sibling {ip} ended at {} MB, short of a bootstrap; not asked again for {} min",
+                node.ip,
+                relayed.to_node / 1_000_000,
+                SIBLING_SLOW_TTL.as_secs() / 60
+            );
+        } else {
+            *lock(&node.last_sibling_bootstrap) = Some((ip.clone(), Instant::now()));
+            gwlog!(
+                "[gw] [{}] bootstrap via sibling {ip} ended at {} MB",
+                node.ip,
+                relayed.to_node / 1_000_000
+            );
+        }
+    } else if relayed.too_slow || ended_in_state {
         let ttl = ctx
             .slow_state_servers
             .mark(&ip, Instant::now(), ctx.priority.contains(&ip));
@@ -555,6 +690,24 @@ async fn transparent_bootstrap(
     }
 }
 
+// A node bootstrapping again within SIBLING_RETRY_SIGN of a sibling's bootstrap relay ending:
+// that sibling's bootstrap didn't take, so it is skipped (SIBLING_SLOW_TTL). The record is
+// consumed either way.
+fn note_bootstrap_again(node: &NodeState, ctx: &GatewayCtx) {
+    let now = Instant::now();
+    if let Some((sib, ended)) = lock(&node.last_sibling_bootstrap).take() {
+        if now.saturating_duration_since(ended) < SIBLING_RETRY_SIGN {
+            ctx.slow_state_servers.mark_for(&sib, now, SIBLING_SLOW_TTL);
+            gwlog!(
+                "[gw] [{}] bootstrapping again {}s after sibling {sib}'s bootstrap: it isn't asked again for {} min",
+                node.ip,
+                now.saturating_duration_since(ended).as_secs(),
+                SIBLING_SLOW_TTL.as_secs() / 60
+            );
+        }
+    }
+}
+
 // 4001 with a bootstrap greet (send_abci:true). With --cache + a fresh captured snapshot, serve
 // it FROM CACHE (no peer state fetch, no rate-limit); then stream live from a pool peer — the
 // node catches up via the client-block RPC (4002, fetch-forwarded). Otherwise fall through to a
@@ -566,6 +719,9 @@ pub(super) async fn handle_4001_bootstrap(
     greet: [u8; 8],
     ctx: GatewayCtx,
 ) {
+    // judged before cache or transparent is chosen: a retry served from --cache must still count
+    // against the sibling whose bootstrap didn't take
+    note_bootstrap_again(&node, &ctx);
     if ctx.cache_coldstart {
         if let Some(blob) = cache_replay_blob(&node, &ctx) {
             replay_cache_then_live(down, node, peers, greet, blob, ctx).await;
@@ -579,6 +735,52 @@ pub(super) async fn handle_4001_bootstrap(
 // its client-block RPC on 4002 hits the same peer), forward the greeting, and relay. This is what
 // (re)establishes `active`. Push mode vets the peer's first live block and merge-serves; plain
 // mode transparently splices the first reachable peer.
+// A node's live session on the shared stream: its 4002 is pinned to the stream's peer for the
+// session, and it ends (so the node reconnects) on its own catch-up watchdog as any push session
+// does. The stream itself is judged, cooled down and logged by LiveHub, once for all its nodes.
+async fn serve_hub_session(
+    down: TcpStream,
+    node: Arc<NodeState>,
+    hub: Arc<Hub>,
+    sub: crate::push::Subscription,
+    ctx: &GatewayCtx,
+) {
+    let _active_guard = ActivePinGuard {
+        node: node.clone(),
+        peer: node.pin_active(&hub.ip),
+    };
+    let _member = hub.member(&node);
+    let tier = ctx.priority.tier_of(&hub.ip);
+    let started = Instant::now();
+    gwlog!(
+        "[gw] [{}] 4001 push session start active_peer={} tier={} mode=shared nodes={} prio_sessions={}",
+        node.ip,
+        hub.ip,
+        tier,
+        hub.nodes(),
+        ctx.priority.sessions(&hub.ip)
+    );
+    let (reason, stats) = crate::push::serve_subscriber(
+        down,
+        &hub.greeting,
+        sub,
+        node.live_floor.clone(),
+        Some(Box::pin(wait_catchup_stuck(node.clone(), REPIN))),
+    )
+    .await;
+    gwlog!(
+        "[gw] [{}] 4001 push session ended active_peer={} tier={} mode=shared secs={} reason={} stats=[blocks={} bytes={} drop_floor={}]",
+        node.ip,
+        hub.ip,
+        tier,
+        started.elapsed().as_secs(),
+        reason,
+        stats.blocks,
+        stats.bytes,
+        stats.dropped_floor
+    );
+}
+
 pub(super) async fn handle_4001_live(
     down: TcpStream,
     node: Arc<NodeState>,
@@ -587,6 +789,33 @@ pub(super) async fn handle_4001_live(
     ctx: GatewayCtx,
 ) {
     let start = ctx.rr.fetch_add(1, Ordering::Relaxed);
+    if let (true, Some(hubs)) = (ctx.push, ctx.live_hub.clone()) {
+        match hubs.join(greet, &peers, start, &ctx).await {
+            Join::Joined(hub, sub) => {
+                serve_hub_session(down, node, hub, sub, &ctx).await;
+                return;
+            }
+            Join::NoPeer => {
+                serve_push_4001_fallback(
+                    down,
+                    node,
+                    &peers,
+                    start,
+                    greet,
+                    0,
+                    &ctx,
+                    "shared live selection failed",
+                )
+                .await;
+                return;
+            }
+            Join::OtherGreeting => gwlog!(
+                "[gw] [{}] 4001 greeting {} differs from the shared stream's; serving this node on its own",
+                node.ip,
+                hex_bytes(&greet)
+            ),
+        }
+    }
     if ctx.push {
         if let Some(live) = select_live_peer(
             &ctx.priority,

@@ -1,139 +1,234 @@
-// Pace reference streams: extra live streams (send_abci:false, nothing forwarded to any node), each
-// from a different pool peer, feeding the gateway's FreshestRound. That round only counts what at
-// least two streams agree on, so two references let even a single node session notice its upstream
-// falling behind the network (push::FreshestRound, BlockProgress::lagging). A reference peer that
-// stalls or misbehaves is replaced and avoided for a while — in the references' own cooldown, never
-// the one node selection uses (a reference hiccup says little about the peer). One that merely
-// lags the others is replaced but not avoided: the round it lagged may itself be wrong.
+// Pace references for the gateway's lag guard (push::FreshestRound): the rounds of a few pool
+// peers, polled with the 4002 height query, so even a single live stream can notice its peer
+// falling behind the network (BlockProgress::lagging, the stalled-behind check). FreshestRound
+// counts only what at least two different peers agree on.
 
 use crate::priority::gwlog;
-use crate::protocol::{
-    block_round, is_plausible_mainnet_round, read_live_frame_with_timeout, GREET_FALSE,
-    MAX_LIVE_FRAME,
-};
+use crate::protocol::{is_plausible_mainnet_round, read_live_frame_with_timeout};
 use crate::push::{BlockProgress, FreshestRound};
 use crate::util::lock;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::io::AsyncWriteExt;
 
 #[allow(unused_imports)]
 use super::*;
 
-// a live stream sends several blocks a second; this much silence is a dead reference
-const PACE_IDLE: Duration = Duration::from_secs(10);
-const PACE_RETRY: Duration = Duration::from_secs(2);
+// a peer replaced for failing or misbehaving isn't polled again for this long
 const PACE_COOLDOWN: Duration = Duration::from_secs(60);
-// A reference whose stream never yields a decodable block round (only control or undecodable
-// frames, often enough to beat PACE_IDLE) paces nothing and holds a reference slot: replace it.
-// BlockProgress::stalled only arms after a first round, so this needs its own deadline.
-#[cfg(not(test))]
-const PACE_FIRST_BLOCK: Duration = Duration::from_secs(30);
-#[cfg(test)]
-const PACE_FIRST_BLOCK: Duration = Duration::from_millis(400);
-pub(super) const PACE_REFERENCES: usize = 2;
 
-// One reference stream, forever. The references share `in_use` (a reference never follows a peer
-// another one is on) and `cooled`, their own cooldown.
-pub(super) async fn run_pace_reference(
+// Peers with a long-lived stream from this gateway (the shared live stream's), counted per claim:
+// a stream replacing another on the same peer claims before the old one releases, so the old one
+// ending never clears the new one's claim. The pace references never poll a claimed peer.
+#[derive(Default)]
+pub(super) struct StreamClaims(Mutex<HashMap<String, usize>>);
+
+impl StreamClaims {
+    pub(super) fn claim(&self, ip: &str) {
+        *lock(&self.0).entry(ip.to_string()).or_insert(0) += 1;
+    }
+
+    pub(super) fn release(&self, ip: &str) {
+        let mut m = lock(&self.0);
+        if let Some(n) = m.get_mut(ip) {
+            *n -= 1;
+            if *n == 0 {
+                m.remove(ip);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn contains(&self, ip: &str) -> bool {
+        lock(&self.0).contains_key(ip)
+    }
+
+    pub(super) fn claimed(&self) -> HashSet<String> {
+        lock(&self.0).keys().cloned().collect()
+    }
+}
+
+// A peer answers `[0,0,0,1, 0, 2]` with a 29-byte
+// frame whose last varint-tagged u32 is its current round (2026-11-16: it tracked the live round
+// within a few rounds, at ~14 rounds/s, from peers that never streamed to this IP). Polling
+// HEIGHT_REFERENCES peers every HEIGHT_POLL_EVERY costs ~15 bytes/s each; a live stream as a
+// reference would download every block (~2.2 MB/s). With the shared live stream, upstream 4001
+// block traffic is then that one stream however many nodes are behind the gateway.
+pub(super) const HEIGHT_REFERENCES: usize = 3;
+#[cfg(not(test))]
+const HEIGHT_POLL_EVERY: Duration = Duration::from_secs(2);
+#[cfg(test)]
+const HEIGHT_POLL_EVERY: Duration = Duration::from_millis(50);
+const HEIGHT_TIMEOUT: Duration = Duration::from_secs(3);
+// consecutive failed polls before a peer is replaced (and cooled down)
+const HEIGHT_MAX_FAILS: u32 = 3;
+const HEIGHT_REQUEST: [u8; 6] = [0, 0, 0, 1, 0, 2];
+
+// The round in a height answer frame (header included): its last 0xfc-tagged u32 (LE).
+pub(super) fn height_answer_round(frame: &[u8]) -> Option<u32> {
+    if frame.len() < 7 || frame[4] != 0 || frame[5] != 0x02 {
+        return None;
+    }
+    let p = &frame[5..];
+    (0..p.len().saturating_sub(4))
+        .rev()
+        .find(|&i| p[i] == 0xfc)
+        .map(|i| u32::from_le_bytes([p[i + 1], p[i + 2], p[i + 3], p[i + 4]]))
+}
+
+fn addr_4002(ip: &str) -> String {
+    if ip.contains(':') {
+        ip.to_string()
+    } else {
+        format!("{ip}:4002")
+    }
+}
+
+// One height query: the peer's round and when the peer read it (halfway through the request's
+// round trip, as close as we can tell). HEIGHT_TIMEOUT bounds the whole query, not each step.
+// a height answer: the round and when the peer read it
+pub(super) type HeightAnswer = Result<(u32, Instant), String>;
+
+pub(super) async fn query_round(ip: &str) -> HeightAnswer {
+    tokio::time::timeout(HEIGHT_TIMEOUT, async {
+        let mut s = crate::blacklist::connect(&addr_4002(ip))
+            .await
+            .map_err(|e| format!("connect: {e}"))?;
+        let sent = Instant::now();
+        s.write_all(&HEIGHT_REQUEST)
+            .await
+            .map_err(|e| format!("write: {e}"))?;
+        let frame = read_live_frame_with_timeout(&mut s, HEIGHT_TIMEOUT, 256)
+            .await
+            .map_err(|e| format!("read: {e}"))?;
+        let sampled = sent + sent.elapsed() / 2;
+        height_answer_round(&frame)
+            .map(|r| (r, sampled))
+            .ok_or_else(|| format!("no round in answer {}", hex_bytes(&frame)))
+    })
+    .await
+    .map_err(|_| format!("no answer within {}s", HEIGHT_TIMEOUT.as_secs()))?
+}
+
+struct Polled {
+    ip: String,
+    feed: crate::push::FreshestFeed,
+    progress: BlockProgress,
+    fails: u32,
+}
+
+// Keep HEIGHT_REFERENCES pool peers (none with a long-lived stream from this gateway, in `avoid`)
+// polled, feeding each one's round into `freshest` through the same gates as a live stream's rounds:
+// plausible, no jump, still rising; a peer that fails, stalls or jumps is replaced and cooled down,
+// one that lags the others too (polling a laggard costs nothing, but re-adding it every poll would
+// only churn the log; the round it lagged is one two peers agree on).
+pub(super) async fn run_height_references(
     pool: Arc<Mutex<Vec<String>>>,
     freshest: Arc<FreshestRound>,
     net_tip: Arc<AtomicU32>,
-    in_use: Arc<Mutex<HashSet<String>>>,
-    cooled: Arc<Mutex<HashMap<String, Instant>>>,
-    start: usize,
+    avoid: Arc<StreamClaims>,
 ) {
-    let mut next = start;
+    let mut polled: Vec<Polled> = Vec::new();
+    let mut cooled: HashMap<String, Instant> = HashMap::new();
+    let mut next = 0usize;
+    let mut short_warned = false;
+    let mut poll = tokio::time::interval(HEIGHT_POLL_EVERY);
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    poll.tick().await; // the first tick is immediate
     loop {
         let now = Instant::now();
-        // pick and claim in one step, so two references never land on the same peer
-        let ip = {
-            let mut busy = lock(&in_use);
-            let mut cooled = lock(&cooled);
-            cooled.retain(|_, until| *until > now);
-            let peers: Vec<String> = lock(&pool)
+        cooled.retain(|_, until| *until > now);
+        if polled.len() < HEIGHT_REFERENCES {
+            let busy = avoid.claimed();
+            let pool = lock(&pool).clone();
+            let free: Vec<&String> = pool
                 .iter()
-                .filter(|ip| !busy.contains(*ip) && !cooled.contains_key(*ip))
-                .cloned()
+                .filter(|ip| {
+                    !busy.contains(*ip)
+                        && !cooled.contains_key(*ip)
+                        && !polled.iter().any(|p| &p.ip == *ip)
+                })
                 .collect();
-            if peers.is_empty() {
-                None
-            } else {
-                let ip = peers[next % peers.len()].clone();
-                busy.insert(ip.clone());
-                Some(ip)
+            for k in 0..free.len().min(HEIGHT_REFERENCES - polled.len()) {
+                let ip = free[(next + k) % free.len()].clone();
+                polled.push(Polled {
+                    feed: freshest.feed(&ip),
+                    ip,
+                    progress: BlockProgress::new(0, now),
+                    fails: 0,
+                });
             }
-        };
-        let Some(ip) = ip else {
-            tokio::time::sleep(Duration::from_secs(10)).await;
-            continue;
-        };
-        next = next.wrapping_add(1);
-        let ended = follow_pace(&ip, &freshest, &net_tip).await;
-        lock(&in_use).remove(&ip);
-        gwlog!("[gw] pace reference via {ip} ended: {}", ended.reason);
-        if ended.cool {
-            lock(&cooled).insert(ip, Instant::now() + PACE_COOLDOWN);
+            next = next.wrapping_add(1);
         }
-        tokio::time::sleep(PACE_RETRY).await;
-    }
-}
-
-struct PaceEnd {
-    reason: String,
-    // avoid the peer for a while (false: it only lagged the other streams)
-    cool: bool,
-}
-
-impl From<String> for PaceEnd {
-    fn from(reason: String) -> Self {
-        PaceEnd { reason, cool: true }
-    }
-}
-
-// Follow one peer's live stream, offering each block round that passes the same plausibility and
-// jump gates as a node session's active stream. Returns why it stopped.
-async fn follow_pace(ip: &str, freshest: &Arc<FreshestRound>, net_tip: &AtomicU32) -> PaceEnd {
-    let mut s = match connect_and_greet_4001(ip, GREET_FALSE, Duration::from_secs(4)).await {
-        Ok((s, _greeting)) => s,
-        Err(e) => return format!("connect: {e}").into(),
-    };
-    let feed = freshest.feed(ip);
-    let started = Instant::now();
-    let mut progress = BlockProgress::new(0, started);
-    loop {
+        // a stream is judged only against two OTHER peers (FreshestRound::get_at): with fewer
+        // references the lag guards pause, so say so
+        let short = polled.len() < 2;
+        if short != short_warned {
+            short_warned = short;
+            if short {
+                gwlog!(
+                    "[gw] WARN only {} pace reference(s) available: the lag guards pause until there are 2",
+                    polled.len()
+                );
+            } else {
+                gwlog!("[gw] pace references back to {}", polled.len());
+            }
+        }
+        let mut set = tokio::task::JoinSet::new();
+        for (i, p) in polled.iter().enumerate() {
+            let ip = p.ip.clone();
+            set.spawn(async move { (i, query_round(&ip).await) });
+        }
+        let mut results: Vec<(usize, HeightAnswer)> = Vec::new();
+        while let Some(joined) = set.join_next().await {
+            if let Ok(r) = joined {
+                results.push(r);
+            }
+        }
         let now = Instant::now();
-        if progress.last_round == 0 && now.duration_since(started) > PACE_FIRST_BLOCK {
-            return format!("no block round within {}s", PACE_FIRST_BLOCK.as_secs()).into();
+        // (index, why, cool)
+        let mut drop_: Vec<(usize, String, bool)> = Vec::new();
+        for (i, r) in results {
+            let p = &mut polled[i];
+            match r {
+                Err(e) => {
+                    p.fails += 1;
+                    if p.fails >= HEIGHT_MAX_FAILS {
+                        drop_.push((i, e, true));
+                    }
+                }
+                Ok((round, sampled)) => {
+                    p.fails = 0;
+                    if !is_plausible_mainnet_round(round, net_tip.load(Ordering::Acquire)) {
+                        drop_.push((i, format!("implausible round {round}"), true));
+                    } else if let Err(e) = p.progress.on_round(round, sampled) {
+                        drop_.push((i, e, true));
+                    } else {
+                        p.feed.offer_at(round, sampled);
+                        if let Some(behind) = p.progress.lagging(&freshest, &p.ip, false) {
+                            drop_.push((i, format!("lags the freshest round by {behind}"), true));
+                        }
+                    }
+                }
+            }
         }
-        if progress.stalled(now) {
-            return format!("no block above round {}", progress.last_round).into();
+        for (i, p) in polled.iter().enumerate() {
+            if p.progress.stalled(now) && !drop_.iter().any(|d| d.0 == i) {
+                drop_.push((i, format!("no round above {}", p.progress.last_round), true));
+            }
         }
-        let frame = match read_live_frame_with_timeout(&mut s, PACE_IDLE, MAX_LIVE_FRAME).await {
-            Ok(f) => f,
-            Err(e) => return format!("read: {e}").into(),
-        };
-        if frame.len() <= 5 || frame[4] != 1 {
-            continue;
+        drop_.sort_by(|a, b| b.0.cmp(&a.0));
+        for (i, why, cool) in drop_ {
+            let p = polled.remove(i);
+            gwlog!("[gw] height reference {} replaced: {why}", p.ip);
+            if cool {
+                cooled.insert(p.ip, now + PACE_COOLDOWN);
+            }
         }
-        let Some(round) = block_round(&frame[5..]) else {
-            continue;
-        };
-        if !is_plausible_mainnet_round(round, net_tip.load(Ordering::Acquire)) {
-            return format!("implausible round {round}").into();
-        }
-        if let Err(e) = progress.on_round(round, now) {
-            return e.into();
-        }
-        feed.offer(round);
-        // a reference that falls behind the gateway's other streams paces nothing
-        if let Some(behind) = progress.lagging(freshest, false, now) {
-            return PaceEnd {
-                reason: format!("lags the freshest stream by {behind} rounds"),
-                cool: false,
-            };
-        }
+        // a fixed cadence, whatever a slow answer took (each query is bounded by HEIGHT_TIMEOUT)
+        poll.tick().await;
     }
 }
 
@@ -143,101 +238,117 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
-    // a peer that greets, then streams consecutive live blocks every 20ms
-    async fn streaming_peer(first_round: u32) -> String {
+    // a 4002 peer answering every height query with `round()` (as captured on mainnet)
+    async fn height_peer(round: Arc<AtomicU32>) -> String {
         let l = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let addr = l.local_addr().unwrap().to_string();
         tokio::spawn(async move {
-            let (mut s, _) = l.accept().await.unwrap();
-            let mut greet = [0u8; 8];
-            s.read_exact(&mut greet).await.unwrap();
-            s.write_all(&[0, 0, 0, 1, 0, 3]).await.unwrap();
-            let mut round = first_round;
-            loop {
-                let payload = crate::protocol::test_block_payload(round, 2);
-                let mut frame = (payload.len() as u32).to_be_bytes().to_vec();
-                frame.push(1);
-                frame.extend_from_slice(&payload);
-                if s.write_all(&frame).await.is_err() {
-                    return;
-                }
-                round += 1;
-                tokio::time::sleep(Duration::from_millis(20)).await;
+            while let Ok((mut s, _)) = l.accept().await {
+                let r = round.load(Ordering::Relaxed);
+                tokio::spawn(async move {
+                    let mut req = [0u8; 6];
+                    if s.read_exact(&mut req).await.is_err() || req != HEIGHT_REQUEST {
+                        return;
+                    }
+                    let mut f = hex_answer();
+                    let n = f.len();
+                    f[n - 4..].copy_from_slice(&r.to_le_bytes());
+                    let _ = s.write_all(&f).await;
+                });
             }
         });
         addr
     }
 
-    // A reference peer that keeps the connection alive with control frames but never sends a block
-    // round is dropped (and cooled) once PACE_FIRST_BLOCK passes.
-    #[tokio::test]
-    async fn a_reference_that_never_sends_a_block_is_dropped() {
-        let l = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-        let addr = l.local_addr().unwrap().to_string();
-        let peer = tokio::spawn(async move {
-            let (mut s, _) = l.accept().await.unwrap();
-            let mut greet = [0u8; 8];
-            s.read_exact(&mut greet).await.unwrap();
-            s.write_all(&[0, 0, 0, 1, 0, 3]).await.unwrap();
-            // a type-0 control frame every 50ms, well inside PACE_IDLE
-            while s.write_all(&[0, 0, 0, 2, 0, 1, 2]).await.is_ok() {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        });
-        let freshest = Arc::new(FreshestRound::new(
-            150,
-            Duration::from_secs(15),
-            Duration::from_secs(30),
-            Arc::new(AtomicU32::new(1_496_000_000)),
-        ));
-        let ended = tokio::time::timeout(
-            Duration::from_secs(5),
-            follow_pace(&addr, &freshest, &AtomicU32::new(0)),
-        )
-        .await
-        .expect("the reference ends");
-        assert!(
-            ended.reason.starts_with("no block round"),
-            "{}",
-            ended.reason
+    // the 29-byte answer captured from a mainnet peer on 2026-11-16
+    fn hex_answer() -> Vec<u8> {
+        let h = "00000018000201fc3069c348fc9c99e34871fc9b7cf85a01fc93731a5b";
+        (0..h.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn the_round_is_the_last_tagged_value_of_a_height_answer() {
+        assert_eq!(height_answer_round(&hex_answer()), Some(1_528_460_179));
+        assert_eq!(height_answer_round(&[0, 0, 0, 1, 0, 4]), None, "peer full");
+        assert_eq!(
+            height_answer_round(&[0, 0, 0, 3, 0, 0, 1, 0]),
+            None,
+            "peer-only"
         );
-        assert!(ended.cool);
-        peer.abort();
     }
 
     #[tokio::test]
-    async fn two_pace_references_on_different_peers_set_the_freshest_round() {
+    async fn height_references_set_the_freshest_round_and_drop_a_laggard() {
+        let tip = 1_528_460_000u32;
+        let (a, b, slow) = (
+            Arc::new(AtomicU32::new(tip)),
+            Arc::new(AtomicU32::new(tip)),
+            Arc::new(AtomicU32::new(tip - 12_000)),
+        );
         let pool = Arc::new(Mutex::new(vec![
-            streaming_peer(1_496_000_000).await,
-            streaming_peer(1_496_000_000).await,
+            height_peer(a.clone()).await,
+            height_peer(b.clone()).await,
+            height_peer(slow.clone()).await,
         ]));
         let freshest = Arc::new(FreshestRound::new(
-            150,
-            Duration::from_secs(15),
+            100,
+            Duration::from_millis(200),
             Duration::from_secs(30),
-            Arc::new(AtomicU32::new(1_496_000_000)),
+            Arc::new(AtomicU32::new(tip)),
         ));
-        let in_use = Arc::new(Mutex::new(HashSet::new()));
-        let cooled = Arc::new(Mutex::new(HashMap::new()));
-        let tasks: Vec<_> = (0..PACE_REFERENCES)
-            .map(|i| {
-                tokio::spawn(run_pace_reference(
-                    pool.clone(),
-                    freshest.clone(),
-                    Arc::new(AtomicU32::new(0)),
-                    in_use.clone(),
-                    cooled.clone(),
-                    i,
-                ))
-            })
-            .collect();
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        // each streaming peer accepts one connection: both following proves two distinct peers
-        assert_eq!(lock(&in_use).len(), 2, "one peer per reference");
-        let round = freshest.get().expect("two references agree on a round");
-        assert!(round > 1_496_000_005, "{round}");
-        for t in tasks {
-            t.abort();
+        let task = tokio::spawn(run_height_references(
+            pool,
+            freshest.clone(),
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(StreamClaims::default()),
+        ));
+        // the healthy peers advance, the slow one too but 12k rounds behind
+        for _ in 0..20 {
+            for r in [&a, &b, &slow] {
+                r.fetch_add(3, Ordering::Relaxed);
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
+        let f = freshest
+            .get()
+            .expect("two height references agree on a round");
+        assert!(f > tip && f <= a.load(Ordering::Relaxed), "{f}");
+        assert_eq!(
+            freshest.peers_for_test().len(),
+            2,
+            "the laggard was dropped and stays out"
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn height_references_never_poll_a_peer_with_a_stream_from_us() {
+        let r = Arc::new(AtomicU32::new(1_528_460_000));
+        let busy = height_peer(r.clone()).await;
+        let free = height_peer(r.clone()).await;
+        let freshest = Arc::new(FreshestRound::new(
+            100,
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+            Arc::new(AtomicU32::new(1_528_460_000)),
+        ));
+        let avoid = Arc::new(StreamClaims::default());
+        avoid.claim(&busy);
+        let task = tokio::spawn(run_height_references(
+            Arc::new(Mutex::new(vec![busy.clone(), free.clone()])),
+            freshest.clone(),
+            Arc::new(AtomicU32::new(0)),
+            avoid,
+        ));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            freshest.peers_for_test(),
+            vec![free],
+            "only the free peer is polled"
+        );
+        task.abort();
     }
 }

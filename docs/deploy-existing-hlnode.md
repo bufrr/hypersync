@@ -1,10 +1,8 @@
 # hypersync 部署指南
 
 本文档说明怎样把 hypersync 部署到运行 Hyperliquid hl-node 的服务器上，以及怎样接入其它机器上的节点。
-当前拓扑（网关直接在公网发布 4000-4010，按来源 IP 白名单分流，不再有独立应答器）于 2026-11-09 验证：
-Linode 远端节点直连网关公网 IPv4、同机新节点经网关冷启动、两个节点同时由一个网关服务。更早的数据
-（单节点同机约 41 h、Linode 经 WireGuard 10 h、受控停顿测试）来自 2026-10-28 ~ 11-03 的应答器拓扑，
-网关版本 `18f6864`。从应答器拓扑升级、或回滚到它，见第 12 节。
+当前拓扑（网关直接在公网发布 4000-4010，按来源 IP 白名单分流）于 2026-11-09 验证：
+Linode 远端节点直连网关公网 IPv4、同机新节点经网关冷启动、两个节点同时由一个网关服务。
 
 ## 1. 拓扑
 
@@ -30,7 +28,7 @@ flowchart LR
 
   PRIO -- "探测本机公网 4001/4002" --> GW
   GW -- "外连 4001/4002" --> PRIO
-  GW -. "实时区块：仅当所有优先级 peer 不可用<br/>另有测速参考流、追块/冷启动兜底" .-> POOL
+  GW -. "实时区块：仅当所有优先级 peer 不可用<br/>另有测速参考（4002 高度查询）、追块/冷启动兜底" .-> POOL
   PEERD -- "发现、探测" --> POOL
   PEERD --> PD --> GW
   NODE -- "root_node_ips = 172.28.0.10" --> GW
@@ -39,9 +37,9 @@ flowchart LR
 
 - **网关**为每个节点挑一个上游 peer，转发状态数据（冷启动）、实时区块（4001）和追块请求（4002），并在上游停顿、
   落后或异常时几秒内换掉它。一个网关可以同时服务多个节点（按节点来源 IP 区分）。
-- **peerd** 发现并探测公开 peer，按约 120 s 一轮运行，得到可用的 peer 池时更新 `data/peers.json`。
+- **peerd** 发现并探测公开 peer（发实时问候，收到 2 个区块就结束，每个在线 peer 只花几百 KB），按约 120 s 一轮运行，得到可用的 peer 池时更新 `data/peers.json`。
 - **优先级 peer**（`HYPERSYNC_PRIORITY_PEERS`）优先使用。默认独占模式下，节点的**实时区块**只在全部优先级 peer
-  都不可用时才来自公开池；公开池另有三处用途：两条测速参考流（只测速，不给节点供块）、冷启动在优先级 peer
+  都不可用时才来自公开池；公开池另有三处用途：测速参考（每 2 s 用 4002 高度查询 3 个 peer 的轮次，不下载区块）、冷启动在优先级 peer
   领先 8 s 仍未成功后可参与竞争、单个 4002 追块请求在优先级 peer 6 s 未应答后可转给公开池。
 - **公网探测应答已并入网关**：网关发布 4000-4010，连接的来源 IP 决定服务。白名单内来源得到完整节点服务；
   其它来源在 4001 得到 `peer full`、在 4002 得到空 peer 表或 `Peer-only`，其余端口立即关闭，不会创建节点状态、
@@ -57,8 +55,8 @@ flowchart LR
   偶尔先冻结 20 分钟。**hl-node 所在主机建议 ≥128 GB。** 网关可以放在小机器上（远端节点直接连接公网网关，见第 9 节）。
 - 默认不开 `--cache`（见第 13 节），节点冷启动时网关透明转发一个正在提供状态的 peer。
 - 网关是单点：节点只连网关。网关靠 `restart: unless-stopped` 自动拉起，重启时节点会断开几秒后自动重连。
-  网关同时负责公网探测应答：网关重启或因配置错误反复退出时，上游 peer 的回访探测也没人应答
-  （旧版独立应答器会继续应答），所以要让网关尽快恢复。
+  网关同时负责公网探测应答：网关重启或因配置错误反复退出时，上游 peer 的回访探测也没人应答，
+  所以要让网关尽快恢复。
 - 优先级 peer 的 IP 在所有日志里只显示为 `prio-1..N`；`.env` 已在 `.gitignore` 里，不要提交或外传。
 
 ## 3. 前置条件
@@ -117,7 +115,7 @@ COMPOSE_FILE=docker-compose.yml
 其它可调项见 README 的 Configuration 表。几点说明：
 
 - `HYPERSYNC_PRIORITY_EXCLUSIVE` 默认 `1`（独占）：节点的实时区块会话只在每个优先级 peer 都不可用时才用公开池
-  （冷启动、4002 和测速参考流的例外见第 1 节）。
+  （冷启动、4002 和测速参考的例外见第 1 节）。
 - 启动检查覆盖节点白名单、优先级 peer 和网关的各项参数（`HYPERSYNC_NODE_WHITELIST`、`HYPERSYNC_PRIORITY_*`、
   `HYPERSYNC_FAILOVER_*`）。值不合法时进程退出，日志里是 `[main] invalid environment: ...`，不会悄悄退回默认值。
   环境变量与文件合并后没有任何有效条目时网关也退出（exit 2）。`HL_SELF_IP` 不在检查范围内，写错时这些 IP
@@ -260,7 +258,7 @@ sudo tail -1 /var/lib/docker/volumes/hyperliquid_hl-data/_data/node_fast_block_t
 
 ## 9. 远端节点（节点在另一台机器）
 
-远端节点直接连接网关公网 IP，不再需要 WireGuard；节点自身仍不需要开放入站端口。
+远端节点直接连接网关公网 IP，节点自身不需要开放入站端口。
 
 1. 把远端节点的公网 IP 加进 `HL_SELF_IP`，并把它的公网 IPv4 来源地址/CIDR 加进
    `HYPERSYNC_NODE_WHITELIST`（或 `data/node_whitelist.txt`），例如 `203.0.113.7`。
@@ -277,6 +275,25 @@ sudo tail -1 /var/lib/docker/volumes/hyperliquid_hl-data/_data/node_fast_block_t
 - 网关按 TCP 来源 IP 区分节点：每个节点在网关看来必须是不同且已加白的来源 IP，比如不同的容器 IP 或公网 IP。
   经过同一个 NAT 的两个节点会被当成一个，不能这样部署。
 - 每个节点都指向网关；`HL_SELF_IP` 包含所有节点的公网 IP（防止它们进入公开池）。
+- **所有节点共用一条上游 4001 实时流**（默认，`HYPERSYNC_SHARED_LIVE=0` 关闭）：上游 peer 看到的网关就像一个节点。
+  第一个节点建立实时会话时网关选 peer（日志 `live hub start peer=...`），之后的节点直接接入（`4001 push session start ...
+  mode=shared nodes=N`），各自经 4002 补上中间的区块。这条流出问题时所有节点的会话一起结束、几秒内一起重连到一条新流
+  （`live hub ended ... reason=...`）。某个节点不读数据只会断开它自己（`node write backlog`），不影响其它节点。
+  冷启动（abci_state + EVM KVs）仍然是每个节点各自一条连接。测速参考只用 4002 高度查询，不下载区块，所以不管接多少个
+  节点，从上游下载的区块流量只有这一条流（2026-11-16 实测约 2.2 MB/s）。
+- **网关后面的节点互相供数据**（`HYPERSYNC_SIBLING_SYNC=0` 关闭），走本机网络，不占上游流量，也不受上游按 IP 限速；
+  任何失败都照旧回到上游 peer：
+  - **冷启动状态**：从另一个在共用流上至少 2 分钟、没有在追块、4002 高度查询离共用流不超过 300 轮的节点下载
+    abci_state + EVM KVs。hl-node 每次请求都要先准备状态，首字节约 13.5–15 s（节点忙时实测超过 20 s），之后约 300 MB/s；首字节最多等 30 s，整个尝试最多 35 s。
+    8 s 内失败就在同一次尝试里问上游；更晚失败时节点 60 s 期限剩下的时间不够上游发完，网关直接断开，节点约 2 s
+    后重试，这次直接走上游。拒绝、太慢或在发完整个冷启动之前断开的节点 10 分钟内不再被问；发够了大小、但节点 5 分钟内又来要冷启动的，也算失败
+    （日志 `bootstrapping again Ns after sibling ...`）。只有同机（`gwnet` 上）
+    的节点能被连到。日志：成功 `node bootstrap via <节点IP> tier=sibling`；回退 `no sibling node served abci_state`、
+    `bootstrap via sibling <节点IP> ended at N MB`。
+  - **4002 追块**：区间查询先问一个这样的节点（3 s），除了正常批次以外的任何回答（拒绝、轮次过大/过小、其它状态、
+    错误、超时）都让该节点 60 s 内不再被问，同一个请求转给上游。日志：`4002 client blocks via <节点IP> tier=sibling`、
+    `4002 sibling <节点IP>: ...; asking upstream`。
+  - 节点的 4002 始终钉在共用流的上游 peer 上，不钉在其它节点上。
 - 同机多个节点时，可以在 `docker-compose.colocated.yml` 里给 peerd 多挂几个数据卷：
 
 ```yaml
@@ -306,6 +323,9 @@ services:
 | `node write failed` / `node write timeout` / `node outbound ended` | 节点那一侧断了：重启，或卡住 30 s 不读数据 | 看节点：通常是 hl-visor 低内存重启 |
 | `node catch-up not converging` | 节点陷在小范围追块循环（hl-node 的已知问题，实测落在落后约 1,050–1,110 轮处）：整整 3 分钟里各批追块落后最新轮次的距离，最大值和最小值之差小于 150 轮，且没有缩小 50 轮以上，且请求范围的中位数小于 64 轮。网关结束会话，让节点重连后一次追完 | 正常处理；每节点每 5 分钟最多一次 |
 | `returning to a priority peer` | 节点之前落到了公开池，现在回到优先级 peer | 正常 |
+| `live hub ended: ...` | 共用的上游实时流结束了（原因在冒号后，和上面各行同义），流上所有节点一起重连 | 同冒号后的原因 |
+| `live hub idle: no node left` | 共用流上没有节点了，等 30 s 后关闭 | 正常 |
+| `node write backlog over 64 MB (node not reading)` | 该节点约 40 s 没读实时流，只断开它自己 | 看节点：通常是重启或低内存 |
 
 冷启动（bootstrap）相关的行，不带 `reason=`：
 
@@ -329,7 +349,7 @@ services:
 
 ## 12. 升级与回滚
 
-**升级网关**（已经是白名单版本时）：
+**升级网关**：
 
 ```sh
 cd /opt/hypersync
@@ -340,52 +360,7 @@ git pull && docker compose build
 docker compose up -d gw peerd                             # overlay 由 COMPOSE_FILE 自动带上；节点断开几秒后自动重连
 ```
 
-**回滚网关**（回到另一个白名单版本）：`docker tag hypersync:prev hypersync:latest && docker compose up -d gw peerd`
-
-### 12.1 从应答器拓扑升级（第一次升级到白名单版本）
-
-旧部署有一个 `hypersync-responder` 容器占着公网 4001/4002，网关不对公网发布端口；新网关要自己发布
-4000-4010，且没有白名单拒绝启动。按顺序做，否则新网关起不来、节点断开：
-
-1. 保存日志、留旧镜像（同上），并记下当前提交，回滚时要用：
-   `git rev-parse HEAD > data/pre-whitelist-commit`
-2. `.env`：加 `HYPERSYNC_NODE_WHITELIST`（同机节点 `172.28.0.128/25` 或它们的固定 gwnet 地址；远端节点
-   加它们的公网 IPv4）。`HYPERSYNC_RESPONDER_BIND` 不再使用；需要限定发布地址时改用 `HYPERSYNC_PUBLIC_BIND`
-   （注意它限定的是全部 4000-4010）。
-3. 用过 WireGuard 的部署（旧版第 9 节）：从 `COMPOSE_FILE` 删掉 `docker-compose.wg.yml`，新 compose 已发布
-   4000-4010，overlay 再发布一次会端口冲突。最平滑的过渡是把远端节点的 WireGuard 隧道地址也加进白名单
-   （不设 `HYPERSYNC_PUBLIC_BIND` 时网关在所有地址上发布，包括隧道地址），节点不用改就能继续连；之后再逐台把
-   `root_node_ips` 改成网关公网 IPv4、把节点公网 IPv4 加白，最后去掉 WireGuard。
-4. 拉代码、构建，删掉旧应答器后立即启动新网关。新 compose 里已经没有 `responder` 服务，`docker compose`
-   不会自己删它：
-
-```sh
-git pull && docker compose build
-docker compose config | grep -E "4000-4010"               # gw 应发布 4000-4010，且没有 wg overlay 的第二份映射
-docker rm -f hypersync-responder                          # 释放公网 4001/4002（到下一行起来之间几秒没人应答探测）
-docker compose up -d gw peerd
-```
-
-5. 验收：`docker logs hypersync-gw 2>&1 | grep -E "node whitelist|bind :"` 列出预期的白名单，没有 `REJECTED`
-   也没有 `bind`；每个节点的 `applied block` 持续增长；10 分钟后 `[gw] [public]` 统计有 `from priority peers=...`。
-6. 新版本稳定后删掉白名单之前的镜像，免得以后被当成回滚镜像（这次第 1 步打的 `hypersync:prev` 就是）：
-   `docker image rm hypersync:prev`。
-
-### 12.2 回滚到应答器拓扑（白名单之前的版本）
-
-**不能只换镜像。** 新 compose 把 4000-4010 发布到公网，而白名单之前的网关不检查来源，任何人都能拿到完整
-服务（包括约 5.8 GB 的状态转发）。代码、compose 和镜像要一起回退：
-
-```sh
-cd /opt/hypersync
-git checkout $(cat data/pre-whitelist-commit)             # 代码和 compose 回到应答器拓扑
-docker compose build                                       # 旧版本镜像
-# .env：恢复 HYPERSYNC_RESPONDER_BIND；用过 WireGuard 时把 docker-compose.wg.yml 加回 COMPOSE_FILE
-docker compose up -d gw peerd                              # 按旧 compose 重建网关：不再发布公网 4000-4010
-docker compose --profile public up -d responder            # 应答器接管公网 4001/4002
-```
-
-远端节点要改回经 WireGuard 连接（旧网关不对公网开放），否则连不上。
+**回滚网关**：`docker tag hypersync:prev hypersync:latest && docker compose up -d gw peerd`
 
 **整体回滚到直连**（先停 hypersync，再让节点重新开放端口，避免和网关抢端口）：
 
@@ -426,7 +401,7 @@ docker compose --profile public up -d responder            # 应答器接管公�
 
 **peerd `live=0` 能不能切？** 不建议。先查 `data/peers.json`、peerd 日志里的 `reasons={...}`、`HL_STATS_DIR` 挂载，
 必要时 `docker restart hypersync-peerd`。独占模式下节点主要用优先级 peer，但公开池是它们全部不可用时唯一的退路，
-测速参考流、冷启动和 4002 的兜底也来自公开池。
+测速参考、冷启动和 4002 的兜底也来自公开池。
 
 **优先级 peer 怎么换？** 改 `.env` 的 `HYPERSYNC_PRIORITY_PEERS` 后执行
 `docker compose up -d --force-recreate gw peerd`。网关用这个列表统计来自优先级 peer 的探测次数。

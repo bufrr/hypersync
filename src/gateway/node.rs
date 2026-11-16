@@ -74,6 +74,9 @@ pub(super) struct NodeState {
     last_client_blocks: Mutex<Option<ClientBlockRun>>,
     // the next client-block range, fetched while the node processes the current one
     pub(super) prefetch: Mutex<Option<super::client_blocks::Prefetch>>,
+    // the sibling this node last bootstrapped from and when that relay ended: if the node asks
+    // for a bootstrap again soon after, that bootstrap didn't take (see transparent_bootstrap)
+    pub(super) last_sibling_bootstrap: Mutex<Option<(String, Instant)>>,
 }
 
 impl NodeState {
@@ -93,6 +96,7 @@ impl NodeState {
             last_catchup_cut: Mutex::new(None),
             last_client_blocks: Mutex::new(None),
             prefetch: Mutex::new(None),
+            last_sibling_bootstrap: Mutex::new(None),
         }
     }
 

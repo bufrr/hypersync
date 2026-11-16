@@ -183,7 +183,7 @@ mod tests {
     use crate::gateway::response_is_peer_only;
     use crate::protocol::response_is_peer_full;
 
-    async fn responder() -> (std::net::SocketAddr, std::net::SocketAddr, Arc<Stats>) {
+    async fn public_listeners() -> (std::net::SocketAddr, std::net::SocketAddr, Arc<Stats>) {
         use tokio::net::TcpListener;
 
         let public = Arc::new(Public::new());
@@ -213,13 +213,13 @@ mod tests {
         let mut out = Vec::new();
         let _ = timeout(Duration::from_secs(5), c.read_to_end(&mut out))
             .await
-            .expect("responder held the connection open");
+            .expect("the public listener held the connection open");
         out
     }
 
     #[tokio::test]
     async fn a_greeting_is_refused_as_peer_full_and_gets_no_block() {
-        let (p4001, _, stats) = responder().await;
+        let (p4001, _, stats) = public_listeners().await;
         for greeting in [crate::protocol::GREET_FALSE, crate::protocol::GREET_TRUE] {
             let out = ask(p4001, &greeting).await;
             assert_eq!(out, PEER_FULL);
@@ -230,7 +230,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_connect_only_probe_is_counted_and_closed() {
-        let (p4001, _, stats) = responder().await;
+        let (p4001, _, stats) = public_listeners().await;
         drop(TcpStream::connect(p4001).await.unwrap());
         for _ in 0..50 {
             if stats.probes.load(Ordering::Relaxed) == 1 {
@@ -243,7 +243,7 @@ mod tests {
 
     #[tokio::test]
     async fn query_peers_gets_an_empty_table_and_anything_else_peer_only() {
-        let (_, p4002, stats) = responder().await;
+        let (_, p4002, stats) = public_listeners().await;
         // the exact bytes QuickNode sent node1
         assert_eq!(ask(p4002, &[0, 0, 0, 1, 0, 1]).await, EMPTY_PEER_TABLE);
         // a height query and a range query
@@ -258,7 +258,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_oversized_or_truncated_request_gets_no_answer() {
-        let (_, p4002, stats) = responder().await;
+        let (_, p4002, stats) = public_listeners().await;
         assert!(ask(p4002, &[0, 0, 0, 65, 0, 0]).await.is_empty());
         assert!(ask(p4002, &[0, 0, 0, 5, 0]).await.is_empty());
         assert_eq!(stats.bad.load(Ordering::Relaxed), 2);
