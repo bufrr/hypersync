@@ -408,6 +408,8 @@ async fn transparent_bootstrap(
     greet: [u8; 8],
     ctx: GatewayCtx,
 ) {
+    // the greeting was read just before this: the node's ~60 s abci_state deadline runs from here
+    let node_greeted = Instant::now();
     // the node is getting fresh state from a peer: no earlier cache replay's floor applies
     node.live_floor.store(0, Ordering::Release);
     // Advance rr by the whole scan window: retries during an incident sweep fresh pool peers
@@ -430,7 +432,8 @@ async fn transparent_bootstrap(
             node.ip
         );
     }
-    let Some(selected) = select_fast_bootstrap_peer(&ctx.priority, &candidates, 0, greet).await
+    let Some(selected) =
+        select_fast_bootstrap_peer(&ctx.priority, &candidates, 0, greet, node_greeted).await
     else {
         gwlog!("[gw] [{}] no peer serving abci_state right now", node.ip);
         return;

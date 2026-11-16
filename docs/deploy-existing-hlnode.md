@@ -208,7 +208,7 @@ cd ~/node && docker compose up -d
 
 冷启动过程（2026-11-15 在 16 核 Linode 上实测，状态服务器约 24 MB/s；详见 `docs/hl-p2p-protocol.md` §7a）：
 
-1. **abci_state（约 1.4 GB，约 1 分钟）**：节点日志每 4 MB 一行 `reading bytes for abci_stream recv greeting: X/Y`。
+1. **abci_state（约 1.4 GB，约 1 分钟）**：节点从连上起只给这一帧约 60 s（含网关选服务器的时间），超时就从头重来，所以网关只选能在剩余时间内发完的服务器。节点日志每 4 MB 一行 `reading bytes for abci_stream recv greeting: X/Y`。
 2. **加载状态（约 1–2.5 分钟）**：出现 `received abci greeting` 和 `computed l1 hash`。这段时间节点**不读网络数据**，
    网关对它的写入会卡住，属于正常现象（网关在冷启动连接的前 15 分钟允许单次写入卡 300 s）。
 3. **EVM KVs（约 4.4 GB，约 3 分钟）**：**节点在这一阶段不打任何进度日志**。要看进度只能看网关一侧的连接字节数：
@@ -313,6 +313,7 @@ services:
 |---|---|---|
 | `[gw] bootstrap via <peer> below 1000 KB/s after N MB; cutting it` | 状态服务器在等待它的 120 s 里平均不到 1 MB/s（超过 5.2 GB 后门槛降到 400 KB/s，超过 7 GB 不再检查）。网关切断，20 分钟内（优先级 peer 为 5 分钟）不再用它做冷启动（仍可提供实时区块），节点几秒内换服务器重新冷启动 | 正常。同一个节点反复出现说明可用的状态服务器都很慢：看 peerd 的 `live` 数 |
 | `[gw] [<node>] bootstrap via <peer> ended inside the abci_state (N of M MB); not used for bootstraps for 20 min` | 状态服务器在 abci_state 中途停住，节点自己约 20–30 s 后放弃（节点日志 `could not read abci state ... deadline has elapsed`）。20 分钟内（优先级 peer 为 5 分钟）不再用它做冷启动 | 正常；节点重启也会触发一次。优先级 peer 被标记时冷启动先换另一个优先级 peer，三个都被标记才用公开池 |
+| `[gw] bootstrap candidate <peer> too slow for the node's abci_state deadline (X MB/s, needs Y)` | 节点从连上起只给 abci_state 约 60 s（选服务器的时间也算在内）。这个候选按预取速率赶不上，网关换下一个，节点不用等 60 s 超时再重来 | 正常；只出现这一行而没有后续 `node bootstrap via` 时，看 peerd 的 `live` 数 |
 | `every bootstrap candidate trickled recently; keeping a slow server this time (no rate cut)` | 候选的状态服务器 20 分钟内都被切过。为免无限重下，这次保留慢服务器，只按 60 s 无数据切断 | 冷启动会很慢但能完成；持续出现说明 peer 池太小或本机 IP 被普遍限速 |
 | `no peer serving abci_state right now` | 这一轮没找到愿意发状态的服务器 | 偶尔正常；持续出现时检查本机公网 4001/4002 是否有应答（`[gw] [public]` 统计） |
 | 节点日志 `Evm Kvs read error: early eof` | 冷启动在 EVM KVs 阶段断了，节点会从头再下 | 偶发且紧跟一条 `cutting it` 是预期的；没有 `cutting it` 却反复出现，说明连接在别处被断（节点重启、网关重启） |

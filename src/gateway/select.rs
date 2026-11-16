@@ -25,6 +25,44 @@ pub(super) const MAX_ABCI_STATE_FRAME: usize = 1_500_000_000;
 
 const BOOTSTRAP_PREFETCH_SECS: u64 = 4;
 
+// hl-node gives the whole abci_state frame ~60 s from its own connect (2026-11-15: a server
+// streaming a steady 27 MB/s, picked 14 s after the node's greeting, was dropped at 60.1 s with
+// "abci_stream ... timed out: deadline has elapsed" at 1,282 of 1,400 MB; one at 34 MB/s picked
+// after 8.7 s made it at 50 s). Selection time counts against it, so a candidate must show from
+// its prefetch rate that it can finish the frame inside what is left, with a margin: one that
+// can't is certain to fail the node, which then restarts its bootstrap a minute later.
+pub(super) const NODE_ABCI_DEADLINE: Duration = Duration::from_secs(60);
+const NODE_ABCI_MARGIN: Duration = Duration::from_secs(5);
+
+// Ok, or the (measured, needed) bytes/s when a server sending `len` bytes, `done` of them in
+// `took`, can't finish by the node's deadline. `elapsed`: time since the node's greeting.
+pub(super) fn fits_node_abci_deadline(
+    len: usize,
+    done: usize,
+    took: Duration,
+    elapsed: Duration,
+) -> Result<(), (f64, f64)> {
+    let rest = len.saturating_sub(done) as f64;
+    if rest == 0.0 {
+        return Ok(());
+    }
+    let left = NODE_ABCI_DEADLINE
+        .saturating_sub(NODE_ABCI_MARGIN)
+        .saturating_sub(elapsed)
+        .as_secs_f64();
+    let rate = done as f64 / took.as_secs_f64().max(1e-3);
+    let needed = if left > 0.0 {
+        rest / left
+    } else {
+        f64::INFINITY
+    };
+    if rate >= needed {
+        Ok(())
+    } else {
+        Err((rate, needed))
+    }
+}
+
 const BOOTSTRAP_SELECT_DEADLINE_SECS: u64 = 24;
 
 const BOOTSTRAP_SELECT_MAX_INFLIGHT: usize = 4;
@@ -68,6 +106,8 @@ fn stage<T>(
 fn peer_error_class(e: &str) -> &'static str {
     if e.contains("peer full") {
         "peer_full"
+    } else if e.contains("abci_state deadline") {
+        "too_slow_for_node"
     } else if e.contains("lagged") || e.contains("behind the freshest") {
         "lagged"
     } else if e.contains("not serving abci_state") {
@@ -128,6 +168,7 @@ pub(super) async fn decline_detail(s: &mut TcpStream, typ: u8, len: usize) -> St
 async fn try_fast_bootstrap_peer(
     ip: String,
     greet: [u8; 8],
+    node_greeted: Instant,
 ) -> Result<BootstrapPeerSelection, String> {
     let mut upc = stage(
         timeout(
@@ -162,6 +203,7 @@ async fn try_fast_bootstrap_peer(
     }
     let prefetch_len = len.min(BOOTSTRAP_PREFETCH_BYTES);
     let mut payload_prefix = vec![0u8; prefetch_len];
+    let prefetch_started = Instant::now();
     stage(
         timeout(
             Duration::from_secs(BOOTSTRAP_PREFETCH_SECS),
@@ -170,6 +212,20 @@ async fn try_fast_bootstrap_peer(
         .await,
         "state prefetch",
     )?;
+    if let Err((rate, needed)) = fits_node_abci_deadline(
+        len,
+        prefetch_len,
+        prefetch_started.elapsed(),
+        node_greeted.elapsed(),
+    ) {
+        let e = format!(
+            "too slow for the node's abci_state deadline ({:.0} MB/s, needs {:.0})",
+            rate / 1e6,
+            needed / 1e6
+        );
+        gwlog!("[gw] bootstrap candidate {ip} {e}");
+        return Err(e);
+    }
 
     Ok(BootstrapPeerSelection {
         upc,
@@ -186,6 +242,7 @@ pub(super) async fn select_fast_bootstrap_peer(
     peers: &[String],
     start: usize,
     greet: [u8; 8],
+    node_greeted: Instant,
 ) -> Option<BootstrapPeerSelection> {
     let n = peers.len();
     if n == 0 {
@@ -230,10 +287,12 @@ pub(super) async fn select_fast_bootstrap_peer(
                 None
             };
             set.spawn(async move {
-                let r = try_fast_bootstrap_peer(ip, greet).await.map(|mut s| {
-                    s.prio_session = slot;
-                    s
-                });
+                let r = try_fast_bootstrap_peer(ip, greet, node_greeted)
+                    .await
+                    .map(|mut s| {
+                        s.prio_session = slot;
+                        s
+                    });
                 (is_priority, r)
             });
             launched += 1;
@@ -1263,6 +1322,7 @@ mod tests {
             &[silent.clone(), state.clone()],
             0,
             crate::protocol::GREET_TRUE,
+            Instant::now(),
         )
         .await
         .expect("the pool serves the state");
@@ -1474,6 +1534,39 @@ mod tests {
         // no memory -> plain rotation
         let out = ordered_candidates(Vec::new(), &pool, 2);
         assert_eq!(out, ["3.3.3.3", "4.4.4.4", "1.1.1.1", "2.2.2.2"]);
+    }
+
+    #[test]
+    fn a_server_must_finish_the_abci_state_inside_the_nodes_deadline() {
+        let mb = 1_000_000usize;
+        let len = 1_400 * mb;
+        let s = Duration::from_secs;
+        // 2026-11-15: 27 MB/s picked 14.3 s after the greeting -> the node timed out at 60 s
+        assert!(fits_node_abci_deadline(
+            len,
+            64 * mb,
+            Duration::from_secs_f64(64.0 / 27.0),
+            Duration::from_secs_f64(14.3)
+        )
+        .is_err());
+        // 34 MB/s picked after 8.7 s finished at 50 s
+        assert!(fits_node_abci_deadline(
+            len,
+            64 * mb,
+            Duration::from_secs_f64(64.0 / 34.0),
+            Duration::from_secs_f64(8.7)
+        )
+        .is_ok());
+        // a fast server is fine even late in the selection window
+        assert!(fits_node_abci_deadline(len, 64 * mb, s(1), s(24)).is_ok());
+        // past the deadline nothing fits; a frame already all prefetched always does
+        assert!(fits_node_abci_deadline(len, 64 * mb, s(1), s(60)).is_err());
+        assert!(fits_node_abci_deadline(64 * mb, 64 * mb, s(4), s(59)).is_ok());
+        let (rate, needed) = fits_node_abci_deadline(len, 64 * mb, s(4), s(10)).unwrap_err();
+        assert!(
+            (rate - 16e6).abs() < 1.0 && needed > 29e6,
+            "{rate} {needed}"
+        );
     }
 
     #[test]
